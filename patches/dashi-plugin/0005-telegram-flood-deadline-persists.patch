@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Fri, 31 Jul 2026 12:33:58 +0000
+Subject: [PATCH 05/10] =?UTF-8?q?fix(telegram):=20=D0=B4=D0=B5=D0=B4=D0=BB?=
+ =?UTF-8?q?=D0=B0=D0=B9=D0=BD=20flood-=D0=B1=D0=B0=D0=BD=D0=B0=20=D0=BF?=
+ =?UTF-8?q?=D0=B5=D1=80=D0=B5=D0=B6=D0=B8=D0=B2=D0=B0=D0=B5=D1=82=20=D1=80?=
+ =?UTF-8?q?=D0=B5=D1=81=D1=82=D0=B0=D1=80=D1=82?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Инцидент 31/07: бан на 58436с пережил два рестарта плагина, и каждый новый
+процесс с пустым латчем отправлял пробный запрос внутрь открытого окна — ровно
+то, что заставляет Telegram продлевать наказание.
+
+- src/safety/flood-state.ts: {stateDir}/telegram-flood.json, атомарная запись
+  0600, дедлайн только продлевается, истёкшие записи вычищаются. Формат простой,
+  чтобы читался и внешними отправителями (релей-хук, cron).
+- rate-limited-telegram-api.ts: опции initialFloodUntilMs (восстановление при
+  старте) и onFlood (запись при латче), обе best-effort — падение записи не может
+  сломать отправку.
+- server.ts: загрузка при старте с предупреждением в лог, запись на каждый латч.
+- 14 тестов на flood-state, полный прогон 2778 pass (5 падений предсуществующие).
+---
+ plugin/src/safety/flood-state.ts              | 140 ++++++++++++++++++
+ .../src/safety/rate-limited-telegram-api.ts   |  21 ++-
+ plugin/src/server.ts                          |  18 ++-
+ plugin/tests/safety/flood-state.test.ts       | 120 +++++++++++++++
+ 4 files changed, 297 insertions(+), 2 deletions(-)
+ create mode 100644 plugin/src/safety/flood-state.ts
+ create mode 100644 plugin/tests/safety/flood-state.test.ts
+
+diff --git a/plugin/src/safety/flood-state.ts b/plugin/src/safety/flood-state.ts
+new file mode 100644
+index 0000000..b011930
+--- /dev/null
++++ b/plugin/src/safety/flood-state.ts
+@@ -0,0 +1,140 @@
++// Durable Telegram flood deadlines, shared between the plugin and any external
++// sender (relay hook, flush cron).
++//
++// Why this file exists (incident 2026-07-31): the flood latch in
++// rate-limited-telegram-api.ts lives in memory. Telegram banned an agent's bot
++// from a chat for 58436s — longer than the plugin's uptime. Every restart threw
++// the deadline away, so the first outbound send probed Bot API inside the still
++// open window, which is exactly what makes Telegram extend the ban. Anything
++// that sends on the bot's behalf must be able to read one shared truth.
++//
++// Format ({stateDir}/telegram-flood.json), deliberately trivial so a shell or
++// python tool can read it without a parser:
++//   { "version": 1, "chats": { "100000001": { "not_before_ms": 1785…, "updated_at": "ISO" } } }
++//
++// Writes are atomic (.tmp + rename on the same filesystem) and best-effort: a
++// failed write must never break an outbound path, it only costs us the
++// after-restart guarantee.
++
++import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
++import { dirname, join } from 'node:path'
++
++export const FLOOD_STATE_FILENAME = 'telegram-flood.json'
++const VERSION = 1
++
++interface FloodEntry {
++  not_before_ms: number
++  updated_at: string
++}
++
++interface FloodFile {
++  version: number
++  chats: Record<string, FloodEntry>
++}
++
++function emptyFile(): FloodFile {
++  return { version: VERSION, chats: {} }
++}
++
++/** Parse the on-disk shape defensively: any damage reads as "no deadlines". */
++export function parseFloodFile(raw: string): FloodFile {
++  let data: unknown
++  try {
++    data = JSON.parse(raw)
++  } catch {
++    return emptyFile()
++  }
++  if (typeof data !== 'object' || data === null) return emptyFile()
++  const chatsRaw = (data as { chats?: unknown }).chats
++  if (typeof chatsRaw !== 'object' || chatsRaw === null) return emptyFile()
++  const chats: Record<string, FloodEntry> = {}
++  for (const [chatId, entry] of Object.entries(chatsRaw as Record<string, unknown>)) {
++    if (typeof entry !== 'object' || entry === null) continue
++    const ms = (entry as { not_before_ms?: unknown }).not_before_ms
++    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) continue
++    const updated = (entry as { updated_at?: unknown }).updated_at
++    chats[chatId] = {
++      not_before_ms: Math.floor(ms),
++      updated_at: typeof updated === 'string' ? updated : '',
++    }
++  }
++  return { version: VERSION, chats }
++}
++
++/** Drop deadlines that have already elapsed — keeps the file from growing. */
++export function pruneExpired(file: FloodFile, nowMs: number): FloodFile {
++  const chats: Record<string, FloodEntry> = {}
++  for (const [chatId, entry] of Object.entries(file.chats)) {
++    if (entry.not_before_ms > nowMs) chats[chatId] = entry
++  }
++  return { version: VERSION, chats }
++}
++
++/**
++ * Merge a newly learned deadline. Only ever EXTENDS: a later, shorter
++ * retry_after must not shorten a longer ban we already know about.
++ */
++export function withDeadline(
++  file: FloodFile,
++  chatId: string,
++  untilMs: number,
++  nowIso: string,
++): FloodFile {
++  const current = file.chats[chatId]?.not_before_ms ?? 0
++  if (untilMs <= current) return file
++  return {
++    version: VERSION,
++    chats: { ...file.chats, [chatId]: { not_before_ms: untilMs, updated_at: nowIso } },
++  }
++}
++
++export function floodStatePath(stateDir: string): string {
++  return join(stateDir, FLOOD_STATE_FILENAME)
++}
++
++/** Deadlines still in the future, as the rate limiter's initialFloodUntilMs. */
++export function loadFloodDeadlines(
++  stateDir: string,
++  nowMs: number = Date.now(),
++): Record<string, number> {
++  let raw: string
++  try {
++    raw = readFileSync(floodStatePath(stateDir), 'utf8')
++  } catch {
++    return {}
++  }
++  const pruned = pruneExpired(parseFloodFile(raw), nowMs)
++  const out: Record<string, number> = {}
++  for (const [chatId, entry] of Object.entries(pruned.chats)) {
++    out[chatId] = entry.not_before_ms
++  }
++  return out
++}
++
++/** Record a deadline. Best-effort, never throws. */
++export function saveFloodDeadline(
++  stateDir: string,
++  chatId: string,
++  untilMs: number,
++  nowMs: number = Date.now(),
++): void {
++  const path = floodStatePath(stateDir)
++  try {
++    mkdirSync(dirname(path), { recursive: true })
++    let current: FloodFile
++    try {
++      current = parseFloodFile(readFileSync(path, 'utf8'))
++    } catch {
++      current = emptyFile()
++    }
++    const next = pruneExpired(
++      withDeadline(current, chatId, untilMs, new Date(nowMs).toISOString()),
++      nowMs,
++    )
++    const tmp = `${path}.tmp`
++    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
++    renameSync(tmp, path)
++  } catch {
++    // Deliberately silent: see the header note on best-effort writes.
++  }
++}
+diff --git a/plugin/src/safety/rate-limited-telegram-api.ts b/plugin/src/safety/rate-limited-telegram-api.ts
+index e2247a4..ba6db90 100644
+--- a/plugin/src/safety/rate-limited-telegram-api.ts
++++ b/plugin/src/safety/rate-limited-telegram-api.ts
+@@ -121,6 +121,19 @@ export interface RateLimitOptions {
+    */
+   retryBudgetS?: number
+   jitterMaxMs?: number
++  /**
++   * Called whenever a flood deadline is learned or extended. Lets the caller
++   * PERSIST the deadline: the in-memory latch dies with the process, and a
++   * restart during a multi-hour ban would otherwise probe Telegram blindly and
++   * extend it (incident 2026-07-31 — the ban outlived two restarts).
++   * Must not throw; failures are swallowed.
++   */
++  onFlood?: (chatId: string, untilMs: number) => void
++  /**
++   * Deadlines restored from disk at startup, in ms epoch per chat id. Consulted
++   * once per chat, then the in-memory latch takes over.
++   */
++  initialFloodUntilMs?: Readonly<Record<string, number>>
+   /** Test seam: replace Date.now() for deterministic virtual time. */
+   now?: () => number
+   /** Test seam: replace setTimeout-based sleep. */
+@@ -208,7 +221,8 @@ export function createRateLimitedTelegramApi(
+       s = {
+         bucket: makeBucket(cfg.perChatBurstCapacity, cfg.perChatRefillPerSec, now()),
+         tail: Promise.resolve(),
+-        floodUntilMs: 0,
++        // Restored deadline (if any) so a restart mid-ban does not probe.
++        floodUntilMs: opts.initialFloodUntilMs?.[chatId] ?? 0,
+       }
+       chatState.set(chatId, s)
+     }
+@@ -248,6 +262,11 @@ export function createRateLimitedTelegramApi(
+       retry_after_s: retryAfterS,
+       until: new Date(until).toISOString(),
+     })
++    try {
++      opts.onFlood?.(chatId, until)
++    } catch {
++      // Persistence is best-effort: never let it break an outbound path.
++    }
+   }
+ 
+   // Wait until both the per-chat and global buckets have a token, then
+diff --git a/plugin/src/server.ts b/plugin/src/server.ts
+index 61c59b0..8b874aa 100644
+--- a/plugin/src/server.ts
++++ b/plugin/src/server.ts
+@@ -46,6 +46,7 @@ import {
+ } from './channel/tools.js'
+ import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
+ import { createRateLimitedTelegramApi } from './safety/rate-limited-telegram-api.js'
++import { loadFloodDeadlines, saveFloodDeadline } from './safety/flood-state.js'
+ import { createReliableTelegramApi } from './safety/reliable-telegram-api.js'
+ import { OutboundActivityTracker } from './status/outbound-activity.js'
+ import { HeartbeatMonitor } from './status/heartbeat-monitor.js'
+@@ -446,7 +447,22 @@ const bot = new Bot(env.TELEGRAM_BOT_TOKEN)
+ // OUTERMOST so its verdict reflects the final outcome of the whole stack.
+ // No call site can bypass — the raw reference is shadowed below.
+ const rawTelegramApi = createTelegramApi(bot, env.TELEGRAM_BOT_TOKEN)
+-const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log)
++// Flood deadlines survive restarts (incident 2026-07-31: a 58436s ban outlived
++// two restarts, and each fresh process probed Bot API inside the open window,
++// which is what extends the ban). Restored on boot, persisted on every latch.
++const restoredFloodDeadlines = loadFloodDeadlines(statePaths.root)
++if (Object.keys(restoredFloodDeadlines).length > 0) {
++  log.warn('restored telegram flood deadlines', {
++    chats: Object.entries(restoredFloodDeadlines).map(([chatId, untilMs]) => ({
++      chat_id: chatId,
++      until: new Date(untilMs).toISOString(),
++    })),
++  })
++}
++const rateLimitedTelegramApi = createRateLimitedTelegramApi(rawTelegramApi, log, {
++  initialFloodUntilMs: restoredFloodDeadlines,
++  onFlood: (chatId, untilMs) => saveFloodDeadline(statePaths.root, chatId, untilMs),
++})
+ // The bot token itself is included in extraSecrets so any code path that
+ // accidentally tries to ship the token (e.g. error message including a
+ // URL-with-token from grammy) gets it scrubbed before the bytes leave us.
+diff --git a/plugin/tests/safety/flood-state.test.ts b/plugin/tests/safety/flood-state.test.ts
+new file mode 100644
+index 0000000..cafda4e
+--- /dev/null
++++ b/plugin/tests/safety/flood-state.test.ts
+@@ -0,0 +1,120 @@
++// Tests for the durable flood-deadline store. Pure functions are exercised
++// directly; the load/save pair runs against a temp dir.
++
++import { describe, expect, test } from 'bun:test'
++import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import {
++  floodStatePath,
++  loadFloodDeadlines,
++  parseFloodFile,
++  pruneExpired,
++  saveFloodDeadline,
++  withDeadline,
++} from '../../src/safety/flood-state.js'
++
++const NOW = 1_785_000_000_000
++const tmp = (): string => mkdtempSync(join(tmpdir(), 'flood-state-'))
++
++describe('parseFloodFile', () => {
++  test('reads a well-formed file', () => {
++    const raw = JSON.stringify({
++      version: 1,
++      chats: { '100000001': { not_before_ms: NOW + 1000, updated_at: 'x' } },
++    })
++    expect(parseFloodFile(raw).chats['100000001']?.not_before_ms).toBe(NOW + 1000)
++  })
++
++  test('garbage reads as empty, never throws', () => {
++    for (const raw of ['', 'not json', '[]', 'null', '{"chats":5}']) {
++      expect(parseFloodFile(raw).chats).toEqual({})
++    }
++  })
++
++  test('drops entries with a non-numeric or non-positive deadline', () => {
++    const raw = JSON.stringify({
++      chats: {
++        a: { not_before_ms: 'soon' },
++        b: { not_before_ms: 0 },
++        c: { not_before_ms: -5 },
++        d: { not_before_ms: NOW },
++      },
++    })
++    expect(Object.keys(parseFloodFile(raw).chats)).toEqual(['d'])
++  })
++})
++
++describe('withDeadline', () => {
++  test('records a new deadline', () => {
++    const f = withDeadline(parseFloodFile(''), '1', NOW + 500, 'iso')
++    expect(f.chats['1']?.not_before_ms).toBe(NOW + 500)
++  })
++
++  test('extends a longer ban but never shortens it', () => {
++    let f = withDeadline(parseFloodFile(''), '1', NOW + 50_000, 'iso')
++    f = withDeadline(f, '1', NOW + 1_000, 'iso') // a later, smaller retry_after
++    expect(f.chats['1']?.not_before_ms).toBe(NOW + 50_000)
++    f = withDeadline(f, '1', NOW + 90_000, 'iso')
++    expect(f.chats['1']?.not_before_ms).toBe(NOW + 90_000)
++  })
++
++  test('chats are independent', () => {
++    let f = withDeadline(parseFloodFile(''), '1', NOW + 100, 'iso')
++    f = withDeadline(f, '2', NOW + 200, 'iso')
++    expect(f.chats['1']?.not_before_ms).toBe(NOW + 100)
++    expect(f.chats['2']?.not_before_ms).toBe(NOW + 200)
++  })
++})
++
++describe('pruneExpired', () => {
++  test('removes elapsed deadlines, keeps future ones', () => {
++    let f = withDeadline(parseFloodFile(''), 'past', NOW - 1, 'iso')
++    f = withDeadline(f, 'future', NOW + 1, 'iso')
++    expect(Object.keys(pruneExpired(f, NOW).chats)).toEqual(['future'])
++  })
++})
++
++describe('load / save round trip', () => {
++  test('a saved deadline is restored', () => {
++    const dir = tmp()
++    saveFloodDeadline(dir, '100000001', NOW + 58_436_000, NOW)
++    expect(loadFloodDeadlines(dir, NOW)['100000001']).toBe(NOW + 58_436_000)
++  })
++
++  test('an elapsed deadline is not restored', () => {
++    const dir = tmp()
++    saveFloodDeadline(dir, '1', NOW + 1000, NOW)
++    expect(loadFloodDeadlines(dir, NOW + 2000)).toEqual({})
++  })
++
++  test('missing file reads as no deadlines', () => {
++    expect(loadFloodDeadlines(join(tmp(), 'nope'), NOW)).toEqual({})
++  })
++
++  test('corrupt file reads as no deadlines instead of throwing', () => {
++    const dir = tmp()
++    writeFileSync(floodStatePath(dir), '{ this is not json')
++    expect(loadFloodDeadlines(dir, NOW)).toEqual({})
++  })
++
++  test('the file is written 0600 and stays machine-readable', () => {
++    const dir = tmp()
++    saveFloodDeadline(dir, '1', NOW + 1000, NOW)
++    const parsed = JSON.parse(readFileSync(floodStatePath(dir), 'utf8'))
++    expect(parsed.version).toBe(1)
++    expect(parsed.chats['1'].not_before_ms).toBe(NOW + 1000)
++    expect(typeof parsed.chats['1'].updated_at).toBe('string')
++  })
++
++  test('saving twice keeps the longer ban', () => {
++    const dir = tmp()
++    saveFloodDeadline(dir, '1', NOW + 50_000, NOW)
++    saveFloodDeadline(dir, '1', NOW + 10_000, NOW)
++    expect(loadFloodDeadlines(dir, NOW)['1']).toBe(NOW + 50_000)
++  })
++
++  test('save never throws on an unwritable path', () => {
++    expect(() => saveFloodDeadline('/proc/nonexistent-dir', '1', NOW + 1, NOW)).not.toThrow()
++  })
++})

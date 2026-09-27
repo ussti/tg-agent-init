@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Sun, 27 Sep 2026 05:17:42 +0000
+Subject: [PATCH 09/10] =?UTF-8?q?=D0=A2=D0=B5=D1=81=D1=82=D1=8B:=20=D1=84?=
+ =?UTF-8?q?=D0=B8=D0=BA=D1=81=D1=82=D1=83=D1=80=D1=8B=20=D0=BF=D0=B0=D0=BC?=
+ =?UTF-8?q?=D1=8F=D1=82=D0=B8=20=D0=BF=D0=BE=D0=B4=20Fix=20Y,=20editRichMe?=
+ =?UTF-8?q?ssage=20=D0=B2=20=D1=84=D0=B5=D0=B9=D0=BA=D0=BE=D0=B2=D0=BE?=
+ =?UTF-8?q?=D0=BC=20API?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugin/tests/memory/e2e-webhook.test.ts       |  4 ++--
+ plugin/tests/memory/writer.test.ts            | 23 ++++++++++++-------
+ .../tests/telegram/dm-inbox-delivery.test.ts  |  1 +
+ 3 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/plugin/tests/memory/e2e-webhook.test.ts b/plugin/tests/memory/e2e-webhook.test.ts
+index 4b4750d..78183c4 100644
+--- a/plugin/tests/memory/e2e-webhook.test.ts
++++ b/plugin/tests/memory/e2e-webhook.test.ts
+@@ -127,7 +127,7 @@ describe('end-to-end: webhook → MemoryWriter → recent.md + verbose.jsonl', (
+     // Seed a Claude transcript file the Stop hook will reference.
+     const transcriptPath = join(workspaceDir, 'session.jsonl')
+     writeFileSync(transcriptPath, JSON.stringify({
+-      message: { role: 'assistant', content: [{ type: 'text', text: 'agent answered the question' }] },
++      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'agent answered the question' } }] },
+     }) + '\n', 'utf8')
+ 
+     const { h } = await startWithMemory()
+@@ -213,7 +213,7 @@ describe('end-to-end: webhook → MemoryWriter → recent.md + verbose.jsonl', (
+ 
+     const transcriptPath = join(workspaceDir, 'multi.jsonl')
+     writeFileSync(transcriptPath, JSON.stringify({
+-      message: { role: 'assistant', content: [{ type: 'text', text: 'shared agent answer' }] },
++      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'shared agent answer' } }] },
+     }) + '\n', 'utf8')
+ 
+     const N = 50
+diff --git a/plugin/tests/memory/writer.test.ts b/plugin/tests/memory/writer.test.ts
+index 6aca172..0fe3608 100644
+--- a/plugin/tests/memory/writer.test.ts
++++ b/plugin/tests/memory/writer.test.ts
+@@ -103,13 +103,16 @@ describe('MemoryWriter.onHook', () => {
+     expect(logsExist).toBe(false)
+   })
+ 
+-  test('UserPromptSubmit + Stop writes recent.md and verbose-*.jsonl with buffered prompt and transcript text', async () => {
++  test('UserPromptSubmit + Stop writes recent.md and verbose-*.jsonl with buffered prompt and reply-tool text', async () => {
+     const c = fakeClock()
+     const { log } = makeLog()
+     const w = new MemoryWriter(cfg(), log, c.now)
+ 
++    // PATCH-Y: the writer captures the reply TOOL's input.text (what was sent
++    // to Telegram), not plain assistant narration. Fixture must carry a
++    // mcp__dashi-channel__reply tool_use block.
+     const transcript = writeTranscript(baseDir, JSON.stringify({
+-      message: { role: 'assistant', content: [{ type: 'text', text: 'agent reply here' }] },
++      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'agent reply here' } }] },
+     }) + '\n')
+ 
+     await w.onHook(payload('UserPromptSubmit', { prompt: 'user question?' }))
+@@ -145,11 +148,13 @@ describe('MemoryWriter.onHook', () => {
+ 
+     const hot = readFileSync(join(workspacePath, 'core', 'hot', 'recent.md'), 'utf8')
+     expect(hot).toContain('**User:** (no prompt)\n')
+-    expect(hot).toContain('**Silvana:** (inline)\n')
++    // PATCH-Y: default transcript_path '/tmp/none.jsonl' is unreadable, so the
++    // reply-tool reader returns null → forensic marker '(no reply tool call)'.
++    expect(hot).toContain('**Silvana:** (no reply tool call)\n')
+ 
+     const v = JSON.parse(readFileSync(join(logsPath, 'verbose-2026-05-15.jsonl'), 'utf8').trim())
+     expect(v.user).toBe('(no prompt)')
+-    expect(v.agent).toBe('')
++    expect(v.agent).toBe('(no reply tool call)')
+     expect(v.dur_ms).toBe(0)
+ 
+     const warns = calls.filter(c => c.level === 'warn')
+@@ -157,7 +162,7 @@ describe('MemoryWriter.onHook', () => {
+     expect(warns[0]!.msg).toContain('Stop without buffered prompt')
+   })
+ 
+-  test('Stop with unreadable transcript path uses empty agent text + (inline) snippet (no throw)', async () => {
++  test('Stop with unreadable transcript path → (no reply tool call) marker (no throw)', async () => {
+     const c = fakeClock()
+     const { log } = makeLog()
+     const w = new MemoryWriter(cfg(), log, c.now)
+@@ -166,9 +171,10 @@ describe('MemoryWriter.onHook', () => {
+     await w.onHook(payload('Stop', { transcript_path: '/path/that/does/not/exist.jsonl' }))
+ 
+     const hot = readFileSync(join(workspacePath, 'core', 'hot', 'recent.md'), 'utf8')
+-    expect(hot).toContain('**Silvana:** (inline)\n')
++    // PATCH-Y: unreadable transcript → reply reader returns null → marker.
++    expect(hot).toContain('**Silvana:** (no reply tool call)\n')
+     const v = JSON.parse(readFileSync(join(logsPath, 'verbose-2026-05-15.jsonl'), 'utf8').trim())
+-    expect(v.agent).toBe('')
++    expect(v.agent).toBe('(no reply tool call)')
+   })
+ 
+   test('PreToolUse / PostToolUse / SessionStart hooks are no-ops', async () => {
+@@ -194,8 +200,9 @@ describe('MemoryWriter.onHook', () => {
+     const w = new MemoryWriter(cfg(), log, c.now)
+ 
+     const longPrompt = 'P'.repeat(500)
++    // PATCH-Y: agent text comes from the reply tool's input.text.
+     const transcript = writeTranscript(baseDir, JSON.stringify({
+-      message: { role: 'assistant', content: [{ type: 'text', text: 'A'.repeat(500) }] },
++      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'A'.repeat(500) } }] },
+     }) + '\n')
+ 
+     await w.onHook(payload('UserPromptSubmit', { prompt: longPrompt }))
+diff --git a/plugin/tests/telegram/dm-inbox-delivery.test.ts b/plugin/tests/telegram/dm-inbox-delivery.test.ts
+index 57a4934..905fb89 100644
+--- a/plugin/tests/telegram/dm-inbox-delivery.test.ts
++++ b/plugin/tests/telegram/dm-inbox-delivery.test.ts
+@@ -93,6 +93,7 @@ function noopApi(): TelegramApi {
+   return {
+     sendMessage: noop as unknown as TelegramApi['sendMessage'],
+     sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
++    editRichMessage: noop as unknown as TelegramApi['editRichMessage'],
+     editMessageText: noop as unknown as TelegramApi['editMessageText'],
+     setMessageReaction: async () => {},
+     sendChatAction: async () => {},

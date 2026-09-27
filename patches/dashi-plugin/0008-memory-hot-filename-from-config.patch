@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Tue, 22 Sep 2026 22:13:18 +0000
+Subject: [PATCH 08/10] =?UTF-8?q?fix(memory):=20=D0=B8=D0=BC=D1=8F=20?=
+ =?UTF-8?q?=D0=B3=D0=BE=D1=80=D1=8F=D1=87=D0=B5=D0=B3=D0=BE=20=D1=84=D0=B0?=
+ =?UTF-8?q?=D0=B9=D0=BB=D0=B0=20=D0=B8=D0=B7=20=D0=BA=D0=BE=D0=BD=D1=84?=
+ =?UTF-8?q?=D0=B8=D0=B3=D0=B0,=20=D0=B0=20=D0=BD=D0=B5=20=D0=B8=D0=B7=20?=
+ =?UTF-8?q?=D0=BE=D0=BA=D1=80=D1=83=D0=B6=D0=B5=D0=BD=D0=B8=D1=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MemoryWriter читал HOT_MEMORY_FILENAME прямо в рантайме. На машине, где
+оператор экспортирует разделение каналов (recent-plugin.md), запись шла
+мимо recent.md и шесть тестов памяти падали с ENOENT — при исправном
+коде.
+
+Имя файла стало полем MemoryConfig (hotFilename, дефолт recent.md).
+Переменную окружения разбирает бутстрап в server.ts, там же, где
+собирается остальной memory-конфиг. Поведение в проде не изменилось.
+
+Два регрессионных теста: override из конфига применяется; переменная
+окружения на writer не влияет.
+
+Сюита: 2810 pass / 0 fail (было 2802/6).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ plugin/src/memory/writer.ts        |  8 ++++-
+ plugin/src/server.ts               |  8 +++++
+ plugin/tests/memory/writer.test.ts | 50 ++++++++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/src/memory/writer.ts b/plugin/src/memory/writer.ts
+index a29eb69..3a566aa 100644
+--- a/plugin/src/memory/writer.ts
++++ b/plugin/src/memory/writer.ts
+@@ -32,6 +32,12 @@ export interface MemoryConfig {
+   trimKeepLines: number
+   bufferTtlMs: number
+   bufferMaxEntries: number
++  // Hot-memory filename inside <workspace>/core/hot/. Optional; defaults
++  // to 'recent.md'. Per-channel splits (e.g. 'recent-plugin.md') are
++  // resolved by the bootstrap in server.ts — the writer never reads the
++  // environment itself, so tests stay hermetic on a host where the
++  // operator exports HOT_MEMORY_FILENAME.
++  hotFilename?: string
+ }
+ 
+ export class MemoryWriter {
+@@ -85,7 +91,7 @@ export class MemoryWriter {
+     }
+ 
+     const ts = formatLocalTs(new Date(this.now()))
+-    const hotFilename = process.env.HOT_MEMORY_FILENAME ?? 'recent.md'
++    const hotFilename = this.cfg.hotFilename ?? 'recent.md'
+     const hotPath = join(this.cfg.workspacePath, 'core', 'hot', hotFilename)
+     await appendHotEntry({
+       path: hotPath,
+diff --git a/plugin/src/server.ts b/plugin/src/server.ts
+index 42131bd..8839da2 100644
+--- a/plugin/src/server.ts
++++ b/plugin/src/server.ts
+@@ -811,6 +811,14 @@ if (config.memory.enabled === true && config.memory.workspace_path !== undefined
+     trimKeepLines: config.memory.trim_keep_lines,
+     bufferTtlMs: config.memory.buffer_ttl_ms,
+     bufferMaxEntries: config.memory.buffer_max_entries,
++    // Per-channel hot-memory split: an operator exports
++    // HOT_MEMORY_FILENAME=recent-plugin.md so gateway and plugin turns
++    // land in separate files. Resolved here, at the only bootstrap, so
++    // MemoryWriter stays a pure function of its config.
++    ...(process.env.HOT_MEMORY_FILENAME !== undefined &&
++      process.env.HOT_MEMORY_FILENAME !== ''
++      ? { hotFilename: process.env.HOT_MEMORY_FILENAME }
++      : {}),
+   }
+   memoryWriter = new MemoryWriter(memCfg, log)
+   log.info('memory writer enabled', {
+diff --git a/plugin/tests/memory/writer.test.ts b/plugin/tests/memory/writer.test.ts
+index 9fc3a17..6aca172 100644
+--- a/plugin/tests/memory/writer.test.ts
++++ b/plugin/tests/memory/writer.test.ts
+@@ -210,4 +210,54 @@ describe('MemoryWriter.onHook', () => {
+     expect(v.user.length).toBe(500)
+     expect(v.agent.length).toBe(500)
+   })
++
++  test('cfg.hotFilename overrides the default hot file name', async () => {
++    const c = fakeClock()
++    const { log } = makeLog()
++    const w = new MemoryWriter(cfg({ hotFilename: 'recent-plugin.md' }), log, c.now)
++
++    const transcript = writeTranscript(baseDir, JSON.stringify({
++      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'routed reply' } }] },
++    }) + '\n')
++
++    await w.onHook(payload('UserPromptSubmit', { prompt: 'split channel prompt' }))
++    await w.onHook(payload('Stop', { transcript_path: transcript }))
++
++    const hot = readFileSync(join(workspacePath, 'core', 'hot', 'recent-plugin.md'), 'utf8')
++    expect(hot).toContain('**User:** split channel prompt\n')
++
++    let defaultExists = true
++    try { readFileSync(join(workspacePath, 'core', 'hot', 'recent.md'), 'utf8') } catch { defaultExists = false }
++    expect(defaultExists).toBe(false)
++  })
++
++  test('HOT_MEMORY_FILENAME in the ambient env does not affect the writer', async () => {
++    // Regression: the writer used to read process.env directly, so the
++    // whole suite failed on a host where the operator exports the
++    // per-channel split. Env resolution now lives in server.ts bootstrap.
++    const prev = process.env.HOT_MEMORY_FILENAME
++    process.env.HOT_MEMORY_FILENAME = 'recent-from-env.md'
++    try {
++      const c = fakeClock()
++      const { log } = makeLog()
++      const w = new MemoryWriter(cfg(), log, c.now)
++
++      const transcript = writeTranscript(baseDir, JSON.stringify({
++        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__dashi-channel__reply', input: { text: 'env-proof reply' } }] },
++      }) + '\n')
++
++      await w.onHook(payload('UserPromptSubmit', { prompt: 'env-proof prompt' }))
++      await w.onHook(payload('Stop', { transcript_path: transcript }))
++
++      const hot = readFileSync(join(workspacePath, 'core', 'hot', 'recent.md'), 'utf8')
++      expect(hot).toContain('**User:** env-proof prompt\n')
++
++      let envFileExists = true
++      try { readFileSync(join(workspacePath, 'core', 'hot', 'recent-from-env.md'), 'utf8') } catch { envFileExists = false }
++      expect(envFileExists).toBe(false)
++    } finally {
++      if (prev === undefined) delete process.env.HOT_MEMORY_FILENAME
++      else process.env.HOT_MEMORY_FILENAME = prev
++    }
++  })
+ })

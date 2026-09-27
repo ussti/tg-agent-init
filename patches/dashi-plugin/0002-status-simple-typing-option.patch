@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Mon, 1 Jun 2026 06:30:42 +0000
+Subject: [PATCH 02/10] =?UTF-8?q?feat(status):=20=D0=BE=D0=BF=D1=86=D0=B8?=
+ =?UTF-8?q?=D1=8F=20simple=5Ftyping=20=E2=80=94=20=D1=81=D0=B2=D0=BE=D1=80?=
+ =?UTF-8?q?=D0=B0=D1=87=D0=B8=D0=B2=D0=B0=D1=82=D1=8C=20activity=20=D0=B2?=
+ =?UTF-8?q?=20=C2=AB=D0=9F=D0=B5=D1=87=D0=B0=D1=82=D0=B0=D0=B5=D1=82?=
+ =?UTF-8?q?=E2=80=A6=C2=BB?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Восстанавливает форк-косметику cebbeb6 (детальный activity-блок захламляет
+Telegram), которую перетёр upstream-merge. Сделано конфиг-флагом
+status.simple_typing (default false = upstream), env TELEGRAM_STATUS_SIMPLE_TYPING.
+Все upstream activity-тесты остаются зелёными; добавлен форк-тест.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ plugin/src/config.ts                          |  9 ++++++
+ plugin/src/status/status-manager.ts           | 29 ++++++++++++++-----
+ plugin/tests/channel/permissions.test.ts      |  2 +-
+ plugin/tests/channel/tools.test.ts            |  2 +-
+ plugin/tests/commands/oob.test.ts             |  2 +-
+ plugin/tests/prompt/media-prompt.test.ts      |  2 +-
+ plugin/tests/security/paths.test.ts           |  2 +-
+ plugin/tests/status/progress-reporter.test.ts |  2 +-
+ .../status/status-manager.multichat.test.ts   |  2 +-
+ .../tests/status/status-manager.race.test.ts  |  4 +--
+ plugin/tests/status/status-manager.test.ts    | 14 +++++++++
+ plugin/tests/status/task-mirror.test.ts       |  2 +-
+ .../tests/telegram/ask-user-question.test.ts  |  2 +-
+ plugin/tests/telegram/gate.test.ts            |  2 +-
+ .../telegram/handlers.addressing.test.ts      |  2 +-
+ plugin/tests/telegram/handlers.album.test.ts  |  2 +-
+ plugin/tests/telegram/handlers.test.ts        |  2 +-
+ plugin/tests/telegram/watcher.test.ts         |  2 +-
+ 18 files changed, 60 insertions(+), 24 deletions(-)
+
+diff --git a/plugin/src/config.ts b/plugin/src/config.ts
+index 439c650..7945776 100644
+--- a/plugin/src/config.ts
++++ b/plugin/src/config.ts
+@@ -73,6 +73,11 @@ export const AppConfigSchema = z.object({
+     // created lazily on the first thinking/tool/activity transition. Native
+     // sendChatAction (header animation) is unaffected.
+     suppress_typing_bubble: z.boolean().default(true),
++    // Kit option: when true, the `activity` status state collapses
++    // to the plain «Печатает…» indicator instead of the detailed tool-by-tool
++    // block — the verbose block clutters Telegram (operator request). Default
++    // false keeps upstream behaviour. Toggle via env TELEGRAM_STATUS_SIMPLE_TYPING.
++    simple_typing: z.boolean().default(false),
+   }).default({}),
+   album: z.object({
+     flush_ms: z.number().int().positive().default(2000),
+@@ -401,6 +406,7 @@ export const RuntimeEnvSchema = z.object({
+   TELEGRAM_ALLOWED_CHAT_IDS: z.string().optional(),
+   TELEGRAM_WORKSPACE_ROOT: z.string().optional(),
+   TELEGRAM_STATUS_INTERVAL_MS: z.coerce.number().int().positive().optional(),
++  TELEGRAM_STATUS_SIMPLE_TYPING: z.string().optional(),
+   TELEGRAM_ALBUM_FLUSH_MS: z.coerce.number().int().positive().optional(),
+   GROQ_API_KEY: z.string().optional(),
+   TELEGRAM_WEBHOOK_HOST: z.string().optional(),
+@@ -585,6 +591,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
+   if (parsedEnv.TELEGRAM_STATUS_INTERVAL_MS !== undefined) {
+     status.interval_ms = parsedEnv.TELEGRAM_STATUS_INTERVAL_MS
+   }
++  if (parsedEnv.TELEGRAM_STATUS_SIMPLE_TYPING !== undefined) {
++    status.simple_typing = /^(1|true|yes|on)$/i.test(parsedEnv.TELEGRAM_STATUS_SIMPLE_TYPING)
++  }
+   if (Object.keys(status).length > 0) merged.status = status
+ 
+   const album = (merged.album && typeof merged.album === 'object' ? merged.album : {}) as Record<string, unknown>
+diff --git a/plugin/src/status/status-manager.ts b/plugin/src/status/status-manager.ts
+index 5b2736f..2012683 100644
+--- a/plugin/src/status/status-manager.ts
++++ b/plugin/src/status/status-manager.ts
+@@ -254,7 +254,17 @@ interface InternalEntry {
+   pausedUntil: number
+ }
+ 
+-function renderState(state: StatusState, tick: number, nowMs: number): string {
++// `simpleTyping` (fork option, config `status.simple_typing`): when true the
++// `activity` state collapses to the plain «Печатает…» indicator instead of the
++// detailed tool-by-tool block — the verbose block clutters Telegram (operator
++// request). Default false preserves upstream behaviour so upstream activity
++// tests keep exercising the full render path.
++function renderState(
++  state: StatusState,
++  tick: number,
++  nowMs: number,
++  simpleTyping = false,
++): string {
+   // Ellipsis animation for typing/thinking: 1→2→3 dots.
+   const dotCount = (tick % 3) + 1
+   const dots = '.'.repeat(dotCount)
+@@ -266,7 +276,9 @@ function renderState(state: StatusState, tick: number, nowMs: number): string {
+     case 'tool':
+       return `<i>🔧 ${escapeHtml(state.toolName)}</i>`
+     case 'activity':
+-      return renderActivityBlock(state.snapshot, nowMs)
++      return simpleTyping
++        ? `<i>Печатает${dots}</i>`
++        : renderActivityBlock(state.snapshot, nowMs)
+     case 'stopped': {
+       const tail = state.reason ? `: ${escapeHtml(state.reason)}` : ''
+       return `<i>Остановлено${tail}</i>`
+@@ -505,6 +517,7 @@ export class StatusManager {
+           { kind: 'stopped', reason: 'superseded' },
+           0,
+           this.now(),
++          this.config.status.simple_typing,
+         )
+         try {
+           await this.telegramApi.editMessageText(
+@@ -530,7 +543,7 @@ export class StatusManager {
+     const suppressBubble =
+       this.config.status.suppress_typing_bubble && initialState.kind === 'typing'
+ 
+-    const text = renderState(initialState, 0, this.now())
++    const text = renderState(initialState, 0, this.now(), this.config.status.simple_typing)
+     let messageId = 0
+     if (!suppressBubble) {
+       const sendOpts: { parse_mode: 'HTML'; reply_to_message_id?: number } = {
+@@ -643,7 +656,7 @@ export class StatusManager {
+       }
+       live.tick += 1
+       if (!live.bubbleSuppressed) {
+-        const next = renderState(live.state, live.tick, this.now())
++        const next = renderState(live.state, live.tick, this.now(), this.config.status.simple_typing)
+         void this.editSafely(live, next)
+       }
+       // Re-arm next tick.
+@@ -716,7 +729,7 @@ export class StatusManager {
+   // sendMessage so ensureBubble can install + await the shared promise
+   // exactly once per chat per concurrent burst.
+   private async createBubble(entry: InternalEntry, state: StatusState): Promise<void> {
+-    const text = renderState(state, 0, this.now())
++    const text = renderState(state, 0, this.now(), this.config.status.simple_typing)
+     const sendOpts: { parse_mode?: 'HTML'; reply_to_message_id?: number } = {}
+     // Skip parse_mode when we've previously had a parse downgrade so
+     // the broken HTML can't trip Telegram a second time.
+@@ -828,7 +841,7 @@ export class StatusManager {
+       // and flipped bubbleSuppressed off. Nothing else to edit on this turn.
+       return
+     }
+-    const text = renderState(state, 0, this.now())
++    const text = renderState(state, 0, this.now(), this.config.status.simple_typing)
+     await this.editSafely(entry, text)
+   }
+ 
+@@ -987,7 +1000,7 @@ export class StatusManager {
+       await this.ensureBubble(entry, entry.state)
+       return
+     }
+-    const text = renderState(entry.state, 0, now)
++    const text = renderState(entry.state, 0, now, this.config.status.simple_typing)
+     await this.editSafely(entry, text)
+   }
+ 
+@@ -1091,7 +1104,7 @@ export class StatusManager {
+     if (entry.bubbleSuppressed) return
+     if (entry.disabled) return
+     const messageId = entry.handle.messageId
+-    const text = renderState({ kind: 'stopped', reason }, 0, this.now())
++    const text = renderState({ kind: 'stopped', reason }, 0, this.now(), this.config.status.simple_typing)
+     return this.runLifecycle(chatId, async () => {
+       try {
+         await this.telegramApi.editMessageText(
+diff --git a/plugin/tests/channel/permissions.test.ts b/plugin/tests/channel/permissions.test.ts
+index 7075773..a2c4418 100644
+--- a/plugin/tests/channel/permissions.test.ts
++++ b/plugin/tests/channel/permissions.test.ts
+@@ -58,7 +58,7 @@ function mkConfig(allowedIds: number[] = [164795011]): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/channel/tools.test.ts b/plugin/tests/channel/tools.test.ts
+index 00720ce..1658533 100644
+--- a/plugin/tests/channel/tools.test.ts
++++ b/plugin/tests/channel/tools.test.ts
+@@ -59,7 +59,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/commands/oob.test.ts b/plugin/tests/commands/oob.test.ts
+index fe006fb..6b073d2 100644
+--- a/plugin/tests/commands/oob.test.ts
++++ b/plugin/tests/commands/oob.test.ts
+@@ -15,7 +15,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/prompt/media-prompt.test.ts b/plugin/tests/prompt/media-prompt.test.ts
+index 3c361fb..60063c6 100644
+--- a/plugin/tests/prompt/media-prompt.test.ts
++++ b/plugin/tests/prompt/media-prompt.test.ts
+@@ -27,7 +27,7 @@ const voiceConfig: AppConfig = {
+   dm_only: true,
+   allowed_user_ids: [1],
+   allowed_chat_ids: [1],
+-  status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++  status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+   album: { flush_ms: 2000 },
+   voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+   webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/security/paths.test.ts b/plugin/tests/security/paths.test.ts
+index 27b16a9..2b8fe29 100644
+--- a/plugin/tests/security/paths.test.ts
++++ b/plugin/tests/security/paths.test.ts
+@@ -40,7 +40,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/status/progress-reporter.test.ts b/plugin/tests/status/progress-reporter.test.ts
+index 49e6bad..cac78d5 100644
+--- a/plugin/tests/status/progress-reporter.test.ts
++++ b/plugin/tests/status/progress-reporter.test.ts
+@@ -51,7 +51,7 @@ function makeConfig(overrides: Partial<AppConfig['progress']> = {}): AppConfig {
+       ttl_ms: 300_000,
+       delete_on_complete: true,
+       suppress_typing_bubble: false,
+-    },
++      simple_typing: false,    },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/status/status-manager.multichat.test.ts b/plugin/tests/status/status-manager.multichat.test.ts
+index 74c75cf..54f8801 100644
+--- a/plugin/tests/status/status-manager.multichat.test.ts
++++ b/plugin/tests/status/status-manager.multichat.test.ts
+@@ -80,7 +80,7 @@ function makeConfig(): AppConfig {
+       ttl_ms: 300_000,
+       delete_on_complete: true,
+       suppress_typing_bubble: false,
+-    },
++      simple_typing: false,    },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/status/status-manager.race.test.ts b/plugin/tests/status/status-manager.race.test.ts
+index 3fbc02c..75cf6de 100644
+--- a/plugin/tests/status/status-manager.race.test.ts
++++ b/plugin/tests/status/status-manager.race.test.ts
+@@ -58,7 +58,7 @@ function makeConfig(overrides: Partial<AppConfig['status']> = {}): AppConfig {
+       // Default: bubble suppressed off so concurrency tests can see
+       // the initial send happen. Lazy-bubble race tests opt in.
+       suppress_typing_bubble: false,
+-      ...overrides,
++      simple_typing: false,      ...overrides,
+     },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+@@ -794,7 +794,7 @@ describe('StatusManager — FIX-C bug #2 (handle stays valid after lazy bubble)'
+     // entries.delete check in complete/cancel is the first line of
+     // defence.
+     const { mgr, api } = makeManager({
+-      config: makeConfig({ suppress_typing_bubble: false }),
++      config: makeConfig({ suppress_typing_bubble: false, simple_typing: false }),
+     })
+     const h1 = await mgr.start(CHAT, undefined)
+     expect(h1.generation).toBe(1)
+diff --git a/plugin/tests/status/status-manager.test.ts b/plugin/tests/status/status-manager.test.ts
+index f9e9c37..fb4f7df 100644
+--- a/plugin/tests/status/status-manager.test.ts
++++ b/plugin/tests/status/status-manager.test.ts
+@@ -28,6 +28,7 @@ function makeConfig(overrides: Partial<AppConfig['status']> = {}): AppConfig {
+       // suite covers the non-suppressed path. Dedicated tests below opt in
+       // by passing { suppress_typing_bubble: true } via overrides.
+       suppress_typing_bubble: false,
++      simple_typing: false,
+       ...overrides,
+     },
+     album: { flush_ms: 2000 },
+@@ -765,6 +766,19 @@ describe('StatusManager.suppress_typing_bubble', () => {
+     expect(sends[0]!.text).not.toContain('Печатает')
+   })
+ 
++  test('simple_typing collapses the activity render to «Печатает…» (fork option)', async () => {
++    const { mgr, api } = makeManager({
++      config: makeConfig({ suppress_typing_bubble: true, simple_typing: true }),
++    })
++    await mgr.start('164795011', undefined)
++    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
++    const sends = api.calls.filter((c) => c.kind === 'send')
++    expect(sends.length).toBe(1)
++    // Fork behaviour: the detailed activity block is suppressed in favour of
++    // the plain typing indicator.
++    expect(sends[0]!.text).toContain('Печатает')
++  })
++
+   test('cancel on a pure-typing session is a quiet no-op (no edit, no leak)', async () => {
+     const { mgr, api } = makeManager({
+       config: makeConfig({ suppress_typing_bubble: true }),
+diff --git a/plugin/tests/status/task-mirror.test.ts b/plugin/tests/status/task-mirror.test.ts
+index 0130b0a..5436a08 100644
+--- a/plugin/tests/status/task-mirror.test.ts
++++ b/plugin/tests/status/task-mirror.test.ts
+@@ -42,7 +42,7 @@ function makeConfig(overrides: Partial<AppConfig['task_mirror']> = {}): AppConfi
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/ask-user-question.test.ts b/plugin/tests/telegram/ask-user-question.test.ts
+index caecb2a..5c2d3c5 100644
+--- a/plugin/tests/telegram/ask-user-question.test.ts
++++ b/plugin/tests/telegram/ask-user-question.test.ts
+@@ -114,7 +114,7 @@ function mkConfig(overrides: { allowedUserIds?: number[]; maxPreview?: number; t
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/gate.test.ts b/plugin/tests/telegram/gate.test.ts
+index c8be619..2db4889 100644
+--- a/plugin/tests/telegram/gate.test.ts
++++ b/plugin/tests/telegram/gate.test.ts
+@@ -16,7 +16,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/handlers.addressing.test.ts b/plugin/tests/telegram/handlers.addressing.test.ts
+index 0e680f5..1d9664f 100644
+--- a/plugin/tests/telegram/handlers.addressing.test.ts
++++ b/plugin/tests/telegram/handlers.addressing.test.ts
+@@ -59,7 +59,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+       ttl_ms: 300_000,
+       delete_on_complete: true,
+       suppress_typing_bubble: false,
+-    },
++      simple_typing: false,    },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/handlers.album.test.ts b/plugin/tests/telegram/handlers.album.test.ts
+index 9d6917f..4fb57bb 100644
+--- a/plugin/tests/telegram/handlers.album.test.ts
++++ b/plugin/tests/telegram/handlers.album.test.ts
+@@ -76,7 +76,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+       ttl_ms: 300_000,
+       delete_on_complete: true,
+       suppress_typing_bubble: false,
+-    },
++      simple_typing: false,    },
+     album: { flush_ms: 50 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/handlers.test.ts b/plugin/tests/telegram/handlers.test.ts
+index a681287..35b7241 100644
+--- a/plugin/tests/telegram/handlers.test.ts
++++ b/plugin/tests/telegram/handlers.test.ts
+@@ -46,7 +46,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/watcher.test.ts b/plugin/tests/telegram/watcher.test.ts
+index 33ebad3..69ee1e7 100644
+--- a/plugin/tests/telegram/watcher.test.ts
++++ b/plugin/tests/telegram/watcher.test.ts
+@@ -22,7 +22,7 @@ function makeConfig(overrides: Partial<AppConfig['watcher']> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: true, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },

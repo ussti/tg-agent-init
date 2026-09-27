@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Sat, 1 Aug 2026 02:02:53 +0000
+Subject: [PATCH 06/10] =?UTF-8?q?=D0=A2=D0=B5=D1=81=D1=82=D1=8B:=20simple?=
+ =?UTF-8?q?=5Ftyping=20=D0=B2=20=D1=84=D0=B8=D0=BA=D1=81=D1=82=D1=83=D1=80?=
+ =?UTF-8?q?=D0=B0=D1=85=20=D0=BD=D0=BE=D0=B2=D1=8B=D1=85=20upstream-=D1=82?=
+ =?UTF-8?q?=D0=B5=D1=81=D1=82=D0=BE=D0=B2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Локальный флаг simple_typing обязателен в типе status, четыре пришедших
+с upstream фикстуры его не задавали — tsc падал на них.
+---
+ plugin/tests/channel/tools.ask-guard.test.ts | 2 +-
+ plugin/tests/channel/tools.guest.test.ts     | 2 +-
+ plugin/tests/safety/rich-path.test.ts        | 2 +-
+ plugin/tests/telegram/handlers.guest.test.ts | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/plugin/tests/channel/tools.ask-guard.test.ts b/plugin/tests/channel/tools.ask-guard.test.ts
+index b0da419..559c18c 100644
+--- a/plugin/tests/channel/tools.ask-guard.test.ts
++++ b/plugin/tests/channel/tools.ask-guard.test.ts
+@@ -74,7 +74,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/channel/tools.guest.test.ts b/plugin/tests/channel/tools.guest.test.ts
+index d1a30cc..e15cecd 100644
+--- a/plugin/tests/channel/tools.guest.test.ts
++++ b/plugin/tests/channel/tools.guest.test.ts
+@@ -39,7 +39,7 @@ function makeConfig(): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/safety/rich-path.test.ts b/plugin/tests/safety/rich-path.test.ts
+index 8b4f890..3f5cdfc 100644
+--- a/plugin/tests/safety/rich-path.test.ts
++++ b/plugin/tests/safety/rich-path.test.ts
+@@ -92,7 +92,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011, -1001234567890],
+-    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: true },
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: true, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },
+diff --git a/plugin/tests/telegram/handlers.guest.test.ts b/plugin/tests/telegram/handlers.guest.test.ts
+index ac0c284..ffa2897 100644
+--- a/plugin/tests/telegram/handlers.guest.test.ts
++++ b/plugin/tests/telegram/handlers.guest.test.ts
+@@ -31,7 +31,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+     dm_only: true,
+     allowed_user_ids: [164795011],
+     allowed_chat_ids: [164795011],
+-    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false },
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
+     album: { flush_ms: 2000 },
+     voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
+     webhook: { enabled: false, host: '127.0.0.1', port: 0 },

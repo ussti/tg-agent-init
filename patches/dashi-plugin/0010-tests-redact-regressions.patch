@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Sun, 27 Sep 2026 05:17:50 +0000
+Subject: [PATCH 10/10] =?UTF-8?q?=D0=A2=D0=B5=D1=81=D1=82=D1=8B:=20=D1=80?=
+ =?UTF-8?q?=D0=B5=D0=B3=D1=80=D0=B5=D1=81=D1=81=D0=B8=D0=B8=20=D1=80=D0=B5?=
+ =?UTF-8?q?=D0=B4=D0=B0=D0=BA=D1=82=D0=BE=D1=80=D0=B0=20(Drive=20ID,=20ID?=
+ =?UTF-8?q?=20=D1=81=20=D0=B4=D0=B5=D1=84=D0=B8=D1=81=D0=B0=D0=BC=D0=B8,?=
+ =?UTF-8?q?=20URL-=D1=81=D0=BB=D0=B0=D0=B3=D0=B8)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugin/tests/safety/redact.test.ts | 57 ++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/plugin/tests/safety/redact.test.ts b/plugin/tests/safety/redact.test.ts
+index e603308..dcdd6cc 100644
+--- a/plugin/tests/safety/redact.test.ts
++++ b/plugin/tests/safety/redact.test.ts
+@@ -161,6 +161,63 @@ describe('redactSecrets — generic long token + extras', () => {
+   test('ignores empty / too-short extras', () => {
+     expect(redactSecrets('the cat sat on the mat', ['', 'abc'])).toBe('the cat sat on the mat')
+   })
++
++  test('does NOT mask Google Drive/Sheets/Docs file IDs in URLs', () => {
++    // Regression: 26/05/2026 — Sheet ID `1xDBaDaLu0Gy6Rgi6Ga4ruvWy6_t515A2oqYP7FSU5ug`
++    // arrived to operator as `1xDB***U5ug`, link unopenable.
++    const sheetId = '1xDBaDaLu0Gy6Rgi6Ga4ruvWy6_t515A2oqYP7FSU5ug'
++    const urls = [
++      `https://docs.google.com/spreadsheets/d/${sheetId}/edit?usp=drivesdk`,
++      `https://docs.google.com/document/d/${sheetId}/edit`,
++      `https://docs.google.com/presentation/d/${sheetId}/edit`,
++      `https://drive.google.com/file/d/${sheetId}/view`,
++      `https://drive.google.com/drive/folders/${sheetId}`,
++    ]
++    for (const url of urls) {
++      const out = redactSecrets(url)
++      expect(out).toContain(sheetId)
++      expect(out).not.toContain('***')
++    }
++  })
++
++  test('does NOT mask hyphenated Google file IDs in URLs', () => {
++    // Regression: 29/05/2026 — prior fix used `\b`, which treats `-` as a word
++    // boundary, so IDs containing hyphens were partially masked despite the
++    // URL-anchor lookbehind. Operator hit this with `1KWd6-by3...K1u-AC3vmuHp`.
++    const hyphenIds = [
++      '1KWd6-by3OQO5K9EcivQdK1u-AC3vmuHp',
++      '1a-bcDEFghiJKLmno_pqRStuVWxyz-0123456789',
++    ]
++    for (const id of hyphenIds) {
++      const urls = [
++        `https://docs.google.com/spreadsheets/d/${id}/edit?gid=0#gid=0`,
++        `https://docs.google.com/document/d/${id}/edit`,
++        `https://drive.google.com/file/d/${id}/view`,
++        `https://drive.google.com/drive/folders/${id}`,
++      ]
++      for (const url of urls) {
++        const out = redactSecrets(url)
++        expect(out).toContain(id)
++        expect(out).not.toContain('***')
++      }
++    }
++  })
++
++  test('does NOT mask human-readable hyphenated URL slugs', () => {
++    // Regression: 05/06/2026 — a TechCrunch article URL came back as
++    // `appl***form/` because the long slug is a ≥24-char [A-Za-z0-9_-] run.
++    // The generic replacer now skips runs that decompose into ≥3 pure
++    // lowercase-alpha hyphen-separated words (dictionary slug, not a secret).
++    const url =
++      'https://techcrunch.com/2026/06/04/apple-approves-poke-as-the-first-ai-agent-on-its-messages-for-business-platform/'
++    const out = redactSecrets(url)
++    expect(out).toBe(url)
++    expect(out).not.toContain('***')
++
++    // But a high-entropy token (mixed case + digits, no word structure) is
++    // still masked — the slug exemption must not become a secret bypass.
++    expect(redactSecrets('AKIAIOSFODNN7EXAMPLEDEADBEEF1234')).toContain('***')
++  })
+ })
+ 
+ describe('redactSecrets — URL exemption for the generic long-token rule', () => {

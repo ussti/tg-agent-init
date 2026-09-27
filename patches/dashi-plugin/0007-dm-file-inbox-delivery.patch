@@ -1,0 +1,1404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Tue, 22 Sep 2026 05:08:20 +0000
+Subject: [PATCH 07/10] =?UTF-8?q?feat(dm):=20=D0=B4=D0=BE=D1=81=D1=82?=
+ =?UTF-8?q?=D0=B0=D0=B2=D0=BA=D0=B0=20=D0=BB=D0=B8=D1=87=D0=BD=D1=8B=D1=85?=
+ =?UTF-8?q?=20=D1=81=D0=BE=D0=BE=D0=B1=D1=89=D0=B5=D0=BD=D0=B8=D0=B9=20?=
+ =?UTF-8?q?=D1=87=D0=B5=D1=80=D0=B5=D0=B7=20=D1=84=D0=B0=D0=B9=D0=BB=D0=BE?=
+ =?UTF-8?q?=D0=B2=D1=8B=D0=B9=20inbox=20=D0=B2=D0=BC=D0=B5=D1=81=D1=82?=
+ =?UTF-8?q?=D0=BE=20MCP-=D1=83=D0=B2=D0=B5=D0=B4=D0=BE=D0=BC=D0=BB=D0=B5?=
+ =?UTF-8?q?=D0=BD=D0=B8=D1=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MCP-уведомление — доставка без подтверждения: если композер TUI не
+отправил текст, сообщение исчезает, а плагин пишет в лог успех. Так
+пропали шесть сообщений 20-22.09. Теперь личное сообщение сначала
+ложится файлом в {state}/chats/{chatId}/inbox, а сторож вставляет его
+в пейн с проверенным Enter.
+
+Закрыты три замечания ревью:
+
+1. Ложный успех. Раньше «отпечатка нет на экране» считалось успешной
+   отправкой, даже когда вставка не дошла (модалка держит клавиатуру).
+   Порядок теперь: композер виден -> вставка -> эхо вставки увидено ->
+   Enter. Коды возврата 0/1/2; при 2 ничего не напечатано, файл
+   остаётся в очереди, разбор останавливается — порядок сохраняется.
+2. Одинаковый отпечаток. Проверка по первым 60 символам давала один и
+   тот же префикс <channel source=... для всех сообщений чата, и второе
+   сообщение подтверждалось эхом первого. Отпечаток — message_id,
+   последнее совпадение.
+3. Сторож на один chat_id. Плагин писал в папку любого личного чата,
+   которую никто не разбирает, и глушил запасной путь. Inbox-путь
+   теперь явный список chat_ids (TELEGRAM_DM_DELIVERY_CHAT_IDS);
+   остальные чаты остаются на уведомлении, пустой список выключает
+   транспорт с предупреждением.
+
+Тесты сторожа переписаны: заглушка tmux раньше никогда не показывала
+вставленный текст, поэтому подтверждение проходило вхолостую. Добавлены
+случаи: модалка над композером, проглоченная вставка, два сообщения с
+разными message_id, Enter без эффекта, чат вне списка, групповое
+сообщение в inbox-режиме.
+
+bun test: 2808 pass / 0 fail; tsc --noEmit чисто.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../src/chats/hooks/multichat-entrypoint.sh   | 178 +++++++++--
+ plugin/src/config.ts                          |  49 +++
+ plugin/src/server.ts                          |  45 +++
+ plugin/src/telegram/dm-inbox-delivery.ts      | 107 +++++++
+ plugin/src/telegram/handlers.ts               |  91 ++++++
+ .../chats/multichat-entrypoint-attach.test.ts | 279 ++++++++++++++++++
+ .../chats/multichat-entrypoint-submit.test.ts |  37 ++-
+ .../tests/telegram/dm-inbox-delivery.test.ts  | 272 +++++++++++++++++
+ 8 files changed, 1030 insertions(+), 28 deletions(-)
+ create mode 100644 plugin/src/telegram/dm-inbox-delivery.ts
+ create mode 100644 plugin/tests/chats/multichat-entrypoint-attach.test.ts
+ create mode 100644 plugin/tests/telegram/dm-inbox-delivery.test.ts
+
+diff --git a/plugin/src/chats/hooks/multichat-entrypoint.sh b/plugin/src/chats/hooks/multichat-entrypoint.sh
+index 761c6eb..acad9a0 100644
+--- a/plugin/src/chats/hooks/multichat-entrypoint.sh
++++ b/plugin/src/chats/hooks/multichat-entrypoint.sh
+@@ -62,6 +62,11 @@ PASTE_SETTLE="${MULTICHAT_PASTE_SETTLE:-0.6}"
+ SUBMIT_RETRY_DELAY="${MULTICHAT_SUBMIT_RETRY_DELAY:-0.4}"
+ SUBMIT_RETRY_FACTOR="${MULTICHAT_SUBMIT_RETRY_FACTOR:-1.8}"
+ SUBMIT_RETRY_MAX="${MULTICHAT_SUBMIT_RETRY_MAX:-5}"
++# Echo gate: after the paste, how many polls (and how long between them)
++# we give the TUI to show the body in its composer. Seeing it is what
++# turns "fingerprint gone" from a guess into proof of a submit.
++ECHO_POLL_INTERVAL="${MULTICHAT_ECHO_POLL_INTERVAL:-0.25}"
++ECHO_POLL_MAX="${MULTICHAT_ECHO_POLL_MAX:-8}"
+ 
+ # ───── Injection helpers ─────
+ # All helpers read $PANE (the target tmux pane id) as a global set by the
+@@ -79,14 +84,30 @@ pane_text() {
+   tmux capture-pane -t "$PANE" -p -J 2>/dev/null || true
+ }
+ 
+-# Block until the Claude Code composer is accepting input. The composer
+-# renders a `❯` prompt char once the input handler is mounted; the boot
+-# banner does not contain one. On timeout we proceed anyway — worst case
+-# we degrade to the pre-fix behaviour instead of dropping the message.
++# True when the pane currently shows the Claude Code composer. The
++# composer renders a `❯` prompt char once the input handler is mounted;
++# a boot banner does not have one, and neither does a modal that has
++# grabbed the keyboard (survey, trust prompt, /model picker,
++# AskUserQuestion) — which is exactly the state where typing anything is
++# unsafe.
++composer_visible() {
++  pane_text | grep -q '❯'
++}
++
++# Block until the composer is accepting input.
++#
++# FIX 2026-09-22: on timeout we now REFUSE (return 1) instead of
++# injecting anyway. The old "degraded mode" was written for a pane we
++# own during boot, where the composer is merely late. In attach mode the
++# same timeout means a modal is holding the keyboard: the paste lands in
++# the dialog, never reaches the composer, and the verify loop then reads
++# "fingerprint not on screen" as success — the message is eaten with a
++# success log. Refusing keeps the file queued for the next pass, which
++# costs a delay and loses nothing.
+ wait_claude_ready() {
+   local i
+   for ((i = 0; i < READY_POLL_MAX; i++)); do
+-    if pane_text | grep -q '❯'; then
++    if composer_visible; then
+       # The prompt can render a beat before the keymap is live; one more
+       # poll interval of settle keeps the first Enter from racing it.
+       sleep "$READY_POLL_INTERVAL"
+@@ -94,8 +115,8 @@ wait_claude_ready() {
+     fi
+     sleep "$READY_POLL_INTERVAL"
+   done
+-  echo "multichat-entrypoint(watcher): TUI readiness timeout, injecting anyway" >&2
+-  return 0
++  echo "multichat-entrypoint(watcher): composer not accepting input (modal or boot) — deferring injection" >&2
++  return 1
+ }
+ 
+ # A distinctive substring of the prompt used to judge "still sitting in
+@@ -106,8 +127,24 @@ wait_claude_ready() {
+ # a pattern that can never match the pane.
+ prompt_fingerprint() {
+   printf '%s' "$1" | python3 -c '
++import re
+ import sys
+-lines = [l.strip() for l in sys.stdin.read().splitlines()]
++raw = sys.stdin.read()
++lines = [l.strip() for l in raw.splitlines()]
++# 0. `message_id="…"` beats every heuristic below when present: it is
++#    per-message unique by construction and short enough to survive on
++#    one pane row. The DM transport (dm-inbox-delivery.ts) renders a
++#    `<channel …>` block whose first 60 chars are IDENTICAL for every
++#    message from the same chat — with the line-prefix fallback below,
++#    message B would match the pane echo still showing message A and
++#    confirm the wrong submit. Last match wins: quoted reply context can
++#    carry an older message_id ahead of the current one.
++# Double quotes only: this whole program is a single-quoted shell
++# argument, so an apostrophe here would terminate it early.
++ids = re.findall(r"message_id=[^ >\t]{1,42}", raw)
++if ids:
++    sys.stdout.write(ids[-1])
++    sys.exit(0)
+ # Selection order (build_prompt renders reply_context -> descriptors ->
+ # speaker line -> media paths):
+ #   1. The LAST "[from @" line, if long enough to be distinctive. Last,
+@@ -141,7 +178,16 @@ else:
+ }
+ 
+ # Paste the body, then press Enter until the turn provably started.
+-# Success signals:
++#
++# FIX 2026-09-22 (positive confirmation). The old loop treated "the
++# fingerprint is not on the pane" as success. That reading is only valid
++# once the body has actually been SEEN in the composer — otherwise a
++# paste that never arrived (modal grabbed the keyboard, tmux op failed)
++# looks exactly like a submitted one, and the message is discarded with
++# a success log. Order now: composer ready -> paste -> SEE the echo ->
++# Enter until the echo clears.
++#
++# Success signals (after the echo was seen):
+ #   * footer shows "esc to interrupt" AND generation was NOT already
+ #     running before our paste — a pre-existing turn would read as a
+ #     false success, so when one is in flight we fall back to the
+@@ -151,12 +197,20 @@ else:
+ #     turns that finish faster than our poll, and queued submits).
+ # The body is pasted exactly once; only Enter is ever retried, so a
+ # false "not submitted" reading can never duplicate the message.
++#
++# Return codes:
++#   0 — submitted, positively confirmed
++#   1 — the body was pasted but the submit was never confirmed; the
++#       caller must NOT re-paste (that would duplicate it)
++#   2 — nothing was injected; the caller should leave the file queued
++#       and try again later
+ submit_prompt() {
+   local msg_text="$1"
+-  local fp attempt delay buf out pre_generating
++  local fp attempt delay buf out pre_generating echo_seen i
+   fp="$(prompt_fingerprint "$msg_text")"
+ 
+-  wait_claude_ready
++  # Refuse to type into a pane that is not showing a composer.
++  wait_claude_ready || return 2
+ 
+   pre_generating=0
+   if pane_text | grep -qiE 'esc to interrupt'; then
+@@ -166,24 +220,53 @@ submit_prompt() {
+   # Bracketed paste: the TUI receives one atomic paste event, so embedded
+   # newlines stay soft newlines and the later Enter can never be grouped
+   # into the paste. printf (not heredoc/<<<) avoids a trailing newline.
+-  # Explicit `|| return 1` on each tmux op: these run with errexit
++  # Explicit `|| return 2` on each tmux op: these run with errexit
+   # suppressed (callers invoke us in `if` context), and a silently failed
+   # paste would otherwise read as "fingerprint vanished" = false success
+-  # — losing the message entirely.
++  # — losing the message entirely. 2, not 1: nothing landed in the
++  # composer, so the file is safe to retry.
+   buf="multichat-${CHAT_ID}-$$"
+   printf '%s' "$msg_text" | tmux load-buffer -b "$buf" - || {
+     echo "multichat-entrypoint(watcher): load-buffer failed" >&2
+-    return 1
++    return 2
+   }
+   tmux paste-buffer -d -t "$PANE" -b "$buf" -p || {
+     echo "multichat-entrypoint(watcher): paste-buffer failed" >&2
+-    return 1
++    return 2
+   }
+ 
+   sleep "$PASTE_SETTLE"
+ 
++  # Echo gate. A large paste is collapsed by the TUI into a placeholder
++  # ("[Pasted text #1 +42 lines]"), so accept either the fingerprint or
++  # that placeholder as proof the composer took the body.
++  echo_seen=0
++  if [[ -n "$fp" ]]; then
++    for ((i = 0; i < ECHO_POLL_MAX; i++)); do
++      out="$(pane_text)"
++      if grep -qF -- "$fp" <<<"$out" || grep -qiE 'pasted text' <<<"$out"; then
++        echo_seen=1
++        break
++      fi
++      sleep "$ECHO_POLL_INTERVAL"
++    done
++    if [[ "$echo_seen" == "0" ]]; then
++      # The composer was up a moment ago and the paste reported success,
++      # yet nothing shows. Something is eating input. Do NOT press Enter
++      # blind — on a modal that would answer it with its default option.
++      echo "multichat-entrypoint(watcher): paste not echoed by the pane — refusing to press Enter" >&2
++      return 1
++    fi
++  fi
++
+   delay="$SUBMIT_RETRY_DELAY"
+   for ((attempt = 1; attempt <= SUBMIT_RETRY_MAX; attempt++)); do
++    # Re-check before every retry: a modal that appeared mid-flight must
++    # not collect our Enter as an answer.
++    if ! composer_visible; then
++      echo "multichat-entrypoint(watcher): composer disappeared mid-submit — stopping Enter retries" >&2
++      return 1
++    fi
+     tmux send-keys -t "$PANE" Enter || true
+     sleep "$delay"
+ 
+@@ -192,7 +275,7 @@ submit_prompt() {
+         && grep -qiE 'esc to interrupt' <<<"$out"; then
+       return 0
+     fi
+-    if [[ -n "$fp" ]] && ! grep -qF -- "$fp" <<<"$out"; then
++    if [[ -n "$fp" && "$echo_seen" == "1" ]] && ! grep -qF -- "$fp" <<<"$out"; then
+       return 0
+     fi
+     if [[ -z "$fp" ]]; then
+@@ -303,8 +386,18 @@ process_inbox() {
+       # triage under a distinct prefix.
+       mv "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
+     elif [[ "$rc" -eq 0 && -n "$msg_text" ]]; then
+-      if submit_prompt "$msg_text"; then
++      local src=0
++      submit_prompt "$msg_text" || src=$?
++      if [[ "$src" -eq 0 ]]; then
+         mv "$f" "${PROCESSED}/$(basename "$f")"
++      elif [[ "$src" -eq 2 ]]; then
++        # NOTHING was injected (composer hidden behind a modal, or a
++        # tmux call failed). Leave the file in the inbox and stop the
++        # drain: retrying now would only hit the same modal, and moving
++        # on would deliver later messages out of order. The next watcher
++        # pass picks it up once the composer is back.
++        echo "multichat-entrypoint: injection deferred ($(basename "$f")) — composer unavailable" >&2
++        return 0
+       else
+         # Body is in the composer but submit never confirmed. Do NOT
+         # requeue (a re-paste would duplicate the message) — mark for
+@@ -338,6 +431,57 @@ INBOX="${MULTICHAT_STATE_DIR}/chats/${CHAT_ID}/inbox"
+ PROCESSED="${INBOX}/.processed"
+ mkdir -p "$INBOX" "$PROCESSED"
+ 
++# ───── Attach mode (DM delivery, 2026-09-22) ─────
++# With MULTICHAT_WATCH_ONLY=1 this script is a standalone inbox watcher
++# for a tmux pane somebody ELSE owns — the master agent session, where
++# the Telegram MCP server itself runs. Private DMs are delivered by
++# writing an inbox file (durable, ordered, replayable) instead of an MCP
++# notification, and this watcher performs the same bracketed-paste +
++# verified-Enter injection the per-chat sessions use. No `claude` is
++# spawned here: the target pane already runs one.
++#
++# Required: MULTICHAT_TARGET_PANE (any tmux target — pane id, or a
++# session name meaning "that session's active pane").
++if [[ "${MULTICHAT_WATCH_ONLY:-}" == "1" ]]; then
++  PANE="${MULTICHAT_TARGET_PANE:-}"
++  if [[ -z "$PANE" ]]; then
++    echo "multichat-entrypoint(attach): MULTICHAT_TARGET_PANE not set, refusing to start" >&2
++    exit 2
++  fi
++
++  # Liveness = the target pane still exists. A watcher aimed at a dead
++  # pane would silently eat inbox files (process_inbox moves them to
++  # .processed/), so we exit instead and let the supervisor restart the
++  # pair together.
++  target_alive() {
++    tmux display-message -p -t "$PANE" '#{pane_id}' >/dev/null 2>&1
++  }
++
++  if ! target_alive; then
++    echo "multichat-entrypoint(attach): target pane '$PANE' not found" >&2
++    exit 2
++  fi
++
++  process_inbox
++
++  if command -v inotifywait >/dev/null 2>&1; then
++    while target_alive; do
++      # -t so a quiet inbox still re-checks pane liveness periodically.
++      inotifywait -q -t "${MULTICHAT_ATTACH_POLL_TIMEOUT:-30}" \
++        -e create,moved_to --include '\.json$' "$INBOX" >/dev/null 2>&1 || true
++      sleep 0.1  # debounce — rename() is atomic but bursts can stack
++      target_alive || break
++      process_inbox
++    done
++  else
++    while target_alive; do
++      sleep 0.5
++      process_inbox
++    done
++  fi
++  exit 0
++fi
++
+ # ───── Background inbox watcher ─────
+ (
+   # tmux exports TMUX_PANE inside every pane. Without it we cannot inject
+diff --git a/plugin/src/config.ts b/plugin/src/config.ts
+index 7945776..6643064 100644
+--- a/plugin/src/config.ts
++++ b/plugin/src/config.ts
+@@ -258,6 +258,34 @@ export const AppConfigSchema = z.object({
+   // MultichatRouter, and routes inbound traffic through them. Schema
+   // declared above AppConfigSchema so the type can be re-exported.
+   multichat: MultichatConfigSchema.default({}),
++  // DM delivery transport (2026-09-22). `notify` = the historical MCP
++  // notification into the master session's composer. `inbox` = write the
++  // message to `{state_dir}/chats/{chat_id}/inbox/` and let the
++  // attach-mode watcher (chats/hooks/multichat-entrypoint.sh, run by the
++  // session supervisor) inject it with a verified Enter — the same
++  // transport group chats have used since Phase 3, minus the per-chat
++  // session spawn. `inbox` falls back to `notify` when a write fails, so
++  // enabling it can only add a delivery path, never remove one.
++  //
++  // `state_dir` defaults, in server.ts, to the multichat state dir when
++  // multichat is enabled, otherwise `{statePaths.root}/multichat`.
++  //
++  // Optional (not `.default({})`) so the many AppConfig object literals in
++  // the test suite stay valid without a mechanical edit: absent === the
++  // historical `notify` behaviour.
++  dm_delivery: z
++    .object({
++      mode: z.enum(['notify', 'inbox']).default('notify'),
++      state_dir: z.string().optional(),
++      // Chats whose inbox a watcher actually drains. The inbox write
++      // itself always succeeds, so writing for a chat nobody watches
++      // would strand the message on disk AND suppress the notify
++      // fallback — worse than the bug this transport fixes. Only ids
++      // listed here take the inbox path; every other private chat stays
++      // on notify. Empty/absent = nobody, i.e. the transport is inert.
++      chat_ids: z.array(z.string()).optional(),
++    })
++    .optional(),
+   // AskUserQuestion relay (Phase ?, 2026-05-27, PRX-1 TASK-6). Bridges
+   // Claude Code's native AskUserQuestion tool requests into Telegram so
+   // the warchief can answer from his phone while a session runs headless.
+@@ -445,6 +473,12 @@ export const RuntimeEnvSchema = z.object({
+   TELEGRAM_MULTICHAT_POLICY_PATH: z.string().optional(),
+   TELEGRAM_MULTICHAT_STATE_DIR: z.string().optional(),
+   TELEGRAM_MULTICHAT_WORKSPACE_DIR: z.string().optional(),
++  // DM delivery transport (2026-09-22): `inbox` | `notify`.
++  TELEGRAM_DM_DELIVERY_MODE: z.enum(['notify', 'inbox']).optional(),
++  TELEGRAM_DM_DELIVERY_STATE_DIR: z.string().optional(),
++  // Comma-separated chat ids whose inbox a watcher drains (see
++  // dm_delivery.chat_ids).
++  TELEGRAM_DM_DELIVERY_CHAT_IDS: z.string().optional(),
+   // AskUserQuestion relay (PRX-1 TASK-6, 2026-05-27). ENABLED follows the
+   // same truthy convention as the multichat/memory flags so operators
+   // memorise one mental model. ALLOWED_USER_IDS is CSV (parsed below with
+@@ -627,6 +661,21 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
+   if (parsedEnv.TELEGRAM_MULTICHAT_WORKSPACE_DIR !== undefined) multichat.workspace_dir = parsedEnv.TELEGRAM_MULTICHAT_WORKSPACE_DIR
+   if (Object.keys(multichat).length > 0) merged.multichat = multichat
+ 
++  // DM delivery env overrides (2026-09-22). Same layering pattern.
++  const dmDelivery = (merged.dm_delivery && typeof merged.dm_delivery === 'object'
++    ? merged.dm_delivery
++    : {}) as Record<string, unknown>
++  if (parsedEnv.TELEGRAM_DM_DELIVERY_MODE !== undefined) dmDelivery.mode = parsedEnv.TELEGRAM_DM_DELIVERY_MODE
++  if (parsedEnv.TELEGRAM_DM_DELIVERY_STATE_DIR !== undefined) {
++    dmDelivery.state_dir = parsedEnv.TELEGRAM_DM_DELIVERY_STATE_DIR
++  }
++  if (parsedEnv.TELEGRAM_DM_DELIVERY_CHAT_IDS !== undefined) {
++    dmDelivery.chat_ids = parsedEnv.TELEGRAM_DM_DELIVERY_CHAT_IDS.split(',')
++      .map((id) => id.trim())
++      .filter((id) => id.length > 0)
++  }
++  if (Object.keys(dmDelivery).length > 0) merged.dm_delivery = dmDelivery
++
+   // AskUserQuestion env overrides (PRX-1 TASK-6, 2026-05-27). Same layering
+   // pattern as the multichat block above.
+   const askUserQuestion = (merged.ask_user_question && typeof merged.ask_user_question === 'object'
+diff --git a/plugin/src/server.ts b/plugin/src/server.ts
+index 8b874aa..42131bd 100644
+--- a/plugin/src/server.ts
++++ b/plugin/src/server.ts
+@@ -393,6 +393,46 @@ if (config.multichat.enabled) {
+   }
+ }
+ 
++// ─────────────────────────────────────────────────────────────────────
++// DM delivery transport (2026-09-22). `dm_delivery.mode = 'inbox'` sends
++// private-chat messages down the multichat file inbox instead of the MCP
++// notification: the message is committed to disk, and the attach-mode
++// watcher (chats/hooks/multichat-entrypoint.sh, started by the session
++// supervisor) pastes it into this pane and verifies the Enter landed.
++// The MCP composer injection has no such confirmation — that is how six
++// of the operator's messages were lost on 20-22 Sep 2026.
++//
++// state_dir resolution: explicit config/env value wins; otherwise reuse
++// the multichat state dir when multichat is on, else a `multichat`
++// subdir of the plugin's own state root. The watcher must be pointed at
++// the SAME directory — see run-plugin.sh.
++// ─────────────────────────────────────────────────────────────────────
++let dmInboxStateDir: string | undefined
++let dmInboxChatIds: string[] | undefined
++if (config.dm_delivery?.mode === 'inbox') {
++  const chatIds = (config.dm_delivery.chat_ids ?? []).filter((id) => id.length > 0)
++  if (chatIds.length === 0) {
++    // Fail-safe: an inbox write always succeeds, so enabling the
++    // transport without naming the watched chats would strand messages
++    // in a directory nobody drains — and suppress the notify fallback
++    // that used to carry them. Stay on notify until run-plugin.sh (or
++    // config) says which chats have a watcher.
++    log.warn('dm delivery mode=inbox but chat_ids is empty — staying on notify')
++  } else {
++    dmInboxStateDir =
++      config.dm_delivery.state_dir
++      ?? multichatStateDir
++      ?? join(statePaths.root, 'multichat')
++    dmInboxChatIds = chatIds
++    log.info('dm delivery transport: inbox', {
++      state_dir: dmInboxStateDir,
++      chat_ids: chatIds,
++    })
++  }
++} else if (config.dm_delivery?.state_dir !== undefined) {
++  log.warn('dm_delivery.state_dir set but mode is not "inbox" — ignored')
++}
++
+ // ─────────────────────────────────────────────────────────────────────
+ // Token lock. Telegram allows exactly one getUpdates consumer. We
+ // delegate the live/stale liveness decision to `tokenLock.acquire`
+@@ -1360,6 +1400,9 @@ const handlerDeps: HandlerDeps = {
+   // (handlers.ts treats the pair atomically).
+   ...(multichatRouter !== undefined ? { router: multichatRouter } : {}),
+   ...(multichatPolicy !== undefined ? { policy: multichatPolicy } : {}),
++  // DM inbox transport — undefined when dm_delivery.mode='notify'.
++  ...(dmInboxStateDir !== undefined ? { dmInboxStateDir } : {}),
++  ...(dmInboxChatIds !== undefined ? { dmInboxChatIds } : {}),
+   // PRX-1 TASK-2: ask UI consumes follow-up `Другое` text replies BEFORE
+   // the permission-reply short-circuit. Always wired — feature gate lives
+   // inside the relay itself (callbacks no-op when no pending request).
+@@ -1671,6 +1714,8 @@ void (async () => {
+             statusManager,
+             ...(multichatRouter !== undefined ? { router: multichatRouter } : {}),
+             ...(multichatPolicy !== undefined ? { policy: multichatPolicy } : {}),
++            ...(dmInboxStateDir !== undefined ? { dmInboxStateDir } : {}),
++            ...(dmInboxChatIds !== undefined ? { dmInboxChatIds } : {}),
+           },
+         )
+       },
+diff --git a/plugin/src/telegram/dm-inbox-delivery.ts b/plugin/src/telegram/dm-inbox-delivery.ts
+new file mode 100644
+index 0000000..64fbddc
+--- /dev/null
++++ b/plugin/src/telegram/dm-inbox-delivery.ts
+@@ -0,0 +1,107 @@
++// DM delivery over the multichat file inbox (2026-09-22).
++//
++// Background. Private DMs have always been handed to the master Claude
++// session as an MCP notification (`sendChannelNotification`). The Claude
++// Code client turns that notification into text in the session composer —
++// and when the composer's Enter does not land (TUI busy, paste-burst
++// grouping, boot race) the message is simply lost: nothing retries, and
++// the plugin has already reported success. Six owner messages died
++// that way between 20 and 22 Sep 2026.
++//
++// Group chats never had that failure mode, because the multichat router
++// delivers them as a JSON file in `{stateDir}/chats/{chatId}/inbox/` and
++// an in-session watcher injects it with a bracketed paste plus a VERIFIED
++// Enter (see chats/hooks/multichat-entrypoint.sh). This module gives DMs
++// the same transport without the rest of multichat: no per-chat tmux
++// session is spawned — the watcher runs in attach mode against the master
++// session's pane, which is where the DM must land.
++//
++// Payload contract: `text` carries the whole `<channel …>` block — the
++// wrapper Claude Code itself renders from an MCP notification's meta,
++// reproduced here around the same `content`, and `user` is left empty so
++// the watcher's build_prompt emits that string verbatim instead of
++// prefixing its own `[from @…]` attribution. The session therefore sees
++// the same prompt shape on either transport, including the chat_id it
++// needs for the reply tool. Group chats do not need this: their session
++// is per-chat and carries CHAT_ID in its own environment, while a DM
++// lands in the master session, which knows only what the prompt says.
++
++import {
++  ensureChatStateDirs,
++  writeToInbox,
++  type InboundMessage,
++} from '../router/inbox-bridge.js'
++import type { Logger } from '../log.js'
++
++export interface DmInboxDeliveryOptions {
++  stateDir: string
++  chatId: string
++  userId: string
++  /** Channel body — exactly what the MCP notification would carry. */
++  content: string
++  /** Channel meta — the attributes of the `<channel …>` tag. */
++  meta: Record<string, string>
++  messageId?: string
++  log: Logger
++}
++
++function escapeAttr(value: string): string {
++  return value
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;')
++}
++
++/**
++ * Render the `<channel …>` block the master session expects.
++ *
++ * Mirrors what Claude Code builds from a `notifications/claude/channel`
++ * event: the meta map becomes the tag's attributes, the content becomes
++ * its body. Meta values are already normalized to strings by the caller
++ * (see channel/notify.ts), so the only work here is attribute escaping.
++ */
++export function renderChannelBlock(
++  content: string,
++  meta: Record<string, string>,
++): string {
++  const attrs = Object.entries(meta)
++    .map(([key, value]) => `${key}="${escapeAttr(value)}"`)
++    .join(' ')
++  return `<channel ${attrs}> ${content} </channel>`
++}
++
++/**
++ * Write one DM into the chat's file inbox.
++ *
++ * Returns `true` when the file is committed (rename done — the watcher
++ * can no longer miss it). Returns `false` on any failure so the caller
++ * can fall back to the legacy MCP notify path: a degraded delivery beats
++ * a dropped one.
++ */
++export async function deliverDmToInbox(
++  opts: DmInboxDeliveryOptions,
++): Promise<boolean> {
++  const { stateDir, chatId, userId, content, meta, messageId, log } = opts
++  try {
++    await ensureChatStateDirs(chatId, stateDir)
++    const message: InboundMessage = {
++      text: renderChannelBlock(content, meta),
++      chat_id: chatId,
++      user_id: userId,
++      // Deliberately empty — see the payload contract above.
++      user: '',
++      timestamp: new Date().toISOString(),
++      ...(messageId !== undefined ? { message_id: messageId } : {}),
++    }
++    const path = await writeToInbox(chatId, message, stateDir)
++    log.info('dm delivered to inbox', { chat_id: chatId, path })
++    return true
++  } catch (err) {
++    log.error('dm inbox delivery failed — falling back to MCP notify', {
++      chat_id: chatId,
++      error: err instanceof Error ? err.message : String(err),
++    })
++    return false
++  }
++}
+diff --git a/plugin/src/telegram/handlers.ts b/plugin/src/telegram/handlers.ts
+index 54b2d89..5aca011 100644
+--- a/plugin/src/telegram/handlers.ts
++++ b/plugin/src/telegram/handlers.ts
+@@ -30,6 +30,7 @@ import type { TelegramApi } from '../channel/tools.js'
+ import type { StatusManager } from '../status/status-manager.js'
+ import type { MultichatPolicy } from '../chats/policy-loader.js'
+ import type { MultichatRouter } from '../router/multichat-router.js'
++import { deliverDmToInbox } from './dm-inbox-delivery.js'
+ import type { InboundMessage } from '../router/inbox-bridge.js'
+ import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
+ import { gateTelegramMessage, type GateInput } from './gate.js'
+@@ -123,9 +124,32 @@ export interface AlbumDispatchDeps {
+   // dispatched as a single InboundMessage (captions merged, media_paths
+   // concatenated). Otherwise the legacy MCP notify path runs.
+   router?: MultichatRouter
++  // DM delivery over the multichat file inbox (2026-09-22). When set,
++  // private-chat messages are written to `{dmInboxStateDir}/chats/{chatId}
++  // /inbox/` and injected into the master session by the attach-mode
++  // watcher (chats/hooks/multichat-entrypoint.sh) with a verified Enter,
++  // instead of relying on the MCP notification the Claude Code client
++  // drops into the composer. Absent → legacy notify path, unchanged.
++  dmInboxStateDir?: string
++  // Chats whose inbox a watcher actually drains. A DM is written to the
++  // inbox ONLY when its chat id is listed here; anything else keeps the
++  // MCP notify path, because an unwatched inbox file is a silent drop
++  // (the write succeeds, so the fallback never fires).
++  dmInboxChatIds?: string[]
+   policy?: MultichatPolicy
+ }
+ 
++/**
++ * Is this DM chat served by an inbox watcher?
++ *
++ * An inbox write always succeeds, so writing for a chat nobody drains
++ * is a silent drop: the file sits on disk and the notify fallback never
++ * fires. Only chats a watcher was started for take the inbox path.
++ */
++function isWatchedDmChat(watched: string[] | undefined, chatId: string): boolean {
++  return (watched ?? []).includes(chatId)
++}
++
+ export interface HandlerDeps {
+   server: Server
+   config: AppConfig
+@@ -189,6 +213,18 @@ export interface HandlerDeps {
+   // sendChannelNotification path. Absent in legacy single-chat
+   // deployments — handlers fall back to the historical MCP notify path.
+   router?: MultichatRouter
++  // DM delivery over the multichat file inbox (2026-09-22) — see
++  // dm-inbox-delivery.ts. When set, private-chat messages are committed
++  // to `{dmInboxStateDir}/chats/{chatId}/inbox/` and injected into this
++  // session by the attach-mode watcher with a verified Enter, instead of
++  // relying on the MCP notification the client drops into the composer.
++  // Absent → legacy notify path, unchanged.
++  dmInboxStateDir?: string
++  // Chats whose inbox a watcher actually drains. A DM is written to the
++  // inbox ONLY when its chat id is listed here; anything else keeps the
++  // MCP notify path, because an unwatched inbox file is a silent drop
++  // (the write succeeds, so the fallback never fires).
++  dmInboxChatIds?: string[]
+   // Multichat policy. Drives gate.ts group-chat allowlist, addressing
+   // mention_allowlist, and per-chat behaviour. MUST be paired with
+   // `router` to flip the dispatch path; passing one without the other
+@@ -633,6 +669,38 @@ async function gateAndNotify(
+     }
+   }
+ 
++  // DM inbox transport (2026-09-22). For private chats this is the
++  // preferred path: a committed inbox file cannot be lost by a composer
++  // that swallows Enter. Only a write failure falls through to the MCP
++  // notification below — never both, so the session never sees the same
++  // message twice.
++  const dmStateDir = deps.dmInboxStateDir
++  if (
++    dmStateDir !== undefined
++    && input.chatType === 'private'
++    && isWatchedDmChat(deps.dmInboxChatIds, decision.chatId)
++  ) {
++    const queued = await deliverDmToInbox({
++      stateDir: dmStateDir,
++      chatId: decision.chatId,
++      userId: decision.senderId,
++      content,
++      meta: event.meta,
++      ...(ctx.message?.message_id !== undefined
++        ? { messageId: String(ctx.message.message_id) }
++        : {}),
++      log: deps.log,
++    })
++    if (queued) {
++      deps.log.info('inbound delivered', {
++        kind,
++        chat_id: decision.chatId,
++        transport: 'inbox',
++      })
++      return
++    }
++  }
++
+   deps.log.info('inbound delivered', { kind, chat_id: decision.chatId })
+   const delivered = await sendChannelNotification(deps.server, event, deps.log)
+   if (!delivered) {
+@@ -1193,6 +1261,29 @@ export async function sendAlbumNotification(
+     media_group_id: ids.mediaGroupId,
+     album_size: album.messages.length,
+   })
++
++  // DM inbox transport (2026-09-22) — same contract as the single-message
++  // path in gateAndNotify: a committed inbox file, or fall through to the
++  // MCP notification below. Groups never reach here (they returned via
++  // the router branch above).
++  const albumDmStateDir = deps.dmInboxStateDir
++  if (
++    albumDmStateDir !== undefined
++    && !isGroup
++    && isWatchedDmChat(deps.dmInboxChatIds, ids.chatId)
++  ) {
++    const queued = await deliverDmToInbox({
++      stateDir: albumDmStateDir,
++      chatId: ids.chatId,
++      userId: ids.senderId,
++      content,
++      meta: event.meta,
++      ...(firstMessageId !== undefined ? { messageId: String(firstMessageId) } : {}),
++      log: deps.log,
++    })
++    if (queued) return { dispatched: true }
++  }
++
+   const delivered = await sendChannelNotification(deps.server, event, deps.log)
+   if (!delivered) {
+     // Bug #2 (TASK-4): throw so the caller dead-letters the on-disk
+diff --git a/plugin/tests/chats/multichat-entrypoint-attach.test.ts b/plugin/tests/chats/multichat-entrypoint-attach.test.ts
+new file mode 100644
+index 0000000..3cbd1ac
+--- /dev/null
++++ b/plugin/tests/chats/multichat-entrypoint-attach.test.ts
+@@ -0,0 +1,279 @@
++// Tests for attach mode in src/chats/hooks/multichat-entrypoint.sh
++// (2026-09-22): the same inbox watcher, pointed at a tmux pane that
++// somebody else owns (the master agent session), with no `claude` spawn.
++//
++// This is the transport private DMs use now — the MCP notification that
++// used to carry them drops text into the composer with no confirmation
++// that Enter ever landed, and six of the operator's messages died that
++// way between 20 and 22 Sep 2026.
++//
++// The script runs as a real process here (not sourced) with a stub tmux
++// and a stub claude on PATH, so we can assert both what it injected and
++// that it never launched a second Claude session.
++
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
++import { spawnSync } from 'child_process'
++import {
++  chmodSync,
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readFileSync,
++  readdirSync,
++  rmSync,
++  writeFileSync,
++} from 'fs'
++import { tmpdir } from 'os'
++import { join } from 'path'
++
++const SCRIPT = join(
++  import.meta.dir,
++  '..',
++  '..',
++  'src',
++  'chats',
++  'hooks',
++  'multichat-entrypoint.sh',
++)
++
++const CHAT_ID = '100000001'
++const READY_PANE = '❯ \n⏵⏵ bypass permissions on (shift+tab to cycle)\n'
++
++let dir: string
++
++beforeEach(() => {
++  dir = mkdtempSync(join(tmpdir(), 'entrypoint-attach-'))
++  mkdirSync(join(dir, 'bin'), { recursive: true })
++})
++
++afterEach(() => {
++  rmSync(dir, { recursive: true, force: true })
++})
++
++function inboxDir(): string {
++  return join(dir, 'state', 'chats', CHAT_ID, 'inbox')
++}
++
++// Stub tmux: logs every call, serves a ready pane for capture-pane, and
++// answers `display-message` (the pane-liveness probe) with success for
++// the first TMUX_STUB_ALIVE_CALLS invocations and failure afterwards —
++// that is how a test ends the watcher loop deterministically.
++function installStubs(): void {
++  const tmux = `#!/usr/bin/env bash
++DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
++echo "$@" >> "$DIR/tmux.log"
++if [[ "$1" == "display-message" ]]; then
++  n=$(cat "$DIR/alive-count" 2>/dev/null || echo 0)
++  n=$((n + 1))
++  echo "$n" > "$DIR/alive-count"
++  [[ "$n" -le "\${TMUX_STUB_ALIVE_CALLS:-2}" ]] || exit 1
++  echo '%7'
++  exit 0
++fi
++if [[ "$1" == "capture-pane" ]]; then
++  cat "$DIR/pane.txt" 2>/dev/null || true
++fi
++if [[ "$1" == "load-buffer" ]]; then
++  cat > "$DIR/loaded-buffer.txt"
++fi
++if [[ "$1" == "paste-buffer" ]]; then
++  # Model the composer: a paste echoes into the pane unless the test
++  # asks for a swallowed paste (TMUX_STUB_NO_ECHO=1 — a modal holding
++  # the keyboard).
++  if [[ "\${TMUX_STUB_NO_ECHO:-0}" != "1" ]]; then
++    cat "$DIR/loaded-buffer.txt" >> "$DIR/pane.txt"
++  fi
++fi
++if [[ "$1" == "send-keys" && "$*" == *Enter* ]]; then
++  # Submit clears the composer back to an empty ready prompt.
++  if [[ "\${TMUX_STUB_ENTER_NOOP:-0}" != "1" ]]; then
++    printf '%s' "$(cat "$DIR/ready-pane.txt")" > "$DIR/pane.txt"
++  fi
++fi
++exit 0
++`
++  writeFileSync(join(dir, 'bin', 'tmux'), tmux)
++  chmodSync(join(dir, 'bin', 'tmux'), 0o755)
++
++  // A `claude` that only records the fact it was started. Attach mode
++  // must never reach it.
++  const claude = `#!/usr/bin/env bash
++DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
++echo started >> "$DIR/claude-started"
++exit 0
++`
++  writeFileSync(join(dir, 'bin', 'claude'), claude)
++  chmodSync(join(dir, 'bin', 'claude'), 0o755)
++
++  writeFileSync(join(dir, 'pane.txt'), READY_PANE)
++  writeFileSync(join(dir, 'ready-pane.txt'), READY_PANE)
++}
++
++function runAttach(
++  extraEnv: Record<string, string> = {},
++): { code: number; stdout: string; stderr: string } {
++  const res = spawnSync('bash', [SCRIPT], {
++    env: {
++      ...process.env,
++      PATH: `${join(dir, 'bin')}:${process.env['PATH'] ?? ''}`,
++      CHAT_ID,
++      MULTICHAT_STATE_DIR: join(dir, 'state'),
++      MULTICHAT_WATCH_ONLY: '1',
++      MULTICHAT_TARGET_PANE: 'agent-plugin',
++      MULTICHAT_ATTACH_POLL_TIMEOUT: '1',
++      MULTICHAT_READY_POLL_INTERVAL: '0.01',
++      MULTICHAT_READY_POLL_MAX: '5',
++      MULTICHAT_PASTE_SETTLE: '0.01',
++      MULTICHAT_SUBMIT_RETRY_DELAY: '0.01',
++      MULTICHAT_SUBMIT_RETRY_FACTOR: '1.0',
++      MULTICHAT_SUBMIT_RETRY_MAX: '3',
++      MULTICHAT_ECHO_POLL_INTERVAL: '0.01',
++      MULTICHAT_ECHO_POLL_MAX: '3',
++      ...extraEnv,
++    },
++    encoding: 'utf8',
++    timeout: 20_000,
++  })
++  return { code: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' }
++}
++
++function tmuxLog(): string[] {
++  try {
++    return readFileSync(join(dir, 'tmux.log'), 'utf8').trim().split('\n')
++  } catch {
++    return []
++  }
++}
++
++function writeInboxMessage(text: string, name = `${Date.now()}-a.json`): void {
++  mkdirSync(inboxDir(), { recursive: true })
++  writeFileSync(
++    join(inboxDir(), name),
++    JSON.stringify({ text, chat_id: CHAT_ID, user_id: '1', user: '' }),
++  )
++}
++
++function channelBlock(messageId: string, body: string): string {
++  return (
++    `<channel source="telegram" chat_id="${CHAT_ID}" user_id="1" ` +
++    `ts="2026-09-22T05:00:00.000Z" message_id="${messageId}"> ${body} </channel>`
++  )
++}
++
++function queuedJson(): string[] {
++  return readdirSync(inboxDir()).filter((f) => f.endsWith('.json'))
++}
++
++function processedNames(): string[] {
++  const p = join(inboxDir(), '.processed')
++  return existsSync(p) ? readdirSync(p) : []
++}
++
++describe('multichat-entrypoint attach mode', () => {
++  test('refuses to start without a target pane', () => {
++    installStubs()
++    const res = runAttach({ MULTICHAT_TARGET_PANE: '' })
++    expect(res.code).toBe(2)
++    expect(res.stderr).toContain('MULTICHAT_TARGET_PANE not set')
++    expect(existsSync(join(dir, 'claude-started'))).toBe(false)
++  })
++
++  test('refuses to start when the target pane is gone', () => {
++    installStubs()
++    const res = runAttach({ TMUX_STUB_ALIVE_CALLS: '0' })
++    expect(res.code).toBe(2)
++    expect(res.stderr).toContain('not found')
++    expect(existsSync(join(dir, 'claude-started'))).toBe(false)
++  })
++
++  test('injects a pending message and never spawns claude', () => {
++    installStubs()
++    writeInboxMessage(channelBlock('11752', 'привет'))
++    const res = runAttach()
++    expect(res.code).toBe(0)
++
++    const log = tmuxLog()
++    expect(log.some((l) => l.startsWith('load-buffer'))).toBe(true)
++    expect(log.some((l) => l.includes('Enter'))).toBe(true)
++    // The pasted body is the channel payload verbatim — the session needs
++    // the chat_id in it to answer with the reply tool.
++    const pasted = readFileSync(join(dir, 'loaded-buffer.txt'), 'utf8')
++    expect(pasted).toContain('chat_id="100000001"')
++    expect(pasted).toContain('привет')
++
++    // Delivered → moved out of the inbox, into .processed/ unprefixed.
++    expect(readdirSync(inboxDir()).filter((f) => f.endsWith('.json'))).toEqual([])
++    const processed = readdirSync(join(inboxDir(), '.processed'))
++    expect(processed.length).toBe(1)
++    expect(processed[0]?.startsWith('submit-unconfirmed-')).toBe(false)
++
++    expect(existsSync(join(dir, 'claude-started'))).toBe(false)
++  })
++
++  test('exits when the target pane dies instead of eating the inbox', () => {
++    installStubs()
++    const res = runAttach({ TMUX_STUB_ALIVE_CALLS: '1' })
++    expect(res.code).toBe(0)
++    // A message that arrives after the watcher is gone stays untouched.
++    writeInboxMessage('поздно')
++    expect(readdirSync(inboxDir()).filter((f) => f.endsWith('.json')).length).toBe(1)
++  })
++
++  test('a modal over the composer defers injection instead of eating the file', () => {
++    installStubs()
++    // No `❯` anywhere: a survey / trust prompt / picker owns the keyboard.
++    writeFileSync(join(dir, 'pane.txt'), 'Do you trust the files in this folder?\n1. Yes\n2. No\n')
++    writeInboxMessage(channelBlock('11752', 'привет'))
++    const res = runAttach()
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('composer not accepting input')
++    // Still queued — nothing was typed, so the next pass can retry it.
++    expect(queuedJson().length).toBe(1)
++    expect(processedNames()).toEqual([])
++    expect(tmuxLog().some((l) => l.includes('Enter'))).toBe(false)
++  })
++
++  test('a paste the pane never echoes does not get an Enter', () => {
++    installStubs()
++    writeInboxMessage(channelBlock('11753', 'привет'))
++    const res = runAttach({ TMUX_STUB_NO_ECHO: '1' })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('refusing to press Enter')
++    expect(tmuxLog().some((l) => l.includes('Enter'))).toBe(false)
++    // Pasted once, never re-pasted: the file is marked, not requeued.
++    expect(queuedJson()).toEqual([])
++    expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
++  })
++
++  test('two messages from the same chat get distinct fingerprints', () => {
++    installStubs()
++    writeInboxMessage(channelBlock('11752', 'первое'), '1000-a.json')
++    writeInboxMessage(channelBlock('11753', 'второе'), '1001-b.json')
++    const res = runAttach()
++    expect(res.code).toBe(0)
++    // Both confirmed: the constant `<channel source=…` prefix is not what
++    // the verifier watches — message_id is, so B cannot match A's echo.
++    expect(queuedJson()).toEqual([])
++    const processed = processedNames()
++    expect(processed.length).toBe(2)
++    expect(processed.some((f) => f.startsWith('submit-unconfirmed-'))).toBe(false)
++  })
++
++  test('an unconfirmed Enter marks the file rather than claiming success', () => {
++    installStubs()
++    writeInboxMessage(channelBlock('11754', 'привет'))
++    // Enter does nothing: the fingerprint stays on the pane and no
++    // generation starts — exactly the deaf-TUI state.
++    const res = runAttach({ TMUX_STUB_ENTER_NOOP: '1' })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('submit not confirmed')
++    expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
++  })
++
++  test('still refuses to start without CHAT_ID', () => {
++    installStubs()
++    const res = runAttach({ CHAT_ID: '' })
++    expect(res.code).toBe(2)
++    expect(res.stderr).toContain('refusing to start')
++  })
++})
+diff --git a/plugin/tests/chats/multichat-entrypoint-submit.test.ts b/plugin/tests/chats/multichat-entrypoint-submit.test.ts
+index d82b933..5e8a976 100644
+--- a/plugin/tests/chats/multichat-entrypoint-submit.test.ts
++++ b/plugin/tests/chats/multichat-entrypoint-submit.test.ts
+@@ -59,10 +59,22 @@ if [[ "$1" == "capture-pane" ]]; then
+   f="$DIR/pane-$n.txt"
+   while [[ ! -f "$f" && $n -gt 1 ]]; do n=$((n - 1)); f="$DIR/pane-$n.txt"; done
+   cat "$f" 2>/dev/null || true
++  # A pasted body stays echoed in the composer until an Enter takes it.
++  # Without this the pane never shows what we typed and the echo gate in
++  # submit_prompt would (correctly) refuse to press Enter at all.
++  if [[ -f "$DIR/echo-on" && "\${TMUX_STUB_NO_ECHO:-0}" != "1" ]]; then
++    cat "$DIR/loaded-buffer.txt" 2>/dev/null || true
++  fi
+ fi
+ if [[ "$1" == "load-buffer" ]]; then
+   cat > "$DIR/loaded-buffer.txt"
+ fi
++if [[ "$1" == "paste-buffer" ]]; then
++  : > "$DIR/echo-on"
++fi
++if [[ "$1" == "send-keys" && "$*" == *Enter* ]]; then
++  rm -f "$DIR/echo-on"
++fi
+ exit 0
+ `
+   spawnSync('mkdir', ['-p', join(dir, 'bin')])
+@@ -100,6 +112,8 @@ ${snippet}`,
+         MULTICHAT_SUBMIT_RETRY_DELAY: '0.01',
+         MULTICHAT_SUBMIT_RETRY_FACTOR: '1.0',
+         MULTICHAT_SUBMIT_RETRY_MAX: '3',
++        MULTICHAT_ECHO_POLL_INTERVAL: '0.01',
++        MULTICHAT_ECHO_POLL_MAX: '3',
+         ...extraEnv,
+       },
+       encoding: 'utf8',
+@@ -129,7 +143,7 @@ describe('submit_prompt', () => {
+     installStubTmux()
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+     // After the first Enter the turn is generating.
+-    writeFileSync(join(dir, 'pane-3.txt'), GENERATING_PANE)
++    writeFileSync(join(dir, 'pane-5.txt'), GENERATING_PANE)
+ 
+     const res = runHelpers(`submit_prompt 'hello from telegram, long enough'`)
+ 
+@@ -152,7 +166,7 @@ describe('submit_prompt', () => {
+     // generating after Enter.
+     writeFileSync(join(dir, 'pane-1.txt'), 'Welcome back!\nLoading MCP…\n')
+     writeFileSync(join(dir, 'pane-3.txt'), READY_PANE)
+-    writeFileSync(join(dir, 'pane-5.txt'), GENERATING_PANE)
++    writeFileSync(join(dir, 'pane-7.txt'), GENERATING_PANE)
+ 
+     const res = runHelpers(`submit_prompt 'message during boot race here'`)
+ 
+@@ -172,8 +186,8 @@ describe('submit_prompt', () => {
+     // swallowed) for one verify round, then generation starts.
+     const stuck = `❯ stuck message that did not submit yet\n`
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+-    writeFileSync(join(dir, 'pane-3.txt'), stuck)
+-    writeFileSync(join(dir, 'pane-5.txt'), GENERATING_PANE)
++    writeFileSync(join(dir, 'pane-5.txt'), stuck)
++    writeFileSync(join(dir, 'pane-7.txt'), GENERATING_PANE)
+ 
+     const res = runHelpers(
+       `submit_prompt 'stuck message that did not submit yet'`,
+@@ -210,7 +224,7 @@ describe('submit_prompt', () => {
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+     // After Enter: no "esc to interrupt" (turn already finished), and the
+     // composer no longer shows the message.
+-    writeFileSync(join(dir, 'pane-3.txt'), `❯ \nanswer rendered above\n`)
++    writeFileSync(join(dir, 'pane-5.txt'), `❯ \nanswer rendered above\n`)
+ 
+     const res = runHelpers(`submit_prompt 'fast turn message goes here ok'`)
+ 
+@@ -228,7 +242,8 @@ describe('submit_prompt', () => {
+       TMUX_STUB_FAIL_LOAD: '1',
+     })
+ 
+-    expect(res.code).toBe(1)
++    // 2, not 1: nothing reached the composer, so the caller may retry.
++    expect(res.code).toBe(2)
+     expect(res.stderr).toContain('load-buffer failed')
+     const log = tmuxLog()
+     expect(log.filter((l) => l.startsWith('paste-buffer')).length).toBe(0)
+@@ -242,9 +257,9 @@ describe('submit_prompt', () => {
+     // false-succeed off the old turn's footer.
+     const stuckWhileGenerating = `✻ Reticulating…\n❯ queued message sitting in composer\nesc to interrupt\n`
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE.replace('\n', '\nesc to interrupt\n'))
+-    writeFileSync(join(dir, 'pane-3.txt'), stuckWhileGenerating)
++    writeFileSync(join(dir, 'pane-5.txt'), stuckWhileGenerating)
+     // Eventually the composer clears (queued submit accepted).
+-    writeFileSync(join(dir, 'pane-5.txt'), `✻ Reticulating…\n❯ \nesc to interrupt\n`)
++    writeFileSync(join(dir, 'pane-7.txt'), `✻ Reticulating…\n❯ \nesc to interrupt\n`)
+ 
+     const res = runHelpers(
+       `submit_prompt 'queued message sitting in composer'`,
+@@ -264,8 +279,8 @@ describe('submit_prompt', () => {
+     // Fingerprint (first 60 chars) still visible → not submitted → retry;
+     // a byte-split fingerprint would never match and false-succeed on the
+     // first Enter instead.
+-    writeFileSync(join(dir, 'pane-3.txt'), `❯ ${ru}\n`)
+-    writeFileSync(join(dir, 'pane-5.txt'), GENERATING_PANE)
++    writeFileSync(join(dir, 'pane-5.txt'), `❯ ${ru}\n`)
++    writeFileSync(join(dir, 'pane-7.txt'), GENERATING_PANE)
+ 
+     const res = runHelpers(`submit_prompt '${ru}'`)
+ 
+@@ -318,7 +333,7 @@ describe('process_inbox', () => {
+   test('confirmed submit moves file to .processed/ unprefixed', () => {
+     installStubTmux()
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+-    writeFileSync(join(dir, 'pane-3.txt'), GENERATING_PANE)
++    writeFileSync(join(dir, 'pane-5.txt'), GENERATING_PANE)
+     const inbox = join(dir, 'inbox')
+     const processed = join(inbox, '.processed')
+     spawnSync('mkdir', ['-p', processed])
+diff --git a/plugin/tests/telegram/dm-inbox-delivery.test.ts b/plugin/tests/telegram/dm-inbox-delivery.test.ts
+new file mode 100644
+index 0000000..57a4934
+--- /dev/null
++++ b/plugin/tests/telegram/dm-inbox-delivery.test.ts
+@@ -0,0 +1,272 @@
++// DM delivery over the multichat file inbox (src/telegram/dm-inbox-delivery.ts)
++// plus the handler branch that prefers it (src/telegram/handlers.ts).
++//
++// The point of the transport: an MCP notification is fire-and-forget —
++// if the session composer never submits it, the message is gone and the
++// plugin still logged a success. The inbox file survives that, so the
++// watcher can retry the Enter. These tests pin the two invariants that
++// make the switch safe: a committed inbox write suppresses the legacy
++// notification (no double delivery), and a failed write does NOT (no
++// dropped delivery).
++
++import { describe, expect, test } from 'bun:test'
++import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs'
++import { tmpdir } from 'os'
++import { join } from 'path'
++import type { Context } from 'grammy'
++
++import { deliverDmToInbox } from '../../src/telegram/dm-inbox-delivery.js'
++import { handleInboundText, type HandlerDeps } from '../../src/telegram/handlers.js'
++import type { AppConfig, StatePaths } from '../../src/config.js'
++import { createLogger } from '../../src/log.js'
++import type { TelegramApi } from '../../src/channel/tools.js'
++import type { BotIdentity } from '../../src/prompt/build.js'
++
++const silentLog = createLogger('test', {
++  stream: { write: () => true } as unknown as NodeJS.WritableStream,
++})
++
++const USER_ID = 164795011
++
++function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
++  return {
++    bot_id: 8507713167,
++    dm_only: true,
++    allowed_user_ids: [USER_ID],
++    allowed_chat_ids: [USER_ID],
++    status: { enabled: false, interval_ms: 700, ttl_ms: 300_000, delete_on_complete: true, suppress_typing_bubble: false, simple_typing: false },
++    album: { flush_ms: 2000 },
++    voice: { provider: 'groq', language: 'ru', model: 'whisper-large-v3-turbo' },
++    webhook: { enabled: false, host: '127.0.0.1', port: 0 },
++    permission_relay: { enabled: false, allowed_user_ids: [USER_ID], bash_only_proof: true },
++    commands: { help: true, status: true, stop: true, reset: true, new: true },
++    memory: {
++      enabled: false,
++      source_tag: 'tg',
++      max_hot_bytes: 20480,
++      trim_keep_lines: 600,
++      buffer_ttl_ms: 5 * 60 * 1000,
++      buffer_max_entries: 100,
++    },
++    progress: { enabled: false, edit_throttle_ms: 3000, recent_buffer: 10, session_ttl_ms: 600000 },
++    task_mirror: { enabled: false, edit_throttle_ms: 3000, session_ttl_ms: 600000, collapse_completed_after: 5 },
++    watcher: { enabled: false, debounce_ms: 10_000, busy_threshold_ms: 30_000 },
++    tmux_mirror: { enabled: false, pane_target: '', socket_name: '', poll_interval_ms: 5000, line_count: 50, hide_segments: [], mode: 'latest_inbound_only', max_lines: 14 },
++    multichat: { enabled: false },
++    ask_user_question: { enabled: false, timeout_ms: 300_000, max_preview_chars: 1000 },
++    permission_gate: { enabled: false, timeout_ms: 120_000 },
++    richMessages: { enabled: false, perChatOptOut: [] },
++    ...overrides,
++  }
++}
++
++function makeStatePaths(): StatePaths {
++  const root = mkdtempSync(join(tmpdir(), 'dm-inbox-test-'))
++  return {
++    root,
++    env: join(root, '.env'),
++    config: join(root, 'config.json'),
++    allowlist: join(root, 'allowlist.json'),
++    pid: join(root, 'bot.pid'),
++    lock: join(root, 'bot.lock'),
++    updateOffset: join(root, 'update-offset'),
++    inbox: join(root, 'inbox'),
++    sessionIds: join(root, 'session-ids'),
++    deadLetterUpdates: join(root, 'dead-letter', 'updates'),
++    deadLetterWebhook: join(root, 'dead-letter', 'webhook'),
++    deadLetterOutbound: join(root, 'dead-letter', 'outbound'),
++    logs: {
++      server: join(root, 'logs', 'server.log'),
++      telegram: join(root, 'logs', 'telegram.log'),
++      permissions: join(root, 'logs', 'permissions.jsonl'),
++      webhook: join(root, 'logs', 'webhook.log'),
++      ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
++      permission_gate: join(root, 'logs', 'permission-gate.jsonl'),
++    },
++  }
++}
++
++function noopApi(): TelegramApi {
++  const noop = async (): Promise<never> => {
++    throw new Error('unexpected api call in dm inbox test')
++  }
++  return {
++    sendMessage: noop as unknown as TelegramApi['sendMessage'],
++    sendRichMessage: noop as unknown as TelegramApi['sendRichMessage'],
++    editMessageText: noop as unknown as TelegramApi['editMessageText'],
++    setMessageReaction: async () => {},
++    sendChatAction: async () => {},
++    sendDocument: noop as unknown as TelegramApi['sendDocument'],
++    sendPhoto: noop as unknown as TelegramApi['sendPhoto'],
++    downloadFile: noop as unknown as TelegramApi['downloadFile'],
++    deleteMessage: noop as unknown as TelegramApi['deleteMessage'],
++    answerGuestQuery: noop as unknown as TelegramApi['answerGuestQuery'],
++  }
++}
++
++function makeDeps(dmInboxStateDir?: string, dmInboxChatIds: string[] = [String(USER_ID)]): {
++  deps: HandlerDeps
++  notifications: Array<{ method: string; params: unknown }>
++  statePaths: StatePaths
++} {
++  const notifications: Array<{ method: string; params: unknown }> = []
++  const statePaths = makeStatePaths()
++  const bot: BotIdentity = { id: 8507713167, username: 'canarybot' }
++  const deps: HandlerDeps = {
++    server: {
++      notification: async (msg: { method: string; params: unknown }): Promise<void> => {
++        notifications.push({ method: msg.method, params: msg.params })
++      },
++      // eslint-disable-next-line @typescript-eslint/no-explicit-any
++    } as any,
++    config: makeConfig(),
++    statePaths,
++    telegramApi: noopApi(),
++    log: silentLog,
++    bot,
++    botApi: { api: {} } as unknown as HandlerDeps['botApi'],
++    botToken: 'stub-value-for-tests',
++    env: {},
++    ...(dmInboxStateDir !== undefined ? { dmInboxStateDir, dmInboxChatIds } : {}),
++  }
++  return { deps, notifications, statePaths }
++}
++
++function makeCtx(text: string, chatType: 'private' | 'supergroup' = 'private'): Context {
++  return {
++    chat: { id: USER_ID, type: chatType },
++    from: { id: USER_ID, is_bot: false, first_name: 'Owner' },
++    message: {
++      message_id: 4242,
++      date: 1700000000,
++      text,
++      chat: { id: USER_ID, type: chatType },
++      from: { id: USER_ID, is_bot: false, first_name: 'Owner' },
++    },
++  } as unknown as Context
++}
++
++function inboxFiles(stateDir: string): string[] {
++  const dir = join(stateDir, 'chats', String(USER_ID), 'inbox')
++  return readdirSync(dir).filter((f) => f.endsWith('.json'))
++}
++
++function readInbox(stateDir: string): Record<string, unknown> {
++  const dir = join(stateDir, 'chats', String(USER_ID), 'inbox')
++  const files = inboxFiles(stateDir)
++  return JSON.parse(readFileSync(join(dir, files[0]!), 'utf8')) as Record<string, unknown>
++}
++
++describe('deliverDmToInbox', () => {
++  test('commits a rendered channel block, with no user attribution', async () => {
++    const stateDir = mkdtempSync(join(tmpdir(), 'dm-state-'))
++    const ok = await deliverDmToInbox({
++      stateDir,
++      chatId: String(USER_ID),
++      userId: String(USER_ID),
++      content: 'привет',
++      meta: {
++        source: 'telegram',
++        chat_id: String(USER_ID),
++        user: 'owner & co',
++        ts: '2026-09-22T05:00:00.000Z',
++      },
++      messageId: '4242',
++      log: silentLog,
++    })
++    expect(ok).toBe(true)
++    const msg = readInbox(stateDir)
++    // Same shape the MCP path produces — the session reads chat_id out of
++    // this tag to answer with the reply tool. Attribute values escaped.
++    expect(msg['text']).toBe(
++      '<channel source="telegram" chat_id="164795011" user="owner &amp; co" ' +
++        'ts="2026-09-22T05:00:00.000Z"> привет </channel>',
++    )
++    // Empty user => build_prompt emits the text without a `[from @…]` prefix.
++    expect(msg['user']).toBe('')
++    expect(msg['chat_id']).toBe(String(USER_ID))
++    expect(msg['message_id']).toBe('4242')
++    rmSync(stateDir, { recursive: true, force: true })
++  })
++
++  test('returns false instead of throwing when the inbox cannot be written', async () => {
++    // A regular file where the state dir should be — ensureChatStateDirs fails.
++    const blocker = join(mkdtempSync(join(tmpdir(), 'dm-state-')), 'not-a-dir')
++    writeFileSync(blocker, 'x')
++    const ok = await deliverDmToInbox({
++      stateDir: blocker,
++      chatId: String(USER_ID),
++      userId: String(USER_ID),
++      content: 'x',
++      meta: { source: 'telegram', chat_id: String(USER_ID) },
++      log: silentLog,
++    })
++    expect(ok).toBe(false)
++  })
++})
++
++describe('handleInboundText — DM transport selection', () => {
++  test('inbox mode: DM goes to the file inbox and NOT to the MCP notification', async () => {
++    const stateDir = mkdtempSync(join(tmpdir(), 'dm-state-'))
++    const { deps, notifications, statePaths } = makeDeps(stateDir)
++
++    await handleInboundText(makeCtx('привет'), deps)
++
++    expect(notifications.length).toBe(0)
++    const msg = readInbox(stateDir)
++    expect(String(msg['text'])).toContain('привет')
++    expect(String(msg['text'])).toContain('chat_id="164795011"')
++    rmSync(stateDir, { recursive: true, force: true })
++    rmSync(statePaths.root, { recursive: true, force: true })
++  })
++
++  test('falls back to the MCP notification when the inbox write fails', async () => {
++    const blocker = join(mkdtempSync(join(tmpdir(), 'dm-state-')), 'not-a-dir')
++    writeFileSync(blocker, 'x')
++    const { deps, notifications, statePaths } = makeDeps(blocker)
++
++    await handleInboundText(makeCtx('привет'), deps)
++
++    expect(notifications.length).toBe(1)
++    rmSync(statePaths.root, { recursive: true, force: true })
++  })
++
++  test('chat not in the watched list stays on the MCP notification', async () => {
++    // No watcher drains this chat's inbox, so a file written there would
++    // never be read AND the notify fallback would be suppressed — the
++    // exact silent-loss bug the transport exists to remove.
++    const stateDir = mkdtempSync(join(tmpdir(), 'dm-state-'))
++    const { deps, notifications, statePaths } = makeDeps(stateDir, ['999000111'])
++
++    await handleInboundText(makeCtx('привет'), deps)
++
++    expect(notifications.length).toBe(1)
++    expect(existsSync(join(stateDir, 'chats', String(USER_ID), 'inbox'))).toBe(false)
++    rmSync(stateDir, { recursive: true, force: true })
++    rmSync(statePaths.root, { recursive: true, force: true })
++  })
++
++  test('group message in inbox mode still uses the MCP notification', async () => {
++    const stateDir = mkdtempSync(join(tmpdir(), 'dm-state-'))
++    const { deps, notifications, statePaths } = makeDeps(stateDir)
++    deps.config.dm_only = false
++
++    await handleInboundText(makeCtx('привет', 'supergroup'), deps)
++
++    // Whatever the group routing decides (mention gating, outbox), it must
++    // never be the DM inbox — that transport is private-chat only.
++    expect(existsSync(join(stateDir, 'chats', String(USER_ID), 'inbox'))).toBe(false)
++    expect(notifications.length).toBeLessThanOrEqual(1)
++    rmSync(stateDir, { recursive: true, force: true })
++    rmSync(statePaths.root, { recursive: true, force: true })
++  })
++
++  test('notify mode (no state dir configured) is unchanged', async () => {
++    const { deps, notifications, statePaths } = makeDeps()
++
++    await handleInboundText(makeCtx('привет'), deps)
++
++    expect(notifications.length).toBe(1)
++    rmSync(statePaths.root, { recursive: true, force: true })
++  })
++})

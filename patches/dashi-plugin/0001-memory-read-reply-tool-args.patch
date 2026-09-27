@@ -1,0 +1,557 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Thu, 28 May 2026 02:57:43 +0000
+Subject: [PATCH 01/10] =?UTF-8?q?fix(memory):=20Fix=20Y=20=E2=80=94=20?=
+ =?UTF-8?q?=D1=87=D0=B8=D1=82=D0=B0=D1=82=D1=8C=20args=20reply=20tool=20?=
+ =?UTF-8?q?=D0=B2=D0=BC=D0=B5=D1=81=D1=82=D0=BE=20=D1=82=D0=B5=D0=BA=D1=81?=
+ =?UTF-8?q?=D1=82=D0=B0,=20+=20boundary=20fix?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bug #2.5: readLastAssistantText возвращал PRIOR turn's text когда turn
+заканчивался на tool_use без follow-up text → recent-plugin.md off-by-one.
+
+Fix Y: полная замена reader на readLastReplyToolArgs — backward walk
+ищет последний assistant tool_use где name == 'mcp__dashi-channel__reply',
+возвращает input.text (== ровно то что ушло в Telegram). Нет reply → null,
+writer эмитит forensic marker '(no reply tool call)' (HARD RULE signal).
+
+Boundary fix: tool_result responses пишутся как role='user' messages
+(synthetic ответы на assistant tool_use). Backward walk видел их сразу
+после assistant reply → срабатывал turn boundary → return null до того
+как доходил до actual reply tool_use. Now: role='user' с content все
+блоки type='tool_result' → continue (synthetic). Только non-tool_result
+user message = real prompt boundary.
+
+writer.ts: import update + 3 forensic markers
+('(no transcript)' / '(no reply tool call)' / real text).
+
+tests: 16 кейсов под новый API + boundary case + happy path + multi-turn
+isolation + malformed JSON shape guards.
+
+Validation: 5/5 alignment, forensic markers = 0.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ plugin/src/memory/transcript-reader.ts        | 105 +++++++----
+ plugin/src/memory/writer.ts                   |  48 +++--
+ plugin/tests/memory/transcript-reader.test.ts | 177 ++++++++++++------
+ 3 files changed, 208 insertions(+), 122 deletions(-)
+
+diff --git a/plugin/src/memory/transcript-reader.ts b/plugin/src/memory/transcript-reader.ts
+index f5a16b0..08aff69 100644
+--- a/plugin/src/memory/transcript-reader.ts
++++ b/plugin/src/memory/transcript-reader.ts
+@@ -1,28 +1,38 @@
+-// Phase 8 / T5 — tail-read the last assistant text from a Claude
+-// transcript JSONL file.
++// Phase 8 / T5 (PATCH-Y, 2026-05-23) — extract last `dashi-channel reply` tool
++// args from a Claude transcript JSONL file.
+ //
+-// Claude Code persists each session as `~/.claude/projects/<slug>/<sid>.jsonl`
+-// with one JSON object per line. We're interested in the last line whose
+-// `message.role === 'assistant'` and whose `message.content` array has
+-// at least one `{type: 'text', text: ...}` block — that's the text the
+-// user would have seen at the end of the turn. Tool-use only assistant
+-// messages are skipped (they have content[].type === 'tool_use').
++// REPLACES the original readLastAssistantText. The old reader returned the
++// last assistant text block; broke when Claude finished a turn with a tool
++// call (no follow-up text) — returned PRIOR turn's text, causing
++// recent-plugin.md misalignment (5/5 in fast-fire burn-in 2026-05-23).
+ //
+-// Strategy: open the file, read at most the trailing TAIL_BYTES bytes
+-// to keep memory bounded on multi-megabyte transcripts, drop the first
+-// (possibly-truncated) line when we didn't start at byte 0, then walk
+-// the lines backward and return the first parseable assistant text.
++// New strategy: walk transcript lines backward, find the last assistant
++// message containing a tool_use block where name === REPLY_TOOL_NAME,
++// return input.text (== exactly what was sent to Telegram).
+ //
+-// All errors are swallowed and surface as `null` — the caller treats
+-// "no agent text" as "(inline)". Missing files, permission denied,
+-// malformed JSON, schema drift — none of them should block the hot/
+-// verbose writes for the user side.
++// Turn boundary: stop when we hit a REAL user message going backward. Reply
++// tool calls before that boundary belong to a prior turn — must NOT be
++// reported as this turn's answer. Returns null if current turn has no reply
++// (HARD RULE violation — caller emits forensic marker downstream).
++//
++// IMPORTANT: Claude Code writes tool_result responses as role='user'
++// messages with content[].type === 'tool_result'. Those are synthetic
++// (responses to assistant tool_use), NOT real turn boundaries — skip them.
++// A real user prompt has at least one non-tool_result block.
++//
++// MVP: returns LAST reply in turn. If Claude splits long answer into multiple
++// reply() calls, earlier chunks are dropped. Document only; extend to
++// concatenate-all if burn-in shows split-reply pattern.
++//
++// All errors swallowed → null. Defensive JSON.parse per-line (partial/
++// malformed lines skipped, never abort).
+ 
+ import { open, type FileHandle } from 'node:fs/promises'
+ 
+ const TAIL_BYTES = 256 * 1024
++const REPLY_TOOL_NAME = 'mcp__dashi-channel__reply'
+ 
+-export async function readLastAssistantText(
++export async function readLastReplyToolArgs(
+   transcriptPath: string,
+ ): Promise<string | null> {
+   let handle: FileHandle | undefined
+@@ -36,52 +46,69 @@ export async function readLastAssistantText(
+     await handle.read(buf, 0, len, start)
+     const text = buf.toString('utf8')
+ 
+-    // Drop possibly-truncated first chunk if we didn't start at byte 0;
+-    // also filter empty lines so a trailing newline doesn't produce an
+-    // empty parse attempt.
++    // Drop possibly-truncated first chunk if we didn't start at byte 0.
+     const split = text.split('\n')
+     const lines = (start > 0 ? split.slice(1) : split).filter((l) => l.length > 0)
+ 
++    // Walk backward. Stop at the first user message — that's the boundary of
++    // the CURRENT turn. Reply tool calls before that belong to prior turn.
+     for (let i = lines.length - 1; i >= 0; i--) {
+-      // Permissive parse: valid JSON with the wrong shape (null, a bare
+-      // array, a string, …) used to bypass the per-line try/catch and
+-      // throw at the next `obj.message?.role` access, escaping to the
+-      // OUTER catch and short-circuiting earlier valid assistant text.
+-      // Each line is now its own boundary — shape mismatch = skip, not
+-      // abort.
+       let obj: unknown
+       try {
+         obj = JSON.parse(lines[i]!)
+       } catch {
++        // Partial/malformed line — skip defensively.
+         continue
+       }
+       if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) continue
+       const msg = (obj as { message?: unknown }).message
+       if (typeof msg !== 'object' || msg === null) continue
+       const role = (msg as { role?: unknown }).role
+-      if (role !== 'assistant') continue
+       const content = (msg as { content?: unknown }).content
++
++      // Turn boundary (backward): first REAL user message ends search window.
++      // tool_result messages have role='user' but are synthetic responses to
++      // assistant tool_use — NOT real boundaries. A real user prompt has at
++      // least one block that is not a tool_result.
++      if (role === 'user') {
++        if (
++          Array.isArray(content) &&
++          content.length > 0 &&
++          content.every(
++            (c) =>
++              typeof c === 'object' &&
++              c !== null &&
++              (c as { type?: unknown }).type === 'tool_result',
++          )
++        ) {
++          continue
++        }
++        return null
++      }
++
++      if (role !== 'assistant') continue
+       if (!Array.isArray(content)) continue
+-      const parts: string[] = []
+-      for (const c of content) {
++
++      // Find LAST reply tool_use in this assistant message (last-only MVP for
++      // multiple replies in one turn — extend to concat if pattern surfaces).
++      for (let j = content.length - 1; j >= 0; j--) {
++        const c = content[j]
+         if (typeof c !== 'object' || c === null) continue
+-        const block = c as { type?: unknown; text?: unknown }
+-        if (block.type === 'text' && typeof block.text === 'string') {
+-          parts.push(block.text)
+-        }
++        const block = c as { type?: unknown; name?: unknown; input?: unknown }
++        if (block.type !== 'tool_use') continue
++        if (block.name !== REPLY_TOOL_NAME) continue
++        if (typeof block.input !== 'object' || block.input === null) continue
++        const replyInput = block.input as { text?: unknown }
++        if (typeof replyInput.text !== 'string') continue
++        return replyInput.text
+       }
+-      if (parts.length > 0) return parts.join('\n')
+     }
+     return null
+   } catch {
+     return null
+   } finally {
+     if (handle) {
+-      try {
+-        await handle.close()
+-      } catch {
+-        // close() race on an already-closed handle is harmless
+-      }
++      try { await handle.close() } catch { /* harmless close-race */ }
+     }
+   }
+ }
+diff --git a/plugin/src/memory/writer.ts b/plugin/src/memory/writer.ts
+index 92eb0f2..a29eb69 100644
+--- a/plugin/src/memory/writer.ts
++++ b/plugin/src/memory/writer.ts
+@@ -1,16 +1,18 @@
+ // Phase 8 / T6 — MemoryWriter facade.
+ //
+ // One instance per plugin process (one agent = one workspace).
+-// onHook(payload) is the single entry point called from the
+-// /hooks/agent webhook branch. UserPromptSubmit buffers the prompt
+-// by chatId; Stop reads the buffer + tail-reads the transcript for
+-// the assistant text + appends one entry each to recent.md and
+-// verbose-YYYY-MM-DD.jsonl.
++// onHook(payload) is the single entry point called from the /hooks/agent
++// webhook branch. UserPromptSubmit buffers the prompt by chatId; Stop reads
++// the buffer + tail-reads the transcript for the reply tool args + appends
++// one entry each to recent.md and verbose-YYYY-MM-DD.jsonl.
+ //
+-// All errors are swallowed — the webhook still returns 200 so Claude
+-// hooks don't back-pressure on a memory outage. The webhook branch
+-// wraps onHook() in its own try/catch + log.warn so even an unhandled
+-// throw here cannot block the HTTP response.
++// All errors swallowed — webhook still returns 200 so Claude hooks don't
++// back-pressure on a memory outage. Webhook branch wraps onHook() in its own
++// try/catch + log.warn so even an unhandled throw here cannot block 200.
++//
++// PATCH-Y (2026-05-23): readLastAssistantText → readLastReplyToolArgs.
++// Memory now reflects exact reply tool args (source of truth) instead of
++// last assistant narration text (which lagged by one turn under fast-fire).
+ 
+ import { join } from 'node:path'
+ 
+@@ -19,16 +21,12 @@ import type { ClaudeHookPayload } from '../schemas.js'
+ import { appendHotEntry, snippet } from './hot-writer.js'
+ import { appendVerbose, type VerboseRecord } from './verbose-writer.js'
+ import { PromptBuffer } from './prompt-buffer.js'
+-import { readLastAssistantText } from './transcript-reader.js'
++import { readLastReplyToolArgs } from './transcript-reader.js'
+ 
+ export interface MemoryConfig {
+-  // <agent-workspace> root. recent.md lands at workspace/core/hot/recent.md.
+   workspacePath: string
+-  // Pre-resolved logs dir (T7 derives <workspace_parent>/logs as the
+-  // default when config.memory.logs_path is unset).
+   logsPath: string
+   sourceTag: string
+-  // Human-friendly capitalised name (e.g. 'Silvana', 'Kaelthas').
+   agentLabel: string
+   maxHotBytes: number
+   trimKeepLines: number
+@@ -69,33 +67,33 @@ export class MemoryWriter {
+     const buffered = this.buffer.take(chatId)
+     const userText = buffered?.prompt ?? '(no prompt)'
+     if (!buffered) {
+-      // Stop without a prior UserPromptSubmit can happen on resume/clear
+-      // hooks, restart races, or when the buffer expired. We never drop
+-      // the entry — '(no prompt)' is the gateway.py parity behaviour.
+       this.log.warn('[memory] Stop without buffered prompt', {
+         chatId,
+         session_id: payload.session_id,
+       })
+     }
+ 
+-    let agentText = ''
++    // PATCH-Y: read exact reply tool args, not last assistant text.
++    // Three explicit forensic markers cover edge cases:
++    //   '(no transcript)'      — payload missing transcript_path (rare)
++    //   '(no reply tool call)' — HARD RULE violation, no reply this turn
++    //   <real text>            — happy path
++    let agentText = '(no transcript)'
+     if (typeof payload.transcript_path === 'string' && payload.transcript_path) {
+-      const t = await readLastAssistantText(payload.transcript_path)
+-      if (t) agentText = t
++      const t = await readLastReplyToolArgs(payload.transcript_path)
++      agentText = t ?? '(no reply tool call)'
+     }
+ 
+     const ts = formatLocalTs(new Date(this.now()))
+-    const hotPath = join(this.cfg.workspacePath, 'core', 'hot', 'recent.md')
++    const hotFilename = process.env.HOT_MEMORY_FILENAME ?? 'recent.md'
++    const hotPath = join(this.cfg.workspacePath, 'core', 'hot', hotFilename)
+     await appendHotEntry({
+       path: hotPath,
+       ts,
+       agentLabel: this.cfg.agentLabel,
+       sourceTag: this.cfg.sourceTag,
+       userSnippet: snippet(userText),
+-      // gateway.py:1950 uses '(inline)' as the agent fallback when no
+-      // response text was captured. We mirror that to keep recent.md
+-      // diff-able between the two implementations.
+-      agentSnippet: snippet(agentText || '(inline)'),
++      agentSnippet: snippet(agentText),
+       maxBytes: this.cfg.maxHotBytes,
+       trimKeepLines: this.cfg.trimKeepLines,
+     })
+diff --git a/plugin/tests/memory/transcript-reader.test.ts b/plugin/tests/memory/transcript-reader.test.ts
+index 5e7d4d0..bbc0270 100644
+--- a/plugin/tests/memory/transcript-reader.test.ts
++++ b/plugin/tests/memory/transcript-reader.test.ts
+@@ -1,11 +1,18 @@
+-// Phase 8 / T5 — transcript-reader tests.
++// Phase 8 / T5 (PATCH-Y, 2026-05-23) — transcript-reader tests.
++//
++// Rewritten for readLastReplyToolArgs (replaces readLastAssistantText). The
++// new reader walks JSONL backward and returns input.text from the last
++// assistant message containing a tool_use block where name === REPLY_TOOL_NAME.
++// Turn boundary: stop at the first user message going backward.
+ 
+ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ 
+-import { readLastAssistantText } from '../../src/memory/transcript-reader.js'
++import { readLastReplyToolArgs } from '../../src/memory/transcript-reader.js'
++
++const REPLY_TOOL = 'mcp__dashi-channel__reply'
+ 
+ let dir: string
+ 
+@@ -27,133 +34,187 @@ function line(obj: unknown): string {
+   return JSON.stringify(obj) + '\n'
+ }
+ 
+-describe('readLastAssistantText', () => {
+-  test('returns text from last assistant message with single text block', async () => {
++function userMsg(text: string): string {
++  return line({ message: { role: 'user', content: [{ type: 'text', text }] } })
++}
++
++function replyToolUse(text: string, id = 'tu_reply'): unknown {
++  return { type: 'tool_use', id, name: REPLY_TOOL, input: { text } }
++}
++
++function asstWithReply(text: string): string {
++  return line({ message: { role: 'assistant', content: [replyToolUse(text)] } })
++}
++
++describe('readLastReplyToolArgs', () => {
++  test('returns input.text from assistant reply tool_use (happy path)', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } }) +
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'hello back' }] } }),
++      userMsg('hi') +
++      asstWithReply('hello back'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('hello back')
++    expect(await readLastReplyToolArgs(path)).toBe('hello back')
+   })
+ 
+-  test('joins multiple text blocks with \\n', async () => {
++  test('returns LAST reply tool_use in a single assistant message', async () => {
+     const path = write('t.jsonl',
++      userMsg('q') +
+       line({
+         message: {
+           role: 'assistant',
+           content: [
+-            { type: 'text', text: 'part1' },
+-            { type: 'tool_use', id: 'tu', name: 'X', input: {} },
+-            { type: 'text', text: 'part2' },
++            replyToolUse('first chunk', 'tu1'),
++            { type: 'text', text: 'narration between' },
++            replyToolUse('second chunk', 'tu2'),
+           ],
+         },
+       }),
+     )
+-    expect(await readLastAssistantText(path)).toBe('part1\npart2')
++    expect(await readLastReplyToolArgs(path)).toBe('second chunk')
+   })
+ 
+-  test('returns the LAST assistant message, not the first', async () => {
++  test('turn boundary — user message going backward stops search, returns null', async () => {
++    // Prior turn had a reply; CURRENT turn (after last user) has none.
++    // Must NOT leak prior turn's reply.
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'first' }] } }) +
+-      line({ message: { role: 'user', content: [{ type: 'text', text: 'next' }] } }) +
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'second' }] } }),
++      userMsg('q1') +
++      asstWithReply('answer 1') +
++      userMsg('q2'),
++    )
++    expect(await readLastReplyToolArgs(path)).toBeNull()
++  })
++
++  test('ignores tool_use with a different name (not the reply tool)', async () => {
++    const path = write('t.jsonl',
++      userMsg('q') +
++      line({
++        message: {
++          role: 'assistant',
++          content: [
++            { type: 'tool_use', id: 'tu_other', name: 'mcp__other__tool', input: { text: 'ignored' } },
++            { type: 'text', text: 'narration' },
++          ],
++        },
++      }),
+     )
+-    expect(await readLastAssistantText(path)).toBe('second')
++    expect(await readLastReplyToolArgs(path)).toBeNull()
+   })
+ 
+-  test('skips assistant messages that have only tool_use blocks', async () => {
++  test('returns reply from CURRENT turn (after last user message)', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'real reply' }] } }) +
+-      line({ message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu', name: 'X', input: {} }] } }),
++      userMsg('q1') +
++      asstWithReply('old answer') +
++      userMsg('q2') +
++      asstWithReply('new answer'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('real reply')
++    expect(await readLastReplyToolArgs(path)).toBe('new answer')
+   })
+ 
+-  test('returns null when no assistant message exists', async () => {
++  test('returns null when current turn has no reply tool call (HARD RULE violation marker)', async () => {
++    // Assistant produced only text — no reply tool call. Caller will emit
++    // '(no reply tool call)' forensic marker.
+     const path = write('t.jsonl',
+-      line({ message: { role: 'user', content: [{ type: 'text', text: 'only user' }] } }),
++      userMsg('q') +
++      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'I forgot to call reply' }] } }),
+     )
+-    expect(await readLastAssistantText(path)).toBeNull()
++    expect(await readLastReplyToolArgs(path)).toBeNull()
+   })
+ 
+   test('returns null for empty file', async () => {
+     const path = write('t.jsonl', '')
+-    expect(await readLastAssistantText(path)).toBeNull()
++    expect(await readLastReplyToolArgs(path)).toBeNull()
+   })
+ 
+   test('returns null when path does not exist (no throw)', async () => {
+-    expect(await readLastAssistantText(join(dir, 'missing.jsonl'))).toBeNull()
++    expect(await readLastReplyToolArgs(join(dir, 'missing.jsonl'))).toBeNull()
+   })
+ 
+   test('handles malformed JSON line gracefully by skipping it', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'good' }] } }) +
+-      'this is not json\n',
++      userMsg('q') +
++      'this is not json\n' +
++      asstWithReply('good'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('good')
++    expect(await readLastReplyToolArgs(path)).toBe('good')
+   })
+ 
+   test('drops possibly-truncated first line when file > TAIL_BYTES', async () => {
+-    // Construct: a giant first line we DO NOT want to read, then a
+-    // smaller assistant text we expect to find. Total > 256 KB.
++    // Pad a giant assistant text we DO NOT want (truncated first chunk),
++    // then the wanted reply. Total > 256 KB.
+     const huge = JSON.stringify({
+-      message: { role: 'assistant', content: [{ type: 'text', text: 'X'.repeat(300_000) }] },
+-    }) + '\n'
+-    const wanted = JSON.stringify({
+-      message: { role: 'assistant', content: [{ type: 'text', text: 'KEEP-ME' }] },
++      message: {
++        role: 'assistant',
++        content: [replyToolUse('X'.repeat(300_000), 'tu_huge')],
++      },
+     }) + '\n'
++    const wanted = userMsg('q') + asstWithReply('KEEP-ME')
+     const path = write('t.jsonl', huge + wanted)
+-    const out = await readLastAssistantText(path)
+-    expect(out).toBe('KEEP-ME')
++    expect(await readLastReplyToolArgs(path)).toBe('KEEP-ME')
+   })
+ 
+   test('ignores entries where message.content is not an array', async () => {
+     const path = write('t.jsonl',
++      userMsg('q') +
+       line({ message: { role: 'assistant', content: 'string-not-array' } }) +
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'final' }] } }),
++      asstWithReply('final'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('final')
++    expect(await readLastReplyToolArgs(path)).toBe('final')
+   })
+ 
+   // ───────────────────────────────────────────────────────────────
+-  // Permissive shape guard (review MEDIUM):
+-  // before the fix, a valid JSON line with the wrong shape (e.g. `null`,
+-  // a bare array, a string) bypassed the per-line try/catch and threw at
+-  // the next `obj.message?.role` access, escaping to the OUTER catch and
+-  // short-circuiting ALL earlier assistant text. After the fix every
+-  // shape mismatch is a `continue`, not an abort.
++  // Permissive shape guard:
++  // valid JSON lines with the wrong top-level shape (null / array / string)
++  // must be skipped via `continue`, never escape to the outer try/catch.
+   // ───────────────────────────────────────────────────────────────
+ 
+-  test('skips JSON `null` line between two valid assistant messages', async () => {
++  test('skips JSON `null` line between user and valid assistant reply', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'older' }] } }) +
++      userMsg('q') +
+       'null\n' +
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'newer' }] } }),
++      asstWithReply('survives'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('newer')
++    expect(await readLastReplyToolArgs(path)).toBe('survives')
+   })
+ 
+   test('skips JSON array line (valid JSON, wrong shape)', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'keep me' }] } }) +
+-      '[1,2,3]\n',
++      userMsg('q') +
++      '[1,2,3]\n' +
++      asstWithReply('keep me'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('keep me')
++    expect(await readLastReplyToolArgs(path)).toBe('keep me')
+   })
+ 
+   test('skips JSON string line (valid JSON, wrong shape)', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'survives' }] } }) +
+-      '"just a string"\n',
++      userMsg('q') +
++      '"just a string"\n' +
++      asstWithReply('survives'),
+     )
+-    expect(await readLastAssistantText(path)).toBe('survives')
++    expect(await readLastReplyToolArgs(path)).toBe('survives')
+   })
+ 
+   test('skips line whose `message` is itself null', async () => {
+     const path = write('t.jsonl',
+-      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'good' }] } }) +
+-      line({ message: null }),
++      userMsg('q') +
++      line({ message: null }) +
++      asstWithReply('good'),
++    )
++    expect(await readLastReplyToolArgs(path)).toBe('good')
++  })
++
++  test('skips reply tool_use with non-string input.text', async () => {
++    // Defensive — if input.text is missing/not-string, do not return it.
++    // Falls through to earlier valid reply.
++    const path = write('t.jsonl',
++      userMsg('q') +
++      asstWithReply('valid earlier') +
++      line({
++        message: {
++          role: 'assistant',
++          content: [{ type: 'tool_use', id: 'tu_bad', name: REPLY_TOOL, input: { text: 42 } }],
++        },
++      }),
+     )
+-    expect(await readLastAssistantText(path)).toBe('good')
++    expect(await readLastReplyToolArgs(path)).toBe('valid earlier')
+   })
+ })

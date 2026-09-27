@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Fail if the kit carries personal identifiers or secret-shaped strings.
+#
+# Two passes:
+#   1. entities — one extended regex per line, read from a list kept OUTSIDE
+#      the repo (the list itself names the people it protects).
+#   2. secrets  — generic credential shapes, always on.
+#
+# vendor/dashi-plugin/ is upstream's code, kept byte-identical to a public
+# commit: pass 1 tolerates upstream's own names (UPSTREAM_ALLOW), pass 2 is
+# replaced by an integrity check against vendor/UPSTREAM_TREE_SHA256 (its test
+# suite is full of canary tokens). In patches/, lines added to test files are
+# fixtures and skipped by pass 2; everything else is scanned.
+#
+# Usage: leak-scan.sh [kit-root]
+# Env:   LEAK_ENTITIES_FILE (default ~/.config/tg-agent-init/leak-entities.txt)
+set -euo pipefail
+
+KIT_ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ENTITIES="${LEAK_ENTITIES_FILE:-$HOME/.config/tg-agent-init/leak-entities.txt}"
+UPSTREAM_ALLOW='thrall|edgelab'
+
+SECRET_PATTERNS=(
+  '[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}'          # Telegram bot token
+  'sk-ant-[A-Za-z0-9_-]{20,}'                  # Anthropic key / OAuth token
+  'gh[pousr]_[A-Za-z0-9]{30,}'                 # GitHub token
+  'gsk_[A-Za-z0-9]{20,}'                       # Groq key
+  'sk-[A-Za-z0-9]{32,}'                        # generic sk- key
+  'AKIA[0-9A-Z]{16}'                           # AWS access key id
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'         # PEM private key
+)
+
+GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache)
+fail=0
+
+log() { echo "[leak-scan] $*"; }
+
+if [ -f "$ENTITIES" ]; then
+  hits="$(grep -rnIiE -f "$ENTITIES" "${GREP_EXCLUDES[@]}" \
+            --exclude-dir=dashi-plugin --exclude=leak-scan.sh "$KIT_ROOT" || true)"
+  # --exclude-dir matches basenames, so patches/dashi-plugin was skipped above.
+  patch_hits="$(grep -rnIiE -f "$ENTITIES" "$KIT_ROOT/patches" 2>/dev/null || true)"
+  vendor_hits="$(grep -rnIiE -f "$ENTITIES" "${GREP_EXCLUDES[@]}" \
+            "$KIT_ROOT/vendor/dashi-plugin" 2>/dev/null \
+            | grep -viE "$UPSTREAM_ALLOW" || true)"
+  hits="$(printf '%s\n%s\n%s\n' "$hits" "$patch_hits" "$vendor_hits" | sed '/^$/d')"
+  if [ -n "$hits" ]; then
+    log "FAIL: personal entities found:"
+    printf '%s\n' "$hits" | cut -c1-200
+    fail=1
+  else
+    log "entities: clean ($(grep -cv '^\s*$' "$ENTITIES") patterns)"
+  fi
+else
+  log "WARN: entity list $ENTITIES not found — pass 1 skipped"
+  [ "${LEAK_SCAN_REQUIRE_ENTITIES:-0}" = 1 ] && fail=1
+fi
+
+# Added lines of non-test files inside patches, as "patch:line<TAB>text".
+patch_payload() {
+  local f
+  for f in "$KIT_ROOT"/patches/*/*.patch; do
+    [ -f "$f" ] || continue
+    awk -v f="$f" '
+      /^\+\+\+ / { file = $2; next }
+      /^\+/ && file !~ /(\/tests?\/|\.test\.)/ { print f ":" NR "\t" substr($0, 2) }
+    ' "$f"
+  done
+}
+
+secret_fail=0
+for pat in "${SECRET_PATTERNS[@]}"; do
+  hits="$(grep -rnIE -e "$pat" "${GREP_EXCLUDES[@]}" --exclude-dir=dashi-plugin \
+            --exclude=leak-scan.sh "$KIT_ROOT" | cut -d: -f1,2 || true)"
+  hits="$hits$(patch_payload | grep -E -e "$pat" | cut -f1 || true)"
+  if [ -n "$hits" ]; then
+    # Print only file:line — never the matched value.
+    log "FAIL: secret-shaped string ($pat) at:"
+    printf '%s\n' "$hits"
+    secret_fail=1
+  fi
+done
+[ "$secret_fail" -eq 1 ] && fail=1
+
+vendor_sum_file="$KIT_ROOT/vendor/UPSTREAM_TREE_SHA256"
+if [ -d "$KIT_ROOT/vendor/dashi-plugin" ]; then
+  actual="$("$KIT_ROOT/scripts/vendor-checksum.sh" "$KIT_ROOT/vendor/dashi-plugin")"
+  if [ "$actual" != "$(cat "$vendor_sum_file" 2>/dev/null)" ]; then
+    log "FAIL: vendor/dashi-plugin differs from the pinned upstream tree"
+    fail=1
+  else
+    log "vendor: matches pinned upstream tree"
+  fi
+fi
+[ "$secret_fail" -eq 0 ] && log "secrets: clean"
+
+exit "$fail"

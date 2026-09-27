@@ -1,0 +1,567 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tg-agent-init <kit@localhost>
+Date: Fri, 31 Jul 2026 11:30:14 +0000
+Subject: [PATCH 04/10] =?UTF-8?q?fix(telegram):=20=D0=BD=D0=B5=20=D0=BF?=
+ =?UTF-8?q?=D1=80=D0=BE=D0=B1=D0=B8=D0=B2=D0=B0=D1=82=D1=8C=20=D0=B0=D0=BA?=
+ =?UTF-8?q?=D1=82=D0=B8=D0=B2=D0=BD=D0=BE=D0=B5=20flood-=D0=BE=D0=BA=D0=BD?=
+ =?UTF-8?q?=D0=BE=20=E2=80=94=20=D0=BB=D0=B0=D1=82=D1=87=20=D0=BD=D0=B0=20?=
+ =?UTF-8?q?=D1=87=D0=B0=D1=82=20+=20=D0=BE=D1=82=D0=BA=D0=B0=D0=B7=20?=
+ =?UTF-8?q?=D0=BE=D1=82=20=D1=80=D0=B5=D1=82=D1=80=D0=B0=D1=8F=20=D1=81?=
+ =?UTF-8?q?=D0=B2=D1=8B=D1=88=D0=B5=20=D0=B1=D1=8E=D0=B4=D0=B6=D0=B5=D1=82?=
+ =?UTF-8?q?=D0=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Инцидент 31/07: retry_after обрезался до 60с и запрос уходил повторно внутри
+незакончившегося flood-окна. Telegram поднимал наказание: ~3 мин -> ~9 мин -> ~17 часов
+без доставки в личку. Сверху накладывались ретраи reply-инструмента самим агентом.
+
+- retry_after больше не clamp'ится: значение сверх бюджета (60с) не спится и не
+  ретраится, а сразу отдаётся ошибкой с дедлайном.
+- Латч на чат: любой 429 пишет floodUntilMs по сырому retry_after; пока латч жив,
+  ни один вызов для этого чата не уходит в сеть (три гейта в enqueueSend, включая
+  проверку после waitForCapacity — гонка найдена на cross-review).
+- TelegramFloodWaitError сохраняет форму grammY 429 для внешних слоёв и несёт текст
+  "MUST NOT be retried" — агент видит его в результате инструмента.
+- 33 теста в файле (13 новых на латч), полный прогон 2764 pass.
+---
+ .../src/safety/rate-limited-telegram-api.ts   | 177 ++++++++++++--
+ .../safety/rate-limited-telegram-api.test.ts  | 217 +++++++++++++++++-
+ 2 files changed, 367 insertions(+), 27 deletions(-)
+
+diff --git a/plugin/src/safety/rate-limited-telegram-api.ts b/plugin/src/safety/rate-limited-telegram-api.ts
+index ffa3715..e2247a4 100644
+--- a/plugin/src/safety/rate-limited-telegram-api.ts
++++ b/plugin/src/safety/rate-limited-telegram-api.ts
+@@ -16,6 +16,20 @@
+ //   3. 429 retry: on a grammY-shaped 429 (`error_code: 429`, optional
+ //      `parameters.retry_after`), sleep the requested seconds + a small
+ //      jitter and retry the SAME call. Bounded by `maxRetries` (default 3).
++//      A retry only happens when we can honour the wait IN FULL (see below).
++//   4. Per-chat flood latch: any 429 records `now + retry_after` for that chat.
++//      While the latch is live every further call for the chat fails fast with
++//      TelegramFloodWaitError and NEVER touches the network.
++//
++// WHY 3 AND 4 (incident 2026-07-31): this file used to CLAMP retry_after to 60s
++// and then re-send after that clamped sleep. When Telegram asked for 1020s the
++// wrapper slept 60s and hit Bot API again — inside the still-active flood
++// window. Requests issued during a flood wait make Telegram raise the penalty,
++// and LLM-level retries of the reply tool added more attempts on top. The
++// ladder observed in production was ~3 min -> ~9 min -> ~17 HOURS of the bot
++// being unable to DM its owner. Hence: never probe inside a window we cannot
++// fully wait out, and latch the chat so no other caller (including the agent
++// retrying its own tool) can probe either.
+ //
+ // Methods that don't consume the send-bucket: editMessageText (Telegram's
+ // edit limits are far more lenient), setMessageReaction, sendChatAction,
+@@ -85,8 +99,12 @@ interface ChatState {
+   // ordering matters more than throughput for a conversational channel.
+   // Different chats run in parallel (separate ChatState entries) so a stuck
+   // chat does not affect others. Worst-case per-chat stall is bounded by
+-  // `maxRetries * MAX_RETRY_AFTER_S`.
++  // `maxRetries * retryBudgetS`.
+   tail: Promise<void>
++  // Absolute ms deadline of an active Telegram flood wait for this chat, or 0
++  // when the chat is clear. Set from the RAW (unclamped) retry_after of any
++  // 429; never probed before it elapses.
++  floodUntilMs: number
+ }
+ 
+ export interface RateLimitOptions {
+@@ -95,6 +113,13 @@ export interface RateLimitOptions {
+   globalRefillPerSec?: number
+   globalBurstCapacity?: number
+   maxRetries?: number
++  /**
++   * Longest retry_after (seconds) we are willing to wait out IN-PROCESS. A 429
++   * asking for more than this is never retried here — it fails fast and latches
++   * the chat, because re-sending inside an unfinished flood window escalates
++   * the penalty. Default 60.
++   */
++  retryBudgetS?: number
+   jitterMaxMs?: number
+   /** Test seam: replace Date.now() for deterministic virtual time. */
+   now?: () => number
+@@ -107,25 +132,51 @@ interface Grammy429 {
+   parameters?: { retry_after?: number }
+ }
+ 
+-// Cap retry_after so one giant value from Telegram (or a hostile-shaped
+-// error) can't lock a chat's FIFO queue for minutes on end. The per-chat
+-// tail-promise chain blocks all subsequent sends to the same chat until the
+-// in-flight op finishes, so worst-case stall = maxRetries × MAX_RETRY_AFTER_S.
+-// With defaults (3 × 60s) that's a 3-minute ceiling; if Telegram really
+-// needs longer, the bounded retries exhaust and the caller sees the 429.
+-const MAX_RETRY_AFTER_S = 60
++// How long a wait we absorb in-process before giving up instead of retrying.
++// This is a BUDGET, not a clamp: a longer retry_after is honoured as a latch
++// deadline, it is simply never slept-through-and-retried inside this call. The
++// per-chat tail-promise chain blocks subsequent sends to the same chat while an
++// op is in flight, so worst-case stall stays maxRetries × retryBudgetS
++// (defaults: 3 × 60s = 3 minutes).
++const DEFAULT_RETRY_BUDGET_S = 60
++
++/**
++ * Thrown when a chat is inside an active Telegram flood wait. Keeps the
++ * grammY 429 shape (`error_code` / `parameters.retry_after`) so the outer
++ * reliable + rich layers keep classifying it as a rate-limit failure, and adds
++ * the deadline so callers can report when delivery becomes possible again.
++ */
++export class TelegramFloodWaitError extends Error {
++  readonly error_code = 429
++  readonly parameters: { retry_after: number }
++  readonly chatId: string
++  readonly untilMs: number
++
++  constructor(chatId: string, retryAfterS: number, untilMs: number) {
++    super(
++      `telegram flood wait active for chat ${chatId}: ${retryAfterS}s remaining ` +
++        `(until ${new Date(untilMs).toISOString()}). The message was NOT delivered ` +
++        `and MUST NOT be retried now — retrying inside the window extends the ban. ` +
++        `End the turn; delivery is possible after the deadline.`,
++    )
++    this.name = 'TelegramFloodWaitError'
++    this.parameters = { retry_after: retryAfterS }
++    this.chatId = chatId
++    this.untilMs = untilMs
++  }
++}
+ 
+ function parse429(err: unknown): { retryAfter: number } | null {
+   if (typeof err !== 'object' || err === null) return null
+   const e = err as Grammy429
+   if (e.error_code !== 429) return null
+   const after = e.parameters?.retry_after
+-  // Telegram's retry_after is in seconds. Coerce to a sane positive integer
+-  // and clamp into [1, MAX_RETRY_AFTER_S].
++  // Telegram's retry_after is in seconds. Coerce to a sane positive integer.
++  // NOT clamped: the real value is what the latch deadline must be built from.
+   if (typeof after !== 'number' || !Number.isFinite(after) || after < 1) {
+     return { retryAfter: 1 }
+   }
+-  return { retryAfter: Math.min(MAX_RETRY_AFTER_S, Math.ceil(after)) }
++  return { retryAfter: Math.ceil(after) }
+ }
+ 
+ export function createRateLimitedTelegramApi(
+@@ -139,6 +190,7 @@ export function createRateLimitedTelegramApi(
+     globalRefillPerSec: opts.globalRefillPerSec ?? 25,
+     globalBurstCapacity: opts.globalBurstCapacity ?? 25,
+     maxRetries: opts.maxRetries ?? 3,
++    retryBudgetS: opts.retryBudgetS ?? DEFAULT_RETRY_BUDGET_S,
+     jitterMaxMs: opts.jitterMaxMs ?? 150,
+   }
+   const now = opts.now ?? ((): number => Date.now())
+@@ -156,12 +208,48 @@ export function createRateLimitedTelegramApi(
+       s = {
+         bucket: makeBucket(cfg.perChatBurstCapacity, cfg.perChatRefillPerSec, now()),
+         tail: Promise.resolve(),
++        floodUntilMs: 0,
+       }
+       chatState.set(chatId, s)
+     }
+     return s
+   }
+ 
++  // Seconds left on this chat's flood wait, 0 when clear. Self-clearing: an
++  // elapsed deadline resets the latch so the next call goes through.
++  function floodRemainingS(chatId: string): number {
++    const s = chatState.get(chatId)
++    if (!s || s.floodUntilMs === 0) return 0
++    const leftMs = s.floodUntilMs - now()
++    if (leftMs <= 0) {
++      s.floodUntilMs = 0
++      return 0
++    }
++    return Math.ceil(leftMs / 1000)
++  }
++
++  // Fail fast (no network call) while the chat is flood-latched.
++  function assertNotFlooded(chatId: string): void {
++    const left = floodRemainingS(chatId)
++    if (left === 0) return
++    const s = chatState.get(chatId)
++    throw new TelegramFloodWaitError(chatId, left, s?.floodUntilMs ?? now() + left * 1000)
++  }
++
++  // Record a flood deadline. Only ever extends it — a later 429 with a shorter
++  // retry_after must not shorten a longer ban we already know about.
++  function latchFlood(chatId: string, retryAfterS: number): void {
++    const s = getChatState(chatId)
++    const until = now() + retryAfterS * 1000
++    if (until <= s.floodUntilMs) return
++    s.floodUntilMs = until
++    log.warn('telegram flood wait latched', {
++      chat_id: chatId,
++      retry_after_s: retryAfterS,
++      until: new Date(until).toISOString(),
++    })
++  }
++
+   // Wait until both the per-chat and global buckets have a token, then
+   // consume one from each. Caller is responsible for holding the per-chat
+   // FIFO lock so two enqueues for the same chat can't race this check.
+@@ -187,7 +275,16 @@ export function createRateLimitedTelegramApi(
+   // `maxRetries` is the MAX NUMBER OF ATTEMPTS including the initial call.
+   // Semantically: budget of how many times we hit Telegram for this op.
+   // maxRetries=3 → up to 3 attempts (2 retries after the first failure).
+-  async function withRetry<T>(method: string, op: () => Promise<T>): Promise<T> {
++  //
++  // `chatId` is passed for every chat-scoped method so a 429 can latch the
++  // chat. The in-op retry below deliberately does NOT consult the latch it just
++  // set: it only retries after sleeping the FULL retry_after, by which point
++  // the deadline has passed.
++  async function withRetry<T>(
++    method: string,
++    op: () => Promise<T>,
++    chatId?: string,
++  ): Promise<T> {
+     let attempt = 0
+     let lastErr: unknown
+     while (true) {
+@@ -198,6 +295,25 @@ export function createRateLimitedTelegramApi(
+         const r = parse429(err)
+         if (r === null) throw err
+         lastErr = err
++        if (chatId !== undefined) latchFlood(chatId, r.retryAfter)
++        // Over budget: do not probe inside a window we cannot wait out. Fail
++        // now with the deadline so the caller can stop instead of escalating.
++        if (r.retryAfter > cfg.retryBudgetS) {
++          log.warn('telegram 429 over retry budget, failing fast', {
++            method,
++            retry_after_s: r.retryAfter,
++            budget_s: cfg.retryBudgetS,
++            chat_id: chatId,
++          })
++          if (chatId !== undefined) {
++            throw new TelegramFloodWaitError(
++              chatId,
++              r.retryAfter,
++              now() + r.retryAfter * 1000,
++            )
++          }
++          throw err
++        }
+         if (attempt >= cfg.maxRetries) break
+         const jitter =
+           cfg.jitterMaxMs > 0 ? Math.floor(Math.random() * cfg.jitterMaxMs) : 0
+@@ -217,6 +333,9 @@ export function createRateLimitedTelegramApi(
+   // Serialize per-chat outbound work: each new op awaits the previous op
+   // (without inheriting its error), then runs under the rate-limit gate.
+   async function enqueueSend<T>(chatId: string, op: () => Promise<T>): Promise<T> {
++    // Fail before joining the queue: a latched chat must not pile callers up
++    // behind an in-flight op, and must not spend the caller's patience.
++    assertNotFlooded(chatId)
+     const state = getChatState(chatId)
+     const prev = state.tail
+     let release!: () => void
+@@ -225,8 +344,17 @@ export function createRateLimitedTelegramApi(
+     })
+     try {
+       await prev.catch(() => {})
++      // Re-check: while we waited our turn, the op ahead of us may have hit a
++      // 429 and latched the chat. Sending now would probe inside the window.
++      assertNotFlooded(chatId)
+       await waitForCapacity(state)
+-      return await withRetry('send', op)
++      // Third and final gate, immediately before the network call. Waiting for
++      // a token is another suspension point, and a NON-FIFO method for the same
++      // chat (editMessageText, setMessageReaction, …) can latch the chat while
++      // we sit here — those never join the tail chain, so the check above does
++      // not cover them.
++      assertNotFlooded(chatId)
++      return await withRetry('send', op, chatId)
+     } finally {
+       release()
+     }
+@@ -264,14 +392,20 @@ export function createRateLimitedTelegramApi(
+       return enqueueSend(chatId, () => raw.sendRichMessage(chatId, rawMarkdown, richOpts))
+     },
+ 
++    // The lighter methods below skip the send bucket but still honour the flood
++    // latch: while Telegram is banning the chat, an edit or a reaction is just
++    // another request inside the window, and probing keeps the ban alive.
+     async editMessageText(
+       chatId: string,
+       messageId: number,
+       text: string,
+       editOpts: EditOpts,
+     ): Promise<void> {
+-      return withRetry('editMessageText', () =>
+-        raw.editMessageText(chatId, messageId, text, editOpts),
++      assertNotFlooded(chatId)
++      return withRetry(
++        'editMessageText',
++        () => raw.editMessageText(chatId, messageId, text, editOpts),
++        chatId,
+       )
+     },
+ 
+@@ -280,13 +414,17 @@ export function createRateLimitedTelegramApi(
+       messageId: number,
+       emoji: string,
+     ): Promise<void> {
+-      return withRetry('setMessageReaction', () =>
+-        raw.setMessageReaction(chatId, messageId, emoji),
++      assertNotFlooded(chatId)
++      return withRetry(
++        'setMessageReaction',
++        () => raw.setMessageReaction(chatId, messageId, emoji),
++        chatId,
+       )
+     },
+ 
+     async sendChatAction(chatId: string, action: ChatAction): Promise<void> {
+-      return withRetry('sendChatAction', () => raw.sendChatAction(chatId, action))
++      assertNotFlooded(chatId)
++      return withRetry('sendChatAction', () => raw.sendChatAction(chatId, action), chatId)
+     },
+ 
+     async sendDocument(
+@@ -310,7 +448,8 @@ export function createRateLimitedTelegramApi(
+     },
+ 
+     async deleteMessage(chatId: string, messageId: number): Promise<void> {
+-      return withRetry('deleteMessage', () => raw.deleteMessage(chatId, messageId))
++      assertNotFlooded(chatId)
++      return withRetry('deleteMessage', () => raw.deleteMessage(chatId, messageId), chatId)
+     },
+ 
+     async answerGuestQuery(
+diff --git a/plugin/tests/safety/rate-limited-telegram-api.test.ts b/plugin/tests/safety/rate-limited-telegram-api.test.ts
+index 75d54c8..7482834 100644
+--- a/plugin/tests/safety/rate-limited-telegram-api.test.ts
++++ b/plugin/tests/safety/rate-limited-telegram-api.test.ts
+@@ -398,18 +398,32 @@ describe('createRateLimitedTelegramApi — 429 retry-after', () => {
+   })
+ })
+ 
+-describe('createRateLimitedTelegramApi — retry_after clamp & edge values', () => {
+-  test('retry_after over 60s is clamped to 60s', async () => {
++describe('createRateLimitedTelegramApi — retry budget & edge values', () => {
++  // Regression, incident 2026-07-31: retry_after used to be CLAMPED to 60s and
++  // retried, i.e. the wrapper re-sent inside an active flood window. Telegram
++  // answered by raising the ban from minutes to ~17 hours. A wait we cannot
++  // honour in full must fail immediately instead.
++  test('retry_after over the budget fails fast without a second attempt', async () => {
+     const clock = new FakeClock()
+     const stub = makeStubApi(clock)
+     const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
+     stub.queueError('sendMessage', make429Error(300))
+-    const p = api.sendMessage('100', 'hi', {})
+-    await flushMicrotasks()
+-    // Even though Telegram said 300s, we should retry after 60s.
+-    await clock.tick(60_000)
+-    await p
+-    expect(stub.calls.length).toBe(1)
++    const err = (await api.sendMessage('100', 'hi', {}).catch((e: unknown) => e)) as Error & {
++      error_code?: number
++      parameters?: { retry_after?: number }
++      untilMs?: number
++    }
++    expect(err).toBeInstanceOf(Error)
++    expect(err.name).toBe('TelegramFloodWaitError')
++    // Keeps the grammY 429 shape for the outer reliable/rich classifiers.
++    expect(err.error_code).toBe(429)
++    expect(err.parameters?.retry_after).toBe(300)
++    expect(err.untilMs).toBe(300_000)
++    // Message must be unmistakable for the agent reading the tool error.
++    expect(err.message).toContain('MUST NOT be retried')
++    // Advancing the clock must not produce a late retry.
++    await clock.tick(120_000)
++    expect(stub.calls.length).toBe(0)
+   })
+ 
+   test('retry_after = 0 is treated as 1s fallback', async () => {
+@@ -503,3 +517,190 @@ describe('createRateLimitedTelegramApi — pass-through methods', () => {
+     expect(stub.calls.length).toBe(3)
+   })
+ })
++
++// ───────────────────────────────────────────────────────────────────────────
++// Per-chat flood latch (incident 2026-07-31).
++//
++// A long 429 must ban the chat locally: no further request may reach Bot API
++// until the deadline, no matter who asks. This is what stops the agent's own
++// LLM-level reply retries from turning a 17-minute wait into a 17-hour one.
++// ───────────────────────────────────────────────────────────────────────────
++describe('createRateLimitedTelegramApi — flood latch', () => {
++  // Drive a chat into a latched state and return the API + stub.
++  async function latch(
++    clock: FakeClock,
++    retryAfterS: number,
++    chatId = '100',
++    opts?: RateLimitOptions,
++  ): Promise<{ api: TelegramApi; stub: ReturnType<typeof makeStubApi> }> {
++    const stub = makeStubApi(clock)
++    const api = createRateLimitedTelegramApi(stub.api, stubLog, opts ?? defaultOpts(clock))
++    stub.queueError('sendMessage', make429Error(retryAfterS))
++    await api.sendMessage(chatId, 'first', {}).catch(() => {})
++    return { api, stub }
++  }
++
++  test('second send to a latched chat fails without touching the API', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    const before = stub.calls.length
++    const err = (await api.sendMessage('100', 'again', {}).catch((e: unknown) => e)) as Error & {
++      name: string
++      parameters?: { retry_after?: number }
++    }
++    expect(err.name).toBe('TelegramFloodWaitError')
++    // Reports the REMAINING time, and never reached the network.
++    expect(err.parameters?.retry_after).toBe(1020)
++    expect(stub.calls.length).toBe(before)
++  })
++
++  test('remaining time shrinks as the clock advances', async () => {
++    const clock = new FakeClock()
++    const { api } = await latch(clock, 1020)
++    await clock.tick(20_000)
++    const err = (await api.sendMessage('100', 'again', {}).catch((e: unknown) => e)) as Error & {
++      parameters?: { retry_after?: number }
++    }
++    expect(err.parameters?.retry_after).toBe(1000)
++  })
++
++  test('a different chat is unaffected by the latch', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    await api.sendMessage('200', 'other chat', {})
++    expect(stub.calls.filter((c) => c.chatId === '200').length).toBe(1)
++  })
++
++  test('latch self-clears once the deadline passes', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    await clock.tick(1_020_000)
++    await api.sendMessage('100', 'after the ban', {})
++    expect(stub.calls.filter((c) => c.text === 'after the ban').length).toBe(1)
++  })
++
++  test('latch still holds one second before the deadline', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    await clock.tick(1_019_000)
++    await expect(api.sendMessage('100', 'too early', {})).rejects.toMatchObject({
++      name: 'TelegramFloodWaitError',
++    })
++    expect(stub.calls.filter((c) => c.text === 'too early').length).toBe(0)
++  })
++
++  test('a longer ban is never shortened by a later smaller 429', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    // A 2s 429 arriving later (e.g. from another method) must not shrink the ban.
++    stub.queueError('editMessageText', make429Error(2))
++    await api.editMessageText('100', 1, 'x', {}).catch(() => {})
++    await clock.tick(10_000)
++    await expect(api.sendMessage('100', 'still banned', {})).rejects.toMatchObject({
++      name: 'TelegramFloodWaitError',
++    })
++  })
++
++  test('edits, reactions, chat actions, deletes and media respect the latch', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    const before = stub.calls.length
++    const attempts = [
++      api.editMessageText('100', 1, 'x', {}),
++      api.setMessageReaction('100', 1, 'eyes'),
++      api.sendChatAction('100', 'typing'),
++      api.deleteMessage('100', 1),
++      api.sendDocument('100', '/tmp/d.pdf', {}),
++      api.sendPhoto('100', '/tmp/p.jpg', {}),
++      api.sendRichMessage('100', '**rich**', {}),
++    ]
++    const results = await Promise.allSettled(attempts)
++    expect(results.every((r) => r.status === 'rejected')).toBe(true)
++    expect(stub.calls.length).toBe(before)
++  })
++
++  test('answerGuestQuery is never latched (no chat scope)', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    await api.answerGuestQuery('gq', 'ответ', {})
++    expect(stub.calls.filter((c) => c.method === 'answerGuestQuery').length).toBe(1)
++  })
++
++  test('downloadFile is never latched (inbound, not a send)', async () => {
++    const clock = new FakeClock()
++    const { api, stub } = await latch(clock, 1020)
++    await api.downloadFile('file-1', '/tmp')
++    expect(stub.calls.filter((c) => c.method === 'downloadFile').length).toBe(1)
++  })
++
++  test('a within-budget 429 latches only for its own short window', async () => {
++    const clock = new FakeClock()
++    const stub = makeStubApi(clock)
++    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
++    stub.queueError('sendMessage', make429Error(2))
++    const p = api.sendMessage('100', 'hi', {})
++    await flushMicrotasks()
++    // Mid-window a fresh caller is refused rather than allowed to probe.
++    await expect(api.sendMessage('100', 'probe', {})).rejects.toMatchObject({
++      name: 'TelegramFloodWaitError',
++    })
++    // The in-flight op's own retry is NOT blocked by the latch it set: it slept
++    // the full retry_after, so it goes through and the latch has expired.
++    await clock.tick(2000)
++    await p
++    expect(stub.calls.map((c) => c.text)).toEqual(['hi'])
++    await api.sendMessage('100', 'later', {})
++    expect(stub.calls.map((c) => c.text)).toEqual(['hi', 'later'])
++  })
++
++  test('queued sends behind a failing op are refused, not sent into the ban', async () => {
++    const clock = new FakeClock()
++    const stub = makeStubApi(clock)
++    const api = createRateLimitedTelegramApi(stub.api, stubLog, defaultOpts(clock))
++    stub.queueError('sendMessage', make429Error(1020))
++    const first = api.sendMessage('100', 'first', {}).catch((e: unknown) => e)
++    const second = api.sendMessage('100', 'second', {}).catch((e: unknown) => e)
++    const [e1, e2] = await Promise.all([first, second])
++    expect((e1 as Error).name).toBe('TelegramFloodWaitError')
++    expect((e2 as Error).name).toBe('TelegramFloodWaitError')
++    expect(stub.calls.length).toBe(0)
++  })
++
++  // Race found in review: a send that already cleared the queue can sit in
++  // waitForCapacity while a NON-FIFO method (edit/reaction — they never join the
++  // tail chain) latches the chat. Without a gate right before the network call
++  // that send would land inside the flood window.
++  test('a send waiting for a token is refused if an edit latches the chat meanwhile', async () => {
++    const clock = new FakeClock()
++    const stub = makeStubApi(clock)
++    const opts = defaultOpts(clock)
++    opts.perChatBurstCapacity = 1
++    const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
++    // Burn the only token so the next send must wait for refill.
++    await api.sendMessage('100', 'first', {})
++    const waiting = api.sendMessage('100', 'must not land', {}).catch((e: unknown) => e)
++    await flushMicrotasks()
++    // While it waits, an edit hits a long 429 and latches the chat.
++    stub.queueError('editMessageText', make429Error(1020))
++    await api.editMessageText('100', 1, 'x', {}).catch(() => {})
++    // Token refills — the waiting send must now be refused, not sent.
++    await clock.tick(1000)
++    const err = (await waiting) as Error
++    expect(err.name).toBe('TelegramFloodWaitError')
++    expect(stub.calls.filter((c) => c.text === 'must not land').length).toBe(0)
++  })
++
++  test('retryBudgetS is configurable', async () => {
++    const clock = new FakeClock()
++    const opts = defaultOpts(clock)
++    opts.retryBudgetS = 5
++    const stub = makeStubApi(clock)
++    const api = createRateLimitedTelegramApi(stub.api, stubLog, opts)
++    // 10s exceeds the 5s budget → fail fast, no retry.
++    stub.queueError('sendMessage', make429Error(10))
++    await expect(api.sendMessage('100', 'hi', {})).rejects.toMatchObject({
++      name: 'TelegramFloodWaitError',
++    })
++    expect(stub.calls.length).toBe(0)
++  })
++})

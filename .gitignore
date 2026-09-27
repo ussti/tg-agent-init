@@ -1,0 +1,12 @@
+node_modules/
+.cache/
+build/
+*.log
+.env
+.env.*
+secrets/
+*.key
+*.pem
+*.orig
+*.rej
+!*.example
