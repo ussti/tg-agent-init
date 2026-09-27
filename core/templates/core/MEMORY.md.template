@@ -1,0 +1,6 @@
+# MEMORY — Cold Archive Index
+
+_Canonical topic index. One line per archived topic; full content lives in `archive/`._
+_Read on demand. Recall greps this file, so keep each line's keywords canonical._
+
+<!-- - [Topic name](archive/YYYY-MM.md) — one-line hook with the key terms -->

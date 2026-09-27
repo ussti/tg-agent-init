@@ -1,0 +1,20 @@
+# TOOLS.md
+
+_Read on demand (not `@included`)._
+
+## Workspace
+
+- `CLAUDE.md` — identity
+- `core/` — USER, rules, AGENTS, memory (warm/hot/cold)
+- `skills/` — curated skills
+- `hooks/` — safety, recall, handoff, self-learning
+- `scripts/` — memory maintenance
+
+## Skills installed
+
+<!-- filled after install: groq-voice, superpowers, gws, youtube-transcript, markdown-new, ... -->
+
+## Keys (optional — add to enable the skill)
+
+- `groq-voice`, `gws`, `youtube-transcript`, `perplexity-research`, `datawrapper`, `twitter`
+- Skills degrade gracefully if a key is absent.

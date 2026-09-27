@@ -1,0 +1,20 @@
+# AGENTS.md
+
+_Read on demand (not `@included`)._
+
+## Models
+
+- **Primary:** {{PRIMARY_MODEL}}
+- **Subagents:** native Claude Code Agent tool
+
+## Subagents
+
+- Maximum 3 simultaneously
+- Use for: searching the codebase, running checks, parallel research
+
+## Recall
+
+- **Default:** local keyword recall — `local-recall.mjs` greps the cold memory corpus and injects
+  the top matches. No server, no network.
+- **Optional:** OpenViking semantic recall — see `optional/openviking/` (off by default). Enable
+  only if you run a local OpenViking instance.

@@ -6,7 +6,7 @@
   "owner_chat_ids": [{{OWNER_CHAT_ID}}],
   "workspace_root": "{{AGENT_HOME}}",
   "status": { "enabled": false, "simple_typing": true },
-  "voice": { "provider": "{{VOICE_PROVIDER}}", "language": "{{LANGUAGE}}" },
+  "voice": { "provider": "{{VOICE_PROVIDER}}", "language": "{{LANGUAGE_CODE}}" },
   "webhook": { "enabled": true, "host": "127.0.0.1", "port": {{WEBHOOK_PORT}} },
   "permission_relay": { "enabled": true, "allowed_user_ids": [{{OWNER_CHAT_ID}}] },
   "memory": {

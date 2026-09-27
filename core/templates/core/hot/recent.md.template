@@ -1,0 +1,8 @@
+# Hot memory — full rolling journal (last ~24h)
+
+_Full conversation journal. NOT loaded into context — only `handoff.md` is._
+_Appended by the Stop hook. Trimmed into WARM after ~24h._
+
+<!-- ### YYYY-MM-DD HH:MM [tag]
+Operator: ...
+Agent: ... -->
