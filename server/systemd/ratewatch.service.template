@@ -1,0 +1,20 @@
+[Unit]
+Description=tg-agent {{AGENT_NAME}} rate-limit watchdog (answers TUI rate-limit menus)
+After={{AGENT_NAME}}-agent.service
+Requires={{AGENT_NAME}}-agent.service
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+Group={{RUN_GROUP}}
+EnvironmentFile={{AGENT_WS}}/agent.conf
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME={{USER_HOME}}
+ExecStart={{AGENT_WS}}/bin/ratewatch.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:{{AGENT_WS}}/logs/ratewatch-systemd.log
+StandardError=append:{{AGENT_WS}}/logs/ratewatch-systemd.log
+
+[Install]
+WantedBy=multi-user.target

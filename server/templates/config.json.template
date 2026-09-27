@@ -1,0 +1,20 @@
+{
+  "bot_id": {{BOT_ID}},
+  "dm_only": true,
+  "allowed_user_ids": [{{OWNER_CHAT_ID}}],
+  "allowed_chat_ids": [{{OWNER_CHAT_ID}}],
+  "owner_chat_ids": [{{OWNER_CHAT_ID}}],
+  "workspace_root": "{{AGENT_HOME}}",
+  "status": { "enabled": false, "simple_typing": true },
+  "voice": { "provider": "{{VOICE_PROVIDER}}", "language": "{{LANGUAGE}}" },
+  "webhook": { "enabled": true, "host": "127.0.0.1", "port": {{WEBHOOK_PORT}} },
+  "permission_relay": { "enabled": true, "allowed_user_ids": [{{OWNER_CHAT_ID}}] },
+  "memory": {
+    "enabled": true,
+    "workspace_path": "{{AGENT_HOME}}/.claude",
+    "logs_path": "{{AGENT_HOME}}/.claude/logs",
+    "source_tag": "tg",
+    "agent_label": "{{AGENT_NAME}}"
+  },
+  "multichat": { "enabled": false }
+}

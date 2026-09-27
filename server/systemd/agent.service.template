@@ -1,0 +1,23 @@
+[Unit]
+Description=tg-agent {{AGENT_NAME}} (Claude Code + Telegram channel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+Group={{RUN_GROUP}}
+EnvironmentFile={{AGENT_WS}}/agent.conf
+Environment=PATH={{USER_HOME}}/.bun/bin:{{USER_HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME={{USER_HOME}}
+WorkingDirectory={{AGENT_WS}}/dashi-plugin/plugin
+ExecStart={{AGENT_WS}}/bin/run-agent.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:{{AGENT_WS}}/logs/agent-systemd.log
+StandardError=append:{{AGENT_WS}}/logs/agent-systemd.log
+KillMode=process
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

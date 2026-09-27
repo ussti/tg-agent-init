@@ -1,0 +1,30 @@
+Subject: [PATCH] plugin/CLAUDE.md: rule for raw HTML tags in reply
+
+reply renders Telegram HTML; entity-escaped tags print literally.
+
+--- a/plugin/CLAUDE.md
++++ b/plugin/CLAUDE.md
+@@ -24,6 +24,23 @@
+ question and may lose formatting — call `reply` explicitly, do not rely on the
+ fallback.
+ 
++## Formatting — pass RAW HTML tags, never entity-escape the tags
++
++`reply` renders `text` as **Telegram HTML** (parse_mode=HTML). Pass markup tags
++**raw**:
++
++```
++reply({ chat_id, text: "<b>bold</b> <i>italic</i> <code>x</code>" })   // ✓ renders
++```
++
++NEVER entity-escape the tags themselves — writing `&lt;b&gt;` instead of `<b>`
++makes Telegram print the literal characters `<b>` in the message. This is a
++recurring bug; do not repeat it.
++
++Escape `&`, `<`, `>` **only** when they are literal content, never when they are
++markup: `1 &lt; 2`, `Tom &amp; Jerry`. Supported tags: `b i u s code pre a`.
++When in doubt, send plain text with no tags — safer than broken markup.
++
+ ## Public group / multichat chats
+ 
+ For group/supergroup chats the channel **outbox** path delivers your final text

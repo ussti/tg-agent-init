@@ -24,5 +24,6 @@
 | 0008 memory-hot-filename-from-config | `HOT_MEMORY_FILENAME` is resolved once at bootstrap and passed to the memory writer as config (`hotFilename`), so the hot file name (e.g. `recent-plugin.md`) actually takes effect. |
 | 0009 tests-memory-fixtures-and-fake-api | Memory tests use reply-tool fixtures (follows 0001); fake Telegram API implements `editRichMessage`. |
 | 0010 tests-redact-regressions | Regression tests: Drive file IDs, hyphenated IDs and URL slugs stay unmasked. |
+| 0011 claude-md-raw-html-reply-rule | `plugin/CLAUDE.md`: rule to pass raw HTML tags to `reply` and escape only literal `& < >`. |
 
 Refreshing upstream: `scripts/update-vendor.sh` (keeps the old tree if any patch stops applying).

@@ -1,0 +1,22 @@
+# tg-agent: non-secret agent settings. Written by install-server.sh.
+# Plain KEY="value" lines, no shell expansion ($, backtick and " are rejected by
+# the installer): systemd reads this file as an EnvironmentFile and the scripts
+# source it. Secrets live in SECRETS_DIR.
+AGENT_NAME="{{AGENT_NAME}}"
+AGENT_HOME="{{AGENT_HOME}}"
+AGENT_WS="{{AGENT_HOME}}/.claude"
+PLUGIN_SESSION_NAME="{{AGENT_NAME}}-agent"
+PLUGIN_DIR="{{AGENT_HOME}}/.claude/dashi-plugin/plugin"
+LIBRARY_DIR="{{AGENT_HOME}}/library"
+LOG_DIR="{{AGENT_HOME}}/.claude/logs"
+TELEGRAM_STATE_DIR="{{AGENT_HOME}}/.claude/state/telegram"
+DM_STATE_DIR="{{AGENT_HOME}}/.claude/state/dm-inbox"
+SECRETS_DIR="{{SECRETS_DIR}}"
+CLAUDE_BIN="{{CLAUDE_BIN}}"
+CLAUDE_CONFIG_DIR="{{CLAUDE_CONFIG_DIR}}"
+AGENT_MODEL="{{AGENT_MODEL}}"
+OWNER_CHAT_ID="{{OWNER_CHAT_ID}}"
+OPERATOR_NAME="{{OPERATOR_NAME}}"
+TELEGRAM_WEBHOOK_PORT="{{WEBHOOK_PORT}}"
+TZ="{{TIMEZONE}}"
+HOT_MEMORY_FILENAME="recent-plugin.md"
