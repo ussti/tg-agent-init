@@ -1,0 +1,38 @@
+Swarm worker: stop sending agentId to agent gateways.
+
+The dashi-channel webhook (POST /hooks/agent) accepts agentId only when it
+equals its own id, "dashi-channel", and answers 404 otherwise. The worker
+puts the swarm name of the target agent there, so every delivery to a
+dashi-plugin agent was rejected and marked failed. The gateway URL already
+picks the agent, so the field is dropped (comment and test follow).
+
+--- a/services/swarm_mcp/worker.py
++++ b/services/swarm_mcp/worker.py
+@@ -48,7 +48,7 @@
+ HTTP_TIMEOUT_SEC = 10
+ BATCH_SIZE = 20
+ 
+-# Bridge to a Telegram/HTTP gateway which expects POST {agentId, message, chatId}.
++# Bridge to a Telegram/HTTP gateway which expects POST {message, chatId}.
+ # Configure with env: OWNER_CHAT_ID (Telegram chat for forwarded prompts),
+ # COORDINATOR_AGENT (agent name used as the loop-prevention sink),
+ # GATEWAY_WEBHOOK_TOKEN (Bearer token if your gateway enforces auth).
+@@ -299,7 +299,6 @@
+     payload = json.loads(row["payload_json"])
+     # Repackage into gateway webhook schema.
+     body = {
+-        "agentId": to_agent,
+         "message": _format_virtual_prompt(row["from_agent"], to_agent, row["task_id"], payload),
+         "chatId": OWNER_CHAT_ID,
+     }
+--- a/tests/test_swarm_worker_hmac.py
++++ b/tests/test_swarm_worker_hmac.py
+@@ -371,7 +371,7 @@
+ 
+     # And the bytes must be the canonical body shape, not a JSON re-render
+     decoded = json.loads(posted_bytes.decode("utf-8"))
+-    assert decoded["agentId"] == "tyrande"
++    assert "agentId" not in decoded
+     assert decoded["chatId"] == worker.OWNER_CHAT_ID
+     assert "message" in decoded
+ 

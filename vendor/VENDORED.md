@@ -27,3 +27,21 @@
 | 0011 claude-md-raw-html-reply-rule | `plugin/CLAUDE.md`: rule to pass raw HTML tags to `reply` and escape only literal `& < >`. |
 
 Refreshing upstream: `scripts/update-vendor.sh` (keeps the old tree if any patch stops applying).
+
+## public-gbrain-agentos
+
+- Upstream: https://github.com/qwwiwi/public-gbrain-agentos
+- Pinned commit: see `GBRAIN_UPSTREAM_COMMIT`
+- License: Apache License 2.0 (`public-gbrain-agentos/LICENSE`); copyright stays with the upstream authors
+- `vendor/public-gbrain-agentos/` is an unmodified tree of the pinned commit, checked by
+  `GBRAIN_TREE_SHA256` in the leak scan. Do not edit files there — every change lives in
+  `patches/public-gbrain-agentos/`.
+
+### Statement of changes (Apache-2.0 §4b)
+
+`scripts/build-gbrain.sh` copies the upstream tree and applies these patches in order;
+`install-fleet.sh` runs upstream's `scripts/install.sh` from the result.
+
+| Patch | Change |
+|---|---|
+| 0001 swarm-worker-drop-agentid | The swarm worker no longer sends `agentId` in the webhook body: the dashi-plugin webhook treats it as a routing key and answers 404 for any value but its own. The worker test asserts the field is absent. |
