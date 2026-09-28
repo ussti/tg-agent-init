@@ -246,12 +246,14 @@ render "$KIT_DIR/server/templates/plugin-settings.json.template" "$PLUGIN_DIR/.c
 # ---------------------------------------------------------------- claude config
 say "preparing Claude Code config dir $CLAUDE_CONFIG_DIR"
 mkdir -p "$CLAUDE_CONFIG_DIR"
-python3 - "$CLAUDE_CONFIG_DIR" "$PLUGIN_DIR" "$("$CLAUDE_BIN" --version | awk '{print $1}')" <<'PY'
+python3 - "$CLAUDE_CONFIG_DIR" "$PLUGIN_DIR" "$("$CLAUDE_BIN" --version | awk '{print $1}')" \
+  "$AGENT_HOME" <<'PY'
 import json
 import pathlib
 import sys
 
 cfg_dir, plugin_dir, version = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+agent_home = sys.argv[4]
 
 
 def merge(path: pathlib.Path, patch: dict) -> None:
@@ -271,12 +273,14 @@ merge(cfg_dir / ".claude.json", {
     "hasCompletedOnboarding": True,
     "lastOnboardingVersion": version,
     # The workspace CLAUDE.md @-imports files outside the plugin dir; pre-approve them
-    # so the first start does not stop at the external-imports prompt.
-    "projects": {plugin_dir: {
+    # so the first start does not stop at the external-imports prompt. The hourly
+    # snapshot.sh makes the agent home a git repo, and Claude Code then keys trust on
+    # the repo root instead of the plugin dir, so trust both.
+    "projects": {d: {
         "hasTrustDialogAccepted": True,
         "hasClaudeMdExternalIncludesApproved": True,
         "hasClaudeMdExternalIncludesWarningShown": True,
-    }},
+    } for d in (plugin_dir, agent_home)},
 })
 PY
 if [ ! -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ]; then

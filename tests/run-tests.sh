@@ -173,6 +173,12 @@ check "claude config: plugin dir trusted" jq -e \
 check "claude config: external CLAUDE.md imports pre-approved" jq -e --arg p "$PLUGIN" \
   '.projects[$p] | .hasClaudeMdExternalIncludesApproved and .hasClaudeMdExternalIncludesWarningShown' \
   "$FAKE_HOME/.claude-agent-testbot/.claude.json"
+# snapshot.sh turns the agent home into a git repo within the first hour; Claude Code
+# then keys trust on the repo root, so it must be pre-approved too.
+check "claude config: agent home (snapshot repo root) trusted" jq -e --arg p "$(dirname "$WS")" \
+  '.projects[$p] | .hasTrustDialogAccepted and .hasClaudeMdExternalIncludesApproved
+     and .hasClaudeMdExternalIncludesWarningShown' \
+  "$FAKE_HOME/.claude-agent-testbot/.claude.json"
 check "server cron dry-run" bash "$KIT/server/cron/install-cron.sh" "$WS" --dry-run
 check "core cron dry-run" bash "$KIT/core/cron/install-cron.sh" "$WS" --dry-run
 
