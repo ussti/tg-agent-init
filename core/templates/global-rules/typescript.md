@@ -1,4 +1,4 @@
-# TypeScript conventions (optional coder overlay)
+# TypeScript conventions
 
 - `strict` mode on; no `any`
 - Validate external input with Zod (or equivalent)

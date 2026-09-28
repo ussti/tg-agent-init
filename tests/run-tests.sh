@@ -100,6 +100,8 @@ for groups in d["hooks"].values():
             assert parts[0] == "node" or os.access(target, os.X_OK), target
 PY
 check "channel rule appended to rules.md" grep -q "## Telegram channel" "$WS/core/rules.md"
+check "plugin sees workspace skills" test -f "$PLUGIN/.claude/skills/onboard/SKILL.md"
+check "language rules installed" test -f "$FAKE_HOME/.claude-agent-testbot/rules/python.md"
 check "plugin CLAUDE.md has raw HTML rule" grep -q "RAW HTML" "$PLUGIN/CLAUDE.md"
 check "claude config: bypass prompt skipped" jq -e '.skipDangerousModePermissionPrompt' \
   "$FAKE_HOME/.claude-agent-testbot/settings.json"

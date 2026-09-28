@@ -1,4 +1,4 @@
-# Python conventions (optional coder overlay)
+# Python conventions
 
 - Type hints required
 - Use `pathlib` over `os.path`
