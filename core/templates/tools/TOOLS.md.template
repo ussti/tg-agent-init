@@ -1,20 +1,53 @@
-# TOOLS.md
+# TOOLS.md -- Infrastructure Map
 
 _Read on demand (not `@included`)._
 
-## Workspace
+## My Workspace
 
 - `CLAUDE.md` — identity
-- `core/` — USER, rules, AGENTS, memory (warm/hot/cold)
-- `skills/` — curated skills
+- `core/` — USER, rules, memory (warm / hot / cold)
+- `skills/` — installed skills
 - `hooks/` — safety, recall, handoff, self-learning
 - `scripts/` — memory maintenance
 
+## Model
+
+- **Primary:** {{PRIMARY_MODEL}}
+
+## Memory layers
+
+| Layer | File | Mutability |
+|-------|------|------------|
+| IDENTITY | CLAUDE.md, rules.md, USER.md | manual only |
+| YELLOW | TOOLS.md | agent on trigger |
+| WARM 14d | core/warm/decisions.md | auto-rotate |
+| HOT | core/hot/recent.md, handoff.md | auto |
+| COLD | core/MEMORY.md, core/LEARNINGS.md | on-demand Read |
+
+**Recall:** `hooks/local-recall.mjs` greps the cold memory on each prompt and injects the top
+matches. Keyword-based, no server, no network. Optional semantic recall: `optional/openviking/`
+(off by default).
+
 ## Skills installed
 
-<!-- filled after install: groq-voice, superpowers, gws, youtube-transcript, markdown-new, ... -->
+| Skill | What it does | Key needed |
+|-------|--------------|------------|
+| superpowers | planning, TDD, debugging, review, brainstorming | none |
+| deep-research | multi-source research with citations | none |
+| skill-creator | create and improve skills | none |
+| groq-voice | voice transcription | Groq key |
+| gws | Google Workspace: Gmail, Calendar, Drive, Docs, Sheets | Google OAuth |
+| youtube-transcript | YouTube video transcripts | transcript API key |
+| markdown-new | clean Markdown from a URL | none |
+| quick-reminders | one-off reminders | none |
 
-## Keys (optional — add to enable the skill)
+Skills without their key stay inert and say what to set; nothing else breaks.
 
-- `groq-voice`, `gws`, `youtube-transcript`, `perplexity-research`, `datawrapper`, `twitter`
-- Skills degrade gracefully if a key is absent.
+## Services
+
+<!-- onboard: Which services and accounts does the agent work with (mail, calendar, tables,
+task board, hosting)? Names only, no passwords. -->
+
+## Secrets (paths only, never values)
+
+<!-- onboard: Where keys live on this machine -- a folder path. Never the key itself. -->
