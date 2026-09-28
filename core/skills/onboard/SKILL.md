@@ -1,14 +1,16 @@
 ---
 name: onboard
-description: First-run personalization of this agent. Use when the operator types /onboard or asks to "set me up", "get to know me", "настрой меня", "давай познакомимся", and at the start of a session when core/USER.md still has `<!-- onboard:` slots. Asks one question per slot and writes the answers into USER.md, CLAUDE.md, rules.md and TOOLS.md.
+description: First-run personalization of this agent. Use when the operator types /onboard or asks to "set me up", "get to know me", "настрой меня", "давай познакомимся", and at the start of a session when core/USER.md still has `<!-- onboard:` slots. Asks one question per slot and writes the answers into USER.md and TOOLS.md.
 ---
 
 # Onboard
 
-The identity files ship as a reference set with `<!-- onboard: <question> -->` slots. This skill
-turns each slot into the operator's own answer. It writes ONLY where a slot stands; every other
-line of CLAUDE.md, rules.md and USER.md stays as shipped (those files are operator-only, and
-running /onboard is the operator's permission for exactly these slots).
+The identity files ship as a reference set: the operator's defaults (communication style, what
+the operator needs, writing rules) are already written, and only what the kit cannot know is left
+as `<!-- onboard: <question> -->` slots -- profile, links, goals, overrides of the defaults, and
+services. This skill turns each slot into the operator's own answer. It writes ONLY where a slot
+stands; every other line of CLAUDE.md, rules.md and USER.md stays as shipped (those files are
+operator-only, and running /onboard is the operator's permission for exactly these slots).
 
 ## Tool
 
@@ -35,12 +37,18 @@ The script finds the workspace itself (the folder with `core/USER.md`). If it ca
      follow-up at most, then write what you have.
    - "skip" / "пропусти" / "later" -> do not call `fill`; the slot stays for the next run.
    - "nothing" / "нет" / "none" -> `fill` with `- none`.
-4. Secrets: the Secrets slot takes a folder path only. If the operator pastes a key, do not
-   repeat it back, do not write it anywhere, tell them to put it in a file in that folder and
-   give you the path. Exit 3 from `fill` means the same.
-5. When the list is done, show the operator everything written, grouped by file, and ask
+4. The Overrides slot (USER.md): before asking, show the defaults it overrides -- the bullets of
+   USER.md `Communication Style` and `What operator needs from this agent`, and the `Response
+   format` bullets of rules.md -- retold briefly in the operator's language, then ask what to
+   change. "All good" / "всё ок" -> `fill` with `- none`. Otherwise write only the changes, each
+   as a bullet that names what it replaces (e.g. `- Emoji allowed (replaces "No emoji")`).
+5. Keys are never asked: the installer already wrote the keys folder into TOOLS.md. Services are
+   names only; a service that is not connected yet is still written, marked `(not connected)`.
+   If the operator pastes a key, do not repeat it back, do not write it anywhere, and point to
+   the keys folder from TOOLS.md. Exit 3 from `fill` means the same.
+6. When the list is done, show the operator everything written, grouped by file, and ask
    whether to correct anything. Corrections go through a direct edit of those same lines only.
-6. Finish with one line: onboarding done, the new profile is loaded from the next session
+7. Finish with one line: onboarding done, the new profile is loaded from the next session
    (USER.md, CLAUDE.md and rules.md are read at session start).
 
 ## Rules

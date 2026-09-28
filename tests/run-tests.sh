@@ -53,6 +53,20 @@ echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
 
 echo "== 4. installer end-to-end"
+# Fake claude: answers --version, logs every other call with its config dir, no network.
+# FAKE_CLAUDE_FAIL=1 makes plugin commands fail (offline install).
+mkdir -p "$WORK/claudebin"
+cat > "$WORK/claudebin/claude" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then echo "2.1.0 (Claude Code)"; exit 0; fi
+echo "${CLAUDE_CONFIG_DIR:-} $*" >> "${FAKE_CLAUDE_LOG:-/dev/null}"
+[ "${FAKE_CLAUDE_FAIL:-0}" = 1 ] && exit 1
+exit 0
+SH
+chmod +x "$WORK/claudebin/claude"
+export PATH="$WORK/claudebin:$PATH"
+export FAKE_CLAUDE_LOG="$WORK/claude.log"
+: > "$FAKE_CLAUDE_LOG"
 FAKE_HOME="$WORK/home"
 mkdir -p "$FAKE_HOME"
 OWNER=111222333
@@ -129,13 +143,26 @@ check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS
   grep -q '^- Numbers and facts only with a source' '$WS/core/rules.md'"
 check "no Russian typography rule for a non-Russian agent" \
   bash -c "! grep -q 'Russian typography' '$WS/core/rules.md'"
-check "writing-rules slot builds on the defaults" python3 - "$WS" <<'PY'
+check "onboarding asks five questions: profile, links, goals, overrides, services" \
+  python3 - "$WS" <<'PY'
 import json, subprocess, sys
 out = subprocess.run([sys.executable, f"{sys.argv[1]}/skills/onboard/onboard_slots.py", "list",
                       "--root", sys.argv[1]], capture_output=True, text=True, check=True).stdout
-q = next(s["question"] for s in json.loads(out) if s["id"] == "core/rules.md#response-format")
-assert "already set" in q and "should be added" in q, q
+ids = [s["id"] for s in json.loads(out)]
+assert ids == ["core/USER.md#profile", "core/USER.md#links", "core/USER.md#goals",
+               "core/USER.md#overrides", "tools/TOOLS.md#services"], ids
 PY
+check "style defaults prefilled in USER.md" bash -c \
+  "grep -q '^- One complete solution and the main trade-off' '$WS/core/USER.md' && \
+   grep -q '^- Disagree with reasons' '$WS/core/USER.md'"
+check "channel line filled by the installer" \
+  grep -qx -- '- Telegram, text and voice -- primary' "$WS/core/USER.md"
+check "keys folder filled by the installer" grep -qx -- "- Keys folder: $SEC" "$WS/tools/TOOLS.md"
+check "superpowers installed into the agent's config dir" bash -c \
+  "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
+     '$FAKE_CLAUDE_LOG' && \
+   grep -qx '$FAKE_HOME/.claude-agent-testbot plugin install superpowers@claude-plugins-official' \
+     '$FAKE_CLAUDE_LOG'"
 check "plugin sees workspace skills" test -f "$PLUGIN/.claude/skills/onboard/SKILL.md"
 check "language rules installed" test -f "$FAKE_HOME/.claude-agent-testbot/rules/python.md"
 check "plugin CLAUDE.md has raw HTML rule" grep -q "RAW HTML" "$PLUGIN/CLAUDE.md"
@@ -240,12 +267,13 @@ echo "== 6. install-fleet end-to-end"
 if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=helper-two AGENT_ROLE="Research helper" \
    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
-   BASE_DIR="$FAKE_HOME/agents" \
+   BASE_DIR="$FAKE_HOME/agents" FAKE_CLAUDE_FAIL=1 \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install2.log" 2>&1; then
-  ok "second agent installed"
+  ok "second agent installed (offline plugin install does not stop it)"
 else
   bad "second agent installed"; tail -10 "$WORK/install2.log"
 fi
+check "offline plugin install only warns" grep -q "WARN: marketplace .* unreachable" "$WORK/install2.log"
 check "Russian agent gets the typography rule inside Response format" python3 - \
   "$FAKE_HOME/agents/helper-two/.claude/core/rules.md" <<'PY'
 import sys

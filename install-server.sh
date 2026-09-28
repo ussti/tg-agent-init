@@ -19,6 +19,8 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIT_DIR
 readonly LIVE_TEST_TIMEOUT_S=240
 readonly PORT_WAIT_S=90
+readonly PLUGIN_MARKETPLACE_REPO="anthropics/claude-plugins-official"
+readonly DEFAULT_PLUGINS=("superpowers@claude-plugins-official")
 
 DO_SYSTEMD=1
 DO_CRON=1
@@ -284,6 +286,22 @@ mkdir -p "$CLAUDE_CONFIG_DIR/rules"
 for f in bash python typescript; do
   [ -f "$CLAUDE_CONFIG_DIR/rules/$f.md" ] || cp "$T/global-rules/$f.md" "$CLAUDE_CONFIG_DIR/rules/"
 done
+
+# Default plugins: rules.md makes superpowers mandatory, so it ships with the agent.
+# Both steps are idempotent and need no login; a failure (no network) only warns.
+say "installing default plugins: ${DEFAULT_PLUGINS[*]}"
+if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin marketplace add \
+     "$PLUGIN_MARKETPLACE_REPO" < /dev/null > /dev/null 2>&1; then
+  for p in "${DEFAULT_PLUGINS[@]}"; do
+    CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin install "$p" < /dev/null \
+      > /dev/null 2>&1 || say "WARN: could not install $p; later run:" \
+      "CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin install $p"
+  done
+else
+  say "WARN: marketplace $PLUGIN_MARKETPLACE_REPO unreachable; plugins not installed." \
+    "Later: CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin marketplace add" \
+    "$PLUGIN_MARKETPLACE_REPO, then claude plugin install ${DEFAULT_PLUGINS[*]}"
+fi
 
 if [ -z "$OAUTH" ] && [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
   echo

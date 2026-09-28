@@ -32,7 +32,7 @@ matches. Keyword-based, no server, no network. Optional semantic recall: `option
 
 | Skill | What it does | Key needed |
 |-------|--------------|------------|
-| onboard | first-run questions that fill USER.md and the style slots | none |
+| onboard | first-run questions: profile, goals, style overrides, services | none |
 | superpowers | planning, TDD, debugging, review, brainstorming | none |
 | deep-research | multi-source research with citations | none |
 | skill-creator | create and improve skills | none |
@@ -46,9 +46,9 @@ Skills without their key stay inert and say what to set; nothing else breaks.
 
 ## Services
 
-<!-- onboard: Which services and accounts does the agent work with (mail, calendar, tables,
-task board, hosting)? Names only, no passwords. -->
+<!-- onboard: Which services do you use -- mail, calendar, tables, task board, hosting?
+Names only. Not connected yet is fine; skip if unsure. -->
 
 ## Secrets (paths only, never values)
 
-<!-- onboard: Where keys live on this machine -- a folder path. Never the key itself. -->
+- Keys folder: {{SECRETS_DIR}}
