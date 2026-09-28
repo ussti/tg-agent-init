@@ -1,4 +1,4 @@
-# Bash conventions (optional coder overlay)
+# Bash conventions
 
 - `set -euo pipefail` at the top of every script
 - Quote every variable: `"$var"`, `"${arr[@]}"`

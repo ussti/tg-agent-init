@@ -32,6 +32,7 @@ matches. Keyword-based, no server, no network. Optional semantic recall: `option
 
 | Skill | What it does | Key needed |
 |-------|--------------|------------|
+| onboard | first-run questions that fill USER.md and the style slots | none |
 | superpowers | planning, TDD, debugging, review, brainstorming | none |
 | deep-research | multi-source research with citations | none |
 | skill-creator | create and improve skills | none |

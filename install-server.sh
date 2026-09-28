@@ -217,6 +217,8 @@ if [ "${TG_AGENT_TEST_SKIP_BUN:-0}" != "1" ]; then
   (cd "$PLUGIN_DIR" && bun install --frozen-lockfile)
 fi
 mkdir -p "$PLUGIN_DIR/.claude"
+# the agent runs in the plugin dir: point its project skills at the workspace skills
+ln -sfn ../../../skills "$PLUGIN_DIR/.claude/skills"
 render "$KIT_DIR/server/templates/plugin-settings.json.template" "$PLUGIN_DIR/.claude/settings.json"
 (umask 077; render "$KIT_DIR/server/templates/config.json.template" "$AGENT_WS/state/telegram/config.json")
 
@@ -253,6 +255,10 @@ PY
 if [ ! -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ]; then
   render "$T/global-CLAUDE.md.template" "$CLAUDE_CONFIG_DIR/CLAUDE.md"
 fi
+mkdir -p "$CLAUDE_CONFIG_DIR/rules"
+for f in bash python typescript; do
+  [ -f "$CLAUDE_CONFIG_DIR/rules/$f.md" ] || cp "$T/global-rules/$f.md" "$CLAUDE_CONFIG_DIR/rules/"
+done
 
 if [ -z "$OAUTH" ] && [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
   echo
@@ -326,4 +332,4 @@ echo "== Done. Agent '$AGENT_NAME' (@$BOT_USERNAME)"
 echo "  workspace:  $AGENT_HOME"
 echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
 echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
-echo "  next:       fill $AGENT_WS/core/USER.md with your profile, then talk to the bot"
+echo "  next:       write /onboard to the bot -- it asks about you and fills the profile"
