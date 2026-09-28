@@ -336,11 +336,15 @@ if [ "$DO_SYSTEMD" = "1" ]; then
   if [ "$CAN_ROOT" = "1" ]; then
     as_root install -m 644 "$UNIT_DIR/$UNIT_AGENT" "$UNIT_DIR/$UNIT_WATCH" /etc/systemd/system/
     as_root systemctl daemon-reload
-    as_root systemctl enable --now "$UNIT_AGENT" "$UNIT_WATCH"
+    as_root systemctl enable "$UNIT_AGENT"
+    # reenable drops a wants link left by an older [Install] section.
+    as_root systemctl reenable "$UNIT_WATCH"
+    as_root systemctl start "$UNIT_AGENT" "$UNIT_WATCH"
   else
     say "no passwordless sudo; install the units yourself (as root or with sudo):"
     echo "    sudo install -m 644 $UNIT_DIR/$UNIT_AGENT $UNIT_DIR/$UNIT_WATCH /etc/systemd/system/"
-    echo "    sudo systemctl daemon-reload && sudo systemctl enable --now $UNIT_AGENT $UNIT_WATCH"
+    echo "    sudo systemctl daemon-reload && sudo systemctl enable $UNIT_AGENT"
+    echo "    sudo systemctl reenable $UNIT_WATCH && sudo systemctl start $UNIT_AGENT $UNIT_WATCH"
     DO_LIVE_TEST=0
   fi
 fi

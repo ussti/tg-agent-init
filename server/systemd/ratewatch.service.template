@@ -1,6 +1,8 @@
 [Unit]
 Description=tg-agent {{AGENT_NAME}} rate-limit watchdog (answers TUI rate-limit menus)
 After={{AGENT_NAME}}-agent.service
+# Requires= stops the watchdog with the agent but never starts it again; the
+# WantedBy= below pulls it in on every start of the agent, manual ones included.
 Requires={{AGENT_NAME}}-agent.service
 
 [Service]
@@ -13,8 +15,10 @@ Environment=HOME={{USER_HOME}}
 ExecStart={{AGENT_WS}}/bin/ratewatch.sh
 Restart=always
 RestartSec=5
+# bash exits 143 on SIGTERM; a normal stop must not leave the unit "failed".
+SuccessExitStatus=143
 StandardOutput=append:{{AGENT_WS}}/logs/ratewatch-systemd.log
 StandardError=append:{{AGENT_WS}}/logs/ratewatch-systemd.log
 
 [Install]
-WantedBy=multi-user.target
+WantedBy={{AGENT_NAME}}-agent.service

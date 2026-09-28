@@ -209,6 +209,15 @@ for unit in agent ratewatch; do
     bad "$unit unit renders"
   fi
 done
+# The watchdog must come back on a plain start of the agent after a manual stop:
+# Requires= alone leaves it dead, WantedBy=<agent>.service pulls it in again.
+WATCH_UNIT="$WORK/ratewatch.service"
+AGENT_UNIT_NAME="$(set -a; . "$WS/agent.conf"; echo "$AGENT_NAME-agent.service")"
+check "ratewatch is wanted by the agent unit" grep -qx "WantedBy=$AGENT_UNIT_NAME" "$WATCH_UNIT"
+check "ratewatch is not tied to multi-user.target" bash -c "! grep -q 'multi-user.target' '$WATCH_UNIT'"
+check "ratewatch SIGTERM exit counts as success" grep -qx "SuccessExitStatus=143" "$WATCH_UNIT"
+check "installer re-enables ratewatch (drops the old wants link)" \
+  grep -qF 'systemctl reenable "$UNIT_WATCH"' "$KIT/install-server.sh"
 
 # Interactive run with systemd on and no passwordless sudo: the installer must not
 # stop at a sudo password prompt; it leaves the units on disk and prints the commands.
