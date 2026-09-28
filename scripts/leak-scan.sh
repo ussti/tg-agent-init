@@ -6,10 +6,11 @@
 #      the repo (the list itself names the people it protects).
 #   2. secrets  — generic credential shapes, always on.
 #
-# vendor/dashi-plugin/ is upstream's code, kept byte-identical to a public
-# commit: pass 1 tolerates upstream's own names (UPSTREAM_ALLOW), pass 2 is
-# replaced by an integrity check against vendor/UPSTREAM_TREE_SHA256 (its test
-# suite is full of canary tokens). In patches/, lines added to test files are
+# vendor/dashi-plugin/ and vendor/public-gbrain-agentos/ are upstream code,
+# kept byte-identical to public commits: pass 1 tolerates upstream's own names
+# (UPSTREAM_ALLOW), pass 2 is replaced by integrity checks against
+# vendor/UPSTREAM_TREE_SHA256 and vendor/GBRAIN_TREE_SHA256 (their test suites
+# are full of canary tokens). In patches/, lines added to test files are
 # fixtures and skipped by pass 2; everything else is scanned.
 #
 # Usage: leak-scan.sh [kit-root]
@@ -31,17 +32,19 @@ SECRET_PATTERNS=(
 )
 
 GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache)
+# Basename matches: also skips patches/<same name>, which the passes below cover.
+VENDOR_EXCLUDES=(--exclude-dir=dashi-plugin --exclude-dir=public-gbrain-agentos)
 fail=0
 
 log() { echo "[leak-scan] $*"; }
 
 if [ -f "$ENTITIES" ]; then
-  hits="$(grep -rnIiE -f "$ENTITIES" "${GREP_EXCLUDES[@]}" \
-            --exclude-dir=dashi-plugin --exclude=leak-scan.sh "$KIT_ROOT" || true)"
+  hits="$(grep -rnIiE -f "$ENTITIES" "${GREP_EXCLUDES[@]}" "${VENDOR_EXCLUDES[@]}" \
+            --exclude=leak-scan.sh "$KIT_ROOT" || true)"
   # --exclude-dir matches basenames, so patches/dashi-plugin was skipped above.
   patch_hits="$(grep -rnIiE -f "$ENTITIES" "$KIT_ROOT/patches" 2>/dev/null || true)"
   vendor_hits="$(grep -rnIiE -f "$ENTITIES" "${GREP_EXCLUDES[@]}" \
-            "$KIT_ROOT/vendor/dashi-plugin" 2>/dev/null \
+            "$KIT_ROOT/vendor/dashi-plugin" "$KIT_ROOT/vendor/public-gbrain-agentos" 2>/dev/null \
             | grep -viE "$UPSTREAM_ALLOW" || true)"
   hits="$(printf '%s\n%s\n%s\n' "$hits" "$patch_hits" "$vendor_hits" | sed '/^$/d')"
   if [ -n "$hits" ]; then
@@ -70,7 +73,7 @@ patch_payload() {
 
 secret_fail=0
 for pat in "${SECRET_PATTERNS[@]}"; do
-  hits="$(grep -rnIE -e "$pat" "${GREP_EXCLUDES[@]}" --exclude-dir=dashi-plugin \
+  hits="$(grep -rnIE -e "$pat" "${GREP_EXCLUDES[@]}" "${VENDOR_EXCLUDES[@]}" \
             --exclude=leak-scan.sh "$KIT_ROOT" | cut -d: -f1,2 || true)"
   hits="$hits$(patch_payload | grep -E -e "$pat" | cut -f1 || true)"
   if [ -n "$hits" ]; then
@@ -82,16 +85,20 @@ for pat in "${SECRET_PATTERNS[@]}"; do
 done
 [ "$secret_fail" -eq 1 ] && fail=1
 
-vendor_sum_file="$KIT_ROOT/vendor/UPSTREAM_TREE_SHA256"
-if [ -d "$KIT_ROOT/vendor/dashi-plugin" ]; then
-  actual="$("$KIT_ROOT/scripts/vendor-checksum.sh" "$KIT_ROOT/vendor/dashi-plugin")"
-  if [ "$actual" != "$(cat "$vendor_sum_file" 2>/dev/null)" ]; then
-    log "FAIL: vendor/dashi-plugin differs from the pinned upstream tree"
+# vendor_integrity DIR SUMFILE: the vendored tree must match its pinned hash.
+vendor_integrity() {
+  local dir="$KIT_ROOT/vendor/$1" sum_file="$KIT_ROOT/vendor/$2" actual
+  [ -d "$dir" ] || return 0
+  actual="$("$KIT_ROOT/scripts/vendor-checksum.sh" "$dir")"
+  if [ "$actual" != "$(cat "$sum_file" 2>/dev/null)" ]; then
+    log "FAIL: vendor/$1 differs from the pinned upstream tree"
     fail=1
   else
-    log "vendor: matches pinned upstream tree"
+    log "vendor/$1: matches pinned upstream tree"
   fi
-fi
+}
+vendor_integrity dashi-plugin UPSTREAM_TREE_SHA256
+vendor_integrity public-gbrain-agentos GBRAIN_TREE_SHA256
 [ "$secret_fail" -eq 0 ] && log "secrets: clean"
 
 exit "$fail"
