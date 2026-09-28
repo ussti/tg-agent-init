@@ -48,7 +48,7 @@ fi
 # Existing crontab minus any prior block for THIS agent (exact-line awk match — no regex
 # delimiter issues; the tag contains '#', which broke a sed-based approach). Never wipes:
 # a crontab-read failure just yields an empty prior, and other agents' blocks are preserved.
-EXISTING="$(crontab -l 2>/dev/null | awk -v tag="$TAG" '
+EXISTING="$({ crontab -l 2>/dev/null || true; } | awk -v tag="$TAG" '
   $0 == tag " START" { skip = 1; next }
   $0 == tag " END"   { skip = 0; next }
   !skip { print }

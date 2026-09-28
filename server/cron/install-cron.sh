@@ -44,7 +44,7 @@ if [ "$DRY_RUN" = "--dry-run" ]; then
 fi
 
 # Exact-line awk match: the tag contains '#', which breaks sed-based removal.
-EXISTING="$(crontab -l 2>/dev/null | awk -v tag="$TAG" '
+EXISTING="$({ crontab -l 2>/dev/null || true; } | awk -v tag="$TAG" '
   $0 == tag " START" { skip = 1; next }
   $0 == tag " END"   { skip = 0; next }
   !skip { print }

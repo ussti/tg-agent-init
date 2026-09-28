@@ -95,10 +95,34 @@ for groups in d["hooks"].values():
     for g in groups:
         for h in g["hooks"]:
             parts = [p for p in h["command"].split() if "=" not in p.split("/")[0]]
-            target = parts[1] if parts[0] == "node" else parts[0]
+            runner = os.path.basename(parts[0]) in ("node", "bun")
+            target = parts[1] if runner else parts[0]
             assert os.path.isfile(target), target
-            assert parts[0] == "node" or os.access(target, os.X_OK), target
+            assert runner or os.access(target, os.X_OK), target
 PY
+check "channel.conf access mode is one the plugin accepts" \
+  grep -qx 'TELEGRAM_ACCESS_MODE="static"' "$SEC/channel.conf"
+check "plugin schema still accepts access mode 'static'" \
+  grep -qF ".enum(['static', 'pairing'])" "$KIT/vendor/dashi-plugin/plugin/src/config.ts"
+check "eyes hook runs clean on a prompt without channel refs" bash -c \
+  "out=\"\$(echo '{\"prompt\":\"hi\"}' | bun '$WS/hooks/eyes-on-turn-start.ts')\" && [ -z \"\$out\" ]"
+check "eyes hook on turn start, read receipt on stop" python3 - "$PLUGIN/.claude/settings.json" "$SEC" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+env_file = f"TELEGRAM_CHANNEL_ENV_FILE={sys.argv[2]}/channel.conf"
+def cmds(event):
+    return [h["command"] for g in d["hooks"][event] for h in g["hooks"]]
+eyes = [c for c in cmds("UserPromptSubmit") if "eyes-on-turn-start.ts" in c]
+receipt = [c for c in cmds("Stop") if "read-receipt-hook.ts" in c]
+assert len(eyes) == 1 and len(receipt) == 1, (eyes, receipt)
+assert all(env_file in c for c in eyes + receipt)
+PY
+check "eyes hook import resolves to the plugin's read-receipt hook" bash -c \
+  "cd '$WS/hooks' && test -f \"\$(grep -oE \"'[.][.]/[^']*read-receipt-hook[.]ts'\" \
+   eyes-on-turn-start.ts | tr -d \"'\")\""
+check "secrets deny rules: Read and Edit, no redundant Write" jq -e --arg s "$SEC" \
+  '.permissions.deny | (index("Read(\($s)/**)") != null) and (index("Edit(\($s)/**)") != null)
+   and (index("Write(\($s)/**)") == null)' "$PLUGIN/.claude/settings.json"
 check "channel rule appended to rules.md" grep -q "## Telegram channel" "$WS/core/rules.md"
 check "plugin sees workspace skills" test -f "$PLUGIN/.claude/skills/onboard/SKILL.md"
 check "language rules installed" test -f "$FAKE_HOME/.claude-agent-testbot/rules/python.md"
@@ -107,8 +131,35 @@ check "claude config: bypass prompt skipped" jq -e '.skipDangerousModePermission
   "$FAKE_HOME/.claude-agent-testbot/settings.json"
 check "claude config: plugin dir trusted" jq -e \
   --arg p "$PLUGIN" '.projects[$p].hasTrustDialogAccepted' "$FAKE_HOME/.claude-agent-testbot/.claude.json"
+check "claude config: external CLAUDE.md imports pre-approved" jq -e --arg p "$PLUGIN" \
+  '.projects[$p] | .hasClaudeMdExternalIncludesApproved and .hasClaudeMdExternalIncludesWarningShown' \
+  "$FAKE_HOME/.claude-agent-testbot/.claude.json"
 check "server cron dry-run" bash "$KIT/server/cron/install-cron.sh" "$WS" --dry-run
 check "core cron dry-run" bash "$KIT/core/cron/install-cron.sh" "$WS" --dry-run
+
+# Fake crontab: `-l` fails like the real one for a user who has no crontab yet.
+FAKE_BIN="$WORK/fakebin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/crontab" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  -l) [ -f "$FAKE_CRONTAB_FILE" ] || { echo "no crontab for $(id -un)" >&2; exit 1; }
+      cat "$FAKE_CRONTAB_FILE" ;;
+  -) cat > "$FAKE_CRONTAB_FILE" ;;
+esac
+SH
+chmod +x "$FAKE_BIN/crontab"
+install_both_crons() {
+  PATH="$FAKE_BIN:$PATH" FAKE_CRONTAB_FILE="$WORK/crontab.txt" \
+    bash "$KIT/core/cron/install-cron.sh" "$WS" &&
+  PATH="$FAKE_BIN:$PATH" FAKE_CRONTAB_FILE="$WORK/crontab.txt" \
+    bash "$KIT/server/cron/install-cron.sh" "$WS"
+}
+check "cron installs into an empty crontab" install_both_crons
+check "crontab got both blocks" test "$(grep -c ' START$' "$WORK/crontab.txt" 2>/dev/null)" = 2
+cp "$WORK/crontab.txt" "$WORK/crontab.once" 2>/dev/null || true
+check "cron re-install keeps one copy of each block" install_both_crons
+check "crontab unchanged by re-install" diff -q "$WORK/crontab.once" "$WORK/crontab.txt"
 
 for unit in agent ratewatch; do
   out="$WORK/$unit.service"
@@ -119,6 +170,37 @@ for unit in agent ratewatch; do
     bad "$unit unit renders"
   fi
 done
+
+# Interactive run with systemd on and no passwordless sudo: the installer must not
+# stop at a sudo password prompt; it leaves the units on disk and prints the commands.
+# Skipped as root: there the installer would really install the units.
+if [ "$(id -u)" = "0" ]; then
+  echo "  skip sudo fallback (running as root)"
+else
+  SUDO_HOME="$WORK/home-sudo"
+  mkdir -p "$SUDO_HOME" "$WORK/sudobin"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >> "$FAKE_SUDO_LOG"' 'exit 1' \
+    > "$WORK/sudobin/sudo"
+  chmod +x "$WORK/sudobin/sudo"
+  : > "$WORK/sudo.log"
+  if HOME="$SUDO_HOME" PATH="$WORK/sudobin:$PATH" FAKE_SUDO_LOG="$WORK/sudo.log" \
+     TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" \
+     AGENT_NAME=sudobot OWNER_CHAT_ID="$OWNER" TIMEZONE=UTC WEBHOOK_PORT=$((PORT + 2)) \
+     BASE_DIR="$SUDO_HOME/agents" timeout 120 bash "$KIT/install-server.sh" --no-cron --no-live-test \
+     < /dev/null > "$WORK/install-sudo.log" 2>&1; then
+    ok "installer without passwordless sudo exits 0"
+  else
+    bad "installer without passwordless sudo exits 0 (log below)"
+    tail -20 "$WORK/install-sudo.log"
+  fi
+  SUDO_UNITS="$SUDO_HOME/agents/sudobot/.claude/systemd"
+  check "sudo only probed non-interactively" bash -c \
+    "test -s '$WORK/sudo.log' && ! grep -qv '^-n ' '$WORK/sudo.log'"
+  check "units kept in the workspace" test -f "$SUDO_UNITS/sudobot-agent.service" -a \
+    -f "$SUDO_UNITS/sudobot-ratewatch.service"
+  check "printed install command points at the kept units" \
+    grep -qF "$SUDO_UNITS/sudobot-agent.service" "$WORK/install-sudo.log"
+fi
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
@@ -345,6 +427,11 @@ if [ "$WITH_PLUGIN" = "1" ]; then
     && ok "bun install" || bad "bun install"
   (cd "$WORK/plugin-build/plugin" && bunx tsc --noEmit > "$WORK/tsc.log" 2>&1) \
     && ok "typecheck" || bad "typecheck"
+  # The plugin must accept the env the installer wrote (clean env: no host TELEGRAM_*).
+  check "installer channel.conf passes the plugin's RuntimeEnvSchema" \
+    env -i PATH="$PATH" HOME="$FAKE_HOME" bash -c "set -a; . '$SEC/channel.conf'; set +a; \
+      cd '$WORK/plugin-build/plugin' && bun -e \
+      \"const { RuntimeEnvSchema } = await import('./src/config.ts'); RuntimeEnvSchema.parse(process.env)\""
   (cd "$WORK/plugin-build/plugin" && bun test > "$WORK/test.log" 2>&1) \
     && ok "bun test ($(grep -oE '[0-9]+ pass' "$WORK/test.log" | tail -1))" \
     || { bad "bun test"; grep -E ' fail|✗' "$WORK/test.log" | head -10; }

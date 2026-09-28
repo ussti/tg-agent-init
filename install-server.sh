@@ -131,6 +131,7 @@ AGENT_WS="$AGENT_HOME/.claude"
 SECRETS_DIR="$HOME/.config/tg-agent/$AGENT_NAME"
 CLAUDE_CONFIG_DIR="$HOME/.claude-agent-$AGENT_NAME"
 CLAUDE_BIN="$(command -v claude)"
+BUN_BIN="$(command -v bun)"
 PLUGIN_DIR="$AGENT_WS/dashi-plugin/plugin"
 RUN_USER="$(id -un)"
 RUN_GROUP="$(id -gn)"
@@ -149,7 +150,7 @@ done
 
 export AGENT_NAME AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS \
   TIMEZONE LANGUAGE PRIMARY_MODEL OWNER_CHAT_ID AGENT_HOME AGENT_WS SECRETS_DIR \
-  CLAUDE_CONFIG_DIR CLAUDE_BIN AGENT_MODEL WEBHOOK_PORT BOT_ID RUN_USER RUN_GROUP USER_HOME \
+  CLAUDE_CONFIG_DIR CLAUDE_BIN BUN_BIN AGENT_MODEL WEBHOOK_PORT BOT_ID RUN_USER RUN_GROUP USER_HOME \
   VOICE_PROVIDER
 export LANGUAGE_CODE="$VOICE_LANG"
 
@@ -249,7 +250,13 @@ merge(cfg_dir / "settings.json", {"skipDangerousModePermissionPrompt": True, "th
 merge(cfg_dir / ".claude.json", {
     "hasCompletedOnboarding": True,
     "lastOnboardingVersion": version,
-    "projects": {plugin_dir: {"hasTrustDialogAccepted": True}},
+    # The workspace CLAUDE.md @-imports files outside the plugin dir; pre-approve them
+    # so the first start does not stop at the external-imports prompt.
+    "projects": {plugin_dir: {
+        "hasTrustDialogAccepted": True,
+        "hasClaudeMdExternalIncludesApproved": True,
+        "hasClaudeMdExternalIncludesWarningShown": True,
+    }},
 })
 PY
 if [ ! -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ]; then
@@ -276,16 +283,27 @@ UNIT_AGENT="$AGENT_NAME-agent.service"
 UNIT_WATCH="$AGENT_NAME-ratewatch.service"
 if [ "$DO_SYSTEMD" = "1" ]; then
   say "installing systemd units $UNIT_AGENT, $UNIT_WATCH"
-  UNIT_TMP="$(mktemp -d)"
-  render "$KIT_DIR/server/systemd/agent.service.template" "$UNIT_TMP/$UNIT_AGENT"
-  render "$KIT_DIR/server/systemd/ratewatch.service.template" "$UNIT_TMP/$UNIT_WATCH"
-  if sudo -n true 2>/dev/null || [ "$NONINTERACTIVE" != "1" ]; then
-    sudo install -m 644 "$UNIT_TMP/$UNIT_AGENT" "$UNIT_TMP/$UNIT_WATCH" /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$UNIT_AGENT" "$UNIT_WATCH"
+  # Rendered units stay in the workspace so a manual install can point at them.
+  UNIT_DIR="$AGENT_WS/systemd"
+  mkdir -p "$UNIT_DIR"
+  render "$KIT_DIR/server/systemd/agent.service.template" "$UNIT_DIR/$UNIT_AGENT"
+  render "$KIT_DIR/server/systemd/ratewatch.service.template" "$UNIT_DIR/$UNIT_WATCH"
+  # Root or passwordless sudo only: a password prompt would stall the install.
+  CAN_ROOT=1
+  if [ "$(id -u)" = "0" ]; then
+    as_root() { "$@"; }
+  elif sudo -n true 2>/dev/null; then
+    as_root() { sudo -n "$@"; }
   else
-    say "no passwordless sudo; install the units yourself:"
-    echo "    sudo install -m 644 $UNIT_TMP/$UNIT_AGENT $UNIT_TMP/$UNIT_WATCH /etc/systemd/system/"
+    CAN_ROOT=0
+  fi
+  if [ "$CAN_ROOT" = "1" ]; then
+    as_root install -m 644 "$UNIT_DIR/$UNIT_AGENT" "$UNIT_DIR/$UNIT_WATCH" /etc/systemd/system/
+    as_root systemctl daemon-reload
+    as_root systemctl enable --now "$UNIT_AGENT" "$UNIT_WATCH"
+  else
+    say "no passwordless sudo; install the units yourself (as root or with sudo):"
+    echo "    sudo install -m 644 $UNIT_DIR/$UNIT_AGENT $UNIT_DIR/$UNIT_WATCH /etc/systemd/system/"
     echo "    sudo systemctl daemon-reload && sudo systemctl enable --now $UNIT_AGENT $UNIT_WATCH"
     DO_LIVE_TEST=0
   fi
