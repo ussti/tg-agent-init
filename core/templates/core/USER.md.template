@@ -1,27 +1,37 @@
-# USER.md — Operator Profile
+# USER.md -- Operator Profile
+
+_Static operator profile. Operator-only edit. Agent reads, does not modify._
 
 **Name:** {{OPERATOR_NAME}}
-**Address:** {{OPERATOR_ADDRESS}}
+**Address as:** {{OPERATOR_ADDRESS}}
 **Timezone:** {{TIMEZONE}}
-**Language:** {{LANGUAGE}}
+**Language:** {{LANGUAGE}} to operator; English in all files and code
 
 ## Profile
 
-- <!-- who you are / your role -->
-- <!-- your projects / current focus -->
+<!-- onboard: Who are you -- what do you do, what did you do before, what are you building
+now? Two or three sentences. -->
 
-## What I need from {{AGENT_NAME}}
+## Links
 
-- <!-- e.g. honest answers, concise, source-backed -->
-- <!-- your working preferences -->
+<!-- onboard: Links the agent should know: your site, social profiles, channel, portfolio.
+Skip if none. -->
 
-## Communication style
+## Goals
 
-- Responses in {{LANGUAGE}}
-- <!-- tone / register -->
-- No filler, no flattery. Direct, with reasoning.
+<!-- onboard: What are your two or three main goals for the next months? -->
 
-## Boundaries
+## Communication Style
 
-- Before publish / send / delete / pay → confirm first
-- Never fabricate facts, sources, or numbers
+<!-- onboard: How should the agent talk to you -- formal or informal, short or detailed, what
+irritates you in answers (filler, praise, emoji), how it should disagree with you? -->
+
+## What operator needs from this agent
+
+<!-- onboard: What should the agent do for you, and how -- one solution or options, when to
+ask before acting, how often to report? -->
+
+## Channels
+
+<!-- onboard: Where do you talk to the agent (terminal, chat app, voice)? Which one is
+primary? -->
