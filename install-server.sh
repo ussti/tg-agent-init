@@ -184,6 +184,24 @@ cp "$C"/scripts/*.sh "$C"/scripts/*.mjs "$AGENT_WS/scripts/"
 cp -R "$C"/skills/. "$AGENT_WS/skills/"
 python3 "$KIT_DIR/scripts/render-template.py" --tree "$AGENT_WS"
 
+# Russian-speaking agent: typography rule goes into Response format, after the defaults.
+case "$LANGUAGE" in
+  Russian*|russian*|Русск*|русск*|ru|RU)
+    python3 - "$AGENT_WS/core/rules.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+anchor = "- Summary after each task\n"
+rule = "- Russian typography: long dash «—», quotes «ёлочки», е instead of ё\n"
+text = path.read_text(encoding="utf-8")
+if anchor not in text:
+    raise SystemExit("install-server: Response format anchor missing in core/rules.md")
+path.write_text(text.replace(anchor, anchor + rule, 1), encoding="utf-8")
+PY
+    ;;
+esac
+
 # Channel rule on top of the core identity: the owner only reads Telegram.
 cat "$KIT_DIR/server/templates/channel-rules.md" >> "$AGENT_WS/core/rules.md"
 

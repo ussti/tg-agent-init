@@ -124,6 +124,18 @@ check "secrets deny rules: Read and Edit, no redundant Write" jq -e --arg s "$SE
   '.permissions.deny | (index("Read(\($s)/**)") != null) and (index("Edit(\($s)/**)") != null)
    and (index("Write(\($s)/**)") == null)' "$PLUGIN/.claude/settings.json"
 check "channel rule appended to rules.md" grep -q "## Telegram channel" "$WS/core/rules.md"
+check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
+  grep -q '^- Living syntax: ' '$WS/core/rules.md' && \
+  grep -q '^- Numbers and facts only with a source' '$WS/core/rules.md'"
+check "no Russian typography rule for a non-Russian agent" \
+  bash -c "! grep -q 'Russian typography' '$WS/core/rules.md'"
+check "writing-rules slot builds on the defaults" python3 - "$WS" <<'PY'
+import json, subprocess, sys
+out = subprocess.run([sys.executable, f"{sys.argv[1]}/skills/onboard/onboard_slots.py", "list",
+                      "--root", sys.argv[1]], capture_output=True, text=True, check=True).stdout
+q = next(s["question"] for s in json.loads(out) if s["id"] == "core/rules.md#response-format")
+assert "already set" in q and "should be added" in q, q
+PY
 check "plugin sees workspace skills" test -f "$PLUGIN/.claude/skills/onboard/SKILL.md"
 check "language rules installed" test -f "$FAKE_HOME/.claude-agent-testbot/rules/python.md"
 check "plugin CLAUDE.md has raw HTML rule" grep -q "RAW HTML" "$PLUGIN/CLAUDE.md"
@@ -227,13 +239,20 @@ echo "== 6. install-fleet end-to-end"
 # Second agent next to testbot from section 4.
 if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=helper-two AGENT_ROLE="Research helper" \
-   OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 \
+   OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
    BASE_DIR="$FAKE_HOME/agents" \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install2.log" 2>&1; then
   ok "second agent installed"
 else
   bad "second agent installed"; tail -10 "$WORK/install2.log"
 fi
+check "Russian agent gets the typography rule inside Response format" python3 - \
+  "$FAKE_HOME/agents/helper-two/.claude/core/rules.md" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+section = text.split("## Response format", 1)[1].split("\n## ", 1)[0]
+assert section.count("- Russian typography: ") == 1, section
+PY
 # A reinstall leftover must be ignored by agent discovery.
 cp -a "$FAKE_HOME/agents/testbot" "$FAKE_HOME/agents/testbot.bak_20000101_000000"
 
