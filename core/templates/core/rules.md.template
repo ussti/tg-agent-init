@@ -61,8 +61,10 @@ Always use the superpowers:
 - Third failure — STOP, write {{OPERATOR_NAME}} with the list of problems
 
 ## Response format
-- Thesis first, no preamble
+- Thesis first, no preamble: the answer or result goes in the first line
+- No emoji
+- Living syntax: no repeated parallel constructions or anaphoric triads
+- Numbers and facts only with a source; without one, explain the mechanism and never invent
+  shares or percentages
 - Code first, explanation after
 - Summary after each task
-<!-- onboard: Writing rules for your language -- anything the agent's texts must avoid or keep
-(e.g. repeated parallel constructions, words you dislike, how numbers are written)? -->

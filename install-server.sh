@@ -19,6 +19,8 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIT_DIR
 readonly LIVE_TEST_TIMEOUT_S=240
 readonly PORT_WAIT_S=90
+readonly PLUGIN_MARKETPLACE_REPO="anthropics/claude-plugins-official"
+readonly DEFAULT_PLUGINS=("superpowers@claude-plugins-official")
 
 DO_SYSTEMD=1
 DO_CRON=1
@@ -131,6 +133,7 @@ AGENT_WS="$AGENT_HOME/.claude"
 SECRETS_DIR="$HOME/.config/tg-agent/$AGENT_NAME"
 CLAUDE_CONFIG_DIR="$HOME/.claude-agent-$AGENT_NAME"
 CLAUDE_BIN="$(command -v claude)"
+BUN_BIN="$(command -v bun)"
 PLUGIN_DIR="$AGENT_WS/dashi-plugin/plugin"
 RUN_USER="$(id -un)"
 RUN_GROUP="$(id -gn)"
@@ -149,7 +152,7 @@ done
 
 export AGENT_NAME AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS \
   TIMEZONE LANGUAGE PRIMARY_MODEL OWNER_CHAT_ID AGENT_HOME AGENT_WS SECRETS_DIR \
-  CLAUDE_CONFIG_DIR CLAUDE_BIN AGENT_MODEL WEBHOOK_PORT BOT_ID RUN_USER RUN_GROUP USER_HOME \
+  CLAUDE_CONFIG_DIR CLAUDE_BIN BUN_BIN AGENT_MODEL WEBHOOK_PORT BOT_ID RUN_USER RUN_GROUP USER_HOME \
   VOICE_PROVIDER
 export LANGUAGE_CODE="$VOICE_LANG"
 
@@ -182,6 +185,24 @@ cp "$C"/hooks/* "$AGENT_WS/hooks/"
 cp "$C"/scripts/*.sh "$C"/scripts/*.mjs "$AGENT_WS/scripts/"
 cp -R "$C"/skills/. "$AGENT_WS/skills/"
 python3 "$KIT_DIR/scripts/render-template.py" --tree "$AGENT_WS"
+
+# Russian-speaking agent: typography rule goes into Response format, after the defaults.
+case "$LANGUAGE" in
+  Russian*|russian*|Русск*|русск*|ru|RU)
+    python3 - "$AGENT_WS/core/rules.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+anchor = "- Summary after each task\n"
+rule = "- Russian typography: long dash «—», quotes «ёлочки», е instead of ё\n"
+text = path.read_text(encoding="utf-8")
+if anchor not in text:
+    raise SystemExit("install-server: Response format anchor missing in core/rules.md")
+path.write_text(text.replace(anchor, anchor + rule, 1), encoding="utf-8")
+PY
+    ;;
+esac
 
 # Channel rule on top of the core identity: the owner only reads Telegram.
 cat "$KIT_DIR/server/templates/channel-rules.md" >> "$AGENT_WS/core/rules.md"
@@ -225,12 +246,14 @@ render "$KIT_DIR/server/templates/plugin-settings.json.template" "$PLUGIN_DIR/.c
 # ---------------------------------------------------------------- claude config
 say "preparing Claude Code config dir $CLAUDE_CONFIG_DIR"
 mkdir -p "$CLAUDE_CONFIG_DIR"
-python3 - "$CLAUDE_CONFIG_DIR" "$PLUGIN_DIR" "$("$CLAUDE_BIN" --version | awk '{print $1}')" <<'PY'
+python3 - "$CLAUDE_CONFIG_DIR" "$PLUGIN_DIR" "$("$CLAUDE_BIN" --version | awk '{print $1}')" \
+  "$AGENT_HOME" <<'PY'
 import json
 import pathlib
 import sys
 
 cfg_dir, plugin_dir, version = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+agent_home = sys.argv[4]
 
 
 def merge(path: pathlib.Path, patch: dict) -> None:
@@ -249,7 +272,15 @@ merge(cfg_dir / "settings.json", {"skipDangerousModePermissionPrompt": True, "th
 merge(cfg_dir / ".claude.json", {
     "hasCompletedOnboarding": True,
     "lastOnboardingVersion": version,
-    "projects": {plugin_dir: {"hasTrustDialogAccepted": True}},
+    # The workspace CLAUDE.md @-imports files outside the plugin dir; pre-approve them
+    # so the first start does not stop at the external-imports prompt. The hourly
+    # snapshot.sh makes the agent home a git repo, and Claude Code then keys trust on
+    # the repo root instead of the plugin dir, so trust both.
+    "projects": {d: {
+        "hasTrustDialogAccepted": True,
+        "hasClaudeMdExternalIncludesApproved": True,
+        "hasClaudeMdExternalIncludesWarningShown": True,
+    } for d in (plugin_dir, agent_home)},
 })
 PY
 if [ ! -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ]; then
@@ -259,6 +290,22 @@ mkdir -p "$CLAUDE_CONFIG_DIR/rules"
 for f in bash python typescript; do
   [ -f "$CLAUDE_CONFIG_DIR/rules/$f.md" ] || cp "$T/global-rules/$f.md" "$CLAUDE_CONFIG_DIR/rules/"
 done
+
+# Default plugins: rules.md makes superpowers mandatory, so it ships with the agent.
+# Both steps are idempotent and need no login; a failure (no network) only warns.
+say "installing default plugins: ${DEFAULT_PLUGINS[*]}"
+if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin marketplace add \
+     "$PLUGIN_MARKETPLACE_REPO" < /dev/null > /dev/null 2>&1; then
+  for p in "${DEFAULT_PLUGINS[@]}"; do
+    CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin install "$p" < /dev/null \
+      > /dev/null 2>&1 || say "WARN: could not install $p; later run:" \
+      "CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin install $p"
+  done
+else
+  say "WARN: marketplace $PLUGIN_MARKETPLACE_REPO unreachable; plugins not installed." \
+    "Later: CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin marketplace add" \
+    "$PLUGIN_MARKETPLACE_REPO, then claude plugin install ${DEFAULT_PLUGINS[*]}"
+fi
 
 if [ -z "$OAUTH" ] && [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
   echo
@@ -276,17 +323,32 @@ UNIT_AGENT="$AGENT_NAME-agent.service"
 UNIT_WATCH="$AGENT_NAME-ratewatch.service"
 if [ "$DO_SYSTEMD" = "1" ]; then
   say "installing systemd units $UNIT_AGENT, $UNIT_WATCH"
-  UNIT_TMP="$(mktemp -d)"
-  render "$KIT_DIR/server/systemd/agent.service.template" "$UNIT_TMP/$UNIT_AGENT"
-  render "$KIT_DIR/server/systemd/ratewatch.service.template" "$UNIT_TMP/$UNIT_WATCH"
-  if sudo -n true 2>/dev/null || [ "$NONINTERACTIVE" != "1" ]; then
-    sudo install -m 644 "$UNIT_TMP/$UNIT_AGENT" "$UNIT_TMP/$UNIT_WATCH" /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$UNIT_AGENT" "$UNIT_WATCH"
+  # Rendered units stay in the workspace so a manual install can point at them.
+  UNIT_DIR="$AGENT_WS/systemd"
+  mkdir -p "$UNIT_DIR"
+  render "$KIT_DIR/server/systemd/agent.service.template" "$UNIT_DIR/$UNIT_AGENT"
+  render "$KIT_DIR/server/systemd/ratewatch.service.template" "$UNIT_DIR/$UNIT_WATCH"
+  # Root or passwordless sudo only: a password prompt would stall the install.
+  CAN_ROOT=1
+  if [ "$(id -u)" = "0" ]; then
+    as_root() { "$@"; }
+  elif sudo -n true 2>/dev/null; then
+    as_root() { sudo -n "$@"; }
   else
-    say "no passwordless sudo; install the units yourself:"
-    echo "    sudo install -m 644 $UNIT_TMP/$UNIT_AGENT $UNIT_TMP/$UNIT_WATCH /etc/systemd/system/"
-    echo "    sudo systemctl daemon-reload && sudo systemctl enable --now $UNIT_AGENT $UNIT_WATCH"
+    CAN_ROOT=0
+  fi
+  if [ "$CAN_ROOT" = "1" ]; then
+    as_root install -m 644 "$UNIT_DIR/$UNIT_AGENT" "$UNIT_DIR/$UNIT_WATCH" /etc/systemd/system/
+    as_root systemctl daemon-reload
+    as_root systemctl enable "$UNIT_AGENT"
+    # reenable drops a wants link left by an older [Install] section.
+    as_root systemctl reenable "$UNIT_WATCH"
+    as_root systemctl start "$UNIT_AGENT" "$UNIT_WATCH"
+  else
+    say "no passwordless sudo; install the units yourself (as root or with sudo):"
+    echo "    sudo install -m 644 $UNIT_DIR/$UNIT_AGENT $UNIT_DIR/$UNIT_WATCH /etc/systemd/system/"
+    echo "    sudo systemctl daemon-reload && sudo systemctl enable $UNIT_AGENT"
+    echo "    sudo systemctl reenable $UNIT_WATCH && sudo systemctl start $UNIT_AGENT $UNIT_WATCH"
     DO_LIVE_TEST=0
   fi
 fi

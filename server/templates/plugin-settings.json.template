@@ -29,8 +29,7 @@
       "Bash(git push --force *)",
       "Bash(git push -f *)",
       "Read({{SECRETS_DIR}}/**)",
-      "Edit({{SECRETS_DIR}}/**)",
-      "Write({{SECRETS_DIR}}/**)"
+      "Edit({{SECRETS_DIR}}/**)"
     ]
   },
   "hooks": {
@@ -59,6 +58,7 @@
     "UserPromptSubmit": [
       {
         "hooks": [
+          { "type": "command", "command": "TELEGRAM_CHANNEL_ENV_FILE={{SECRETS_DIR}}/channel.conf TELEGRAM_STATE_DIR={{AGENT_WS}}/state/telegram {{BUN_BIN}} {{AGENT_WS}}/hooks/eyes-on-turn-start.ts", "timeout": 10 },
           { "type": "command", "command": "{{AGENT_WS}}/hooks/post-to-webhook.sh", "timeout": 5 },
           { "type": "command", "command": "{{AGENT_WS}}/hooks/inject-channel-reminder.sh", "timeout": 5 },
           { "type": "command", "command": "CLAUDE_PROJECT_DIR={{AGENT_HOME}} node {{AGENT_WS}}/hooks/local-recall.mjs", "timeout": 10 },
@@ -70,7 +70,8 @@
       {
         "hooks": [
           { "type": "command", "command": "CLAUDE_PROJECT_DIR={{AGENT_HOME}} {{AGENT_WS}}/hooks/write-handoff.sh", "timeout": 10 },
-          { "type": "command", "command": "{{AGENT_WS}}/hooks/post-to-webhook.sh", "timeout": 10 }
+          { "type": "command", "command": "{{AGENT_WS}}/hooks/post-to-webhook.sh", "timeout": 10 },
+          { "type": "command", "command": "TELEGRAM_CHANNEL_ENV_FILE={{SECRETS_DIR}}/channel.conf TELEGRAM_STATE_DIR={{AGENT_WS}}/state/telegram {{BUN_BIN}} {{AGENT_WS}}/dashi-plugin/plugin/scripts/read-receipt-hook.ts", "timeout": 10 }
         ]
       }
     ],

@@ -53,6 +53,20 @@ echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
 
 echo "== 4. installer end-to-end"
+# Fake claude: answers --version, logs every other call with its config dir, no network.
+# FAKE_CLAUDE_FAIL=1 makes plugin commands fail (offline install).
+mkdir -p "$WORK/claudebin"
+cat > "$WORK/claudebin/claude" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then echo "2.1.0 (Claude Code)"; exit 0; fi
+echo "${CLAUDE_CONFIG_DIR:-} $*" >> "${FAKE_CLAUDE_LOG:-/dev/null}"
+[ "${FAKE_CLAUDE_FAIL:-0}" = 1 ] && exit 1
+exit 0
+SH
+chmod +x "$WORK/claudebin/claude"
+export PATH="$WORK/claudebin:$PATH"
+export FAKE_CLAUDE_LOG="$WORK/claude.log"
+: > "$FAKE_CLAUDE_LOG"
 FAKE_HOME="$WORK/home"
 mkdir -p "$FAKE_HOME"
 OWNER=111222333
@@ -95,11 +109,60 @@ for groups in d["hooks"].values():
     for g in groups:
         for h in g["hooks"]:
             parts = [p for p in h["command"].split() if "=" not in p.split("/")[0]]
-            target = parts[1] if parts[0] == "node" else parts[0]
+            runner = os.path.basename(parts[0]) in ("node", "bun")
+            target = parts[1] if runner else parts[0]
             assert os.path.isfile(target), target
-            assert parts[0] == "node" or os.access(target, os.X_OK), target
+            assert runner or os.access(target, os.X_OK), target
 PY
+check "channel.conf access mode is one the plugin accepts" \
+  grep -qx 'TELEGRAM_ACCESS_MODE="static"' "$SEC/channel.conf"
+check "plugin schema still accepts access mode 'static'" \
+  grep -qF ".enum(['static', 'pairing'])" "$KIT/vendor/dashi-plugin/plugin/src/config.ts"
+check "eyes hook runs clean on a prompt without channel refs" bash -c \
+  "out=\"\$(echo '{\"prompt\":\"hi\"}' | bun '$WS/hooks/eyes-on-turn-start.ts')\" && [ -z \"\$out\" ]"
+check "eyes hook on turn start, read receipt on stop" python3 - "$PLUGIN/.claude/settings.json" "$SEC" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+env_file = f"TELEGRAM_CHANNEL_ENV_FILE={sys.argv[2]}/channel.conf"
+def cmds(event):
+    return [h["command"] for g in d["hooks"][event] for h in g["hooks"]]
+eyes = [c for c in cmds("UserPromptSubmit") if "eyes-on-turn-start.ts" in c]
+receipt = [c for c in cmds("Stop") if "read-receipt-hook.ts" in c]
+assert len(eyes) == 1 and len(receipt) == 1, (eyes, receipt)
+assert all(env_file in c for c in eyes + receipt)
+PY
+check "eyes hook import resolves to the plugin's read-receipt hook" bash -c \
+  "cd '$WS/hooks' && test -f \"\$(grep -oE \"'[.][.]/[^']*read-receipt-hook[.]ts'\" \
+   eyes-on-turn-start.ts | tr -d \"'\")\""
+check "secrets deny rules: Read and Edit, no redundant Write" jq -e --arg s "$SEC" \
+  '.permissions.deny | (index("Read(\($s)/**)") != null) and (index("Edit(\($s)/**)") != null)
+   and (index("Write(\($s)/**)") == null)' "$PLUGIN/.claude/settings.json"
 check "channel rule appended to rules.md" grep -q "## Telegram channel" "$WS/core/rules.md"
+check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
+  grep -q '^- Living syntax: ' '$WS/core/rules.md' && \
+  grep -q '^- Numbers and facts only with a source' '$WS/core/rules.md'"
+check "no Russian typography rule for a non-Russian agent" \
+  bash -c "! grep -q 'Russian typography' '$WS/core/rules.md'"
+check "onboarding asks five questions: profile, links, goals, overrides, services" \
+  python3 - "$WS" <<'PY'
+import json, subprocess, sys
+out = subprocess.run([sys.executable, f"{sys.argv[1]}/skills/onboard/onboard_slots.py", "list",
+                      "--root", sys.argv[1]], capture_output=True, text=True, check=True).stdout
+ids = [s["id"] for s in json.loads(out)]
+assert ids == ["core/USER.md#profile", "core/USER.md#links", "core/USER.md#goals",
+               "core/USER.md#overrides", "tools/TOOLS.md#services"], ids
+PY
+check "style defaults prefilled in USER.md" bash -c \
+  "grep -q '^- One complete solution and the main trade-off' '$WS/core/USER.md' && \
+   grep -q '^- Disagree with reasons' '$WS/core/USER.md'"
+check "channel line filled by the installer" \
+  grep -qx -- '- Telegram, text and voice -- primary' "$WS/core/USER.md"
+check "keys folder filled by the installer" grep -qx -- "- Keys folder: $SEC" "$WS/tools/TOOLS.md"
+check "superpowers installed into the agent's config dir" bash -c \
+  "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
+     '$FAKE_CLAUDE_LOG' && \
+   grep -qx '$FAKE_HOME/.claude-agent-testbot plugin install superpowers@claude-plugins-official' \
+     '$FAKE_CLAUDE_LOG'"
 check "plugin sees workspace skills" test -f "$PLUGIN/.claude/skills/onboard/SKILL.md"
 check "language rules installed" test -f "$FAKE_HOME/.claude-agent-testbot/rules/python.md"
 check "plugin CLAUDE.md has raw HTML rule" grep -q "RAW HTML" "$PLUGIN/CLAUDE.md"
@@ -107,8 +170,41 @@ check "claude config: bypass prompt skipped" jq -e '.skipDangerousModePermission
   "$FAKE_HOME/.claude-agent-testbot/settings.json"
 check "claude config: plugin dir trusted" jq -e \
   --arg p "$PLUGIN" '.projects[$p].hasTrustDialogAccepted' "$FAKE_HOME/.claude-agent-testbot/.claude.json"
+check "claude config: external CLAUDE.md imports pre-approved" jq -e --arg p "$PLUGIN" \
+  '.projects[$p] | .hasClaudeMdExternalIncludesApproved and .hasClaudeMdExternalIncludesWarningShown' \
+  "$FAKE_HOME/.claude-agent-testbot/.claude.json"
+# snapshot.sh turns the agent home into a git repo within the first hour; Claude Code
+# then keys trust on the repo root, so it must be pre-approved too.
+check "claude config: agent home (snapshot repo root) trusted" jq -e --arg p "$(dirname "$WS")" \
+  '.projects[$p] | .hasTrustDialogAccepted and .hasClaudeMdExternalIncludesApproved
+     and .hasClaudeMdExternalIncludesWarningShown' \
+  "$FAKE_HOME/.claude-agent-testbot/.claude.json"
 check "server cron dry-run" bash "$KIT/server/cron/install-cron.sh" "$WS" --dry-run
 check "core cron dry-run" bash "$KIT/core/cron/install-cron.sh" "$WS" --dry-run
+
+# Fake crontab: `-l` fails like the real one for a user who has no crontab yet.
+FAKE_BIN="$WORK/fakebin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/crontab" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  -l) [ -f "$FAKE_CRONTAB_FILE" ] || { echo "no crontab for $(id -un)" >&2; exit 1; }
+      cat "$FAKE_CRONTAB_FILE" ;;
+  -) cat > "$FAKE_CRONTAB_FILE" ;;
+esac
+SH
+chmod +x "$FAKE_BIN/crontab"
+install_both_crons() {
+  PATH="$FAKE_BIN:$PATH" FAKE_CRONTAB_FILE="$WORK/crontab.txt" \
+    bash "$KIT/core/cron/install-cron.sh" "$WS" &&
+  PATH="$FAKE_BIN:$PATH" FAKE_CRONTAB_FILE="$WORK/crontab.txt" \
+    bash "$KIT/server/cron/install-cron.sh" "$WS"
+}
+check "cron installs into an empty crontab" install_both_crons
+check "crontab got both blocks" test "$(grep -c ' START$' "$WORK/crontab.txt" 2>/dev/null)" = 2
+cp "$WORK/crontab.txt" "$WORK/crontab.once" 2>/dev/null || true
+check "cron re-install keeps one copy of each block" install_both_crons
+check "crontab unchanged by re-install" diff -q "$WORK/crontab.once" "$WORK/crontab.txt"
 
 for unit in agent ratewatch; do
   out="$WORK/$unit.service"
@@ -119,6 +215,46 @@ for unit in agent ratewatch; do
     bad "$unit unit renders"
   fi
 done
+# The watchdog must come back on a plain start of the agent after a manual stop:
+# Requires= alone leaves it dead, WantedBy=<agent>.service pulls it in again.
+WATCH_UNIT="$WORK/ratewatch.service"
+AGENT_UNIT_NAME="$(set -a; . "$WS/agent.conf"; echo "$AGENT_NAME-agent.service")"
+check "ratewatch is wanted by the agent unit" grep -qx "WantedBy=$AGENT_UNIT_NAME" "$WATCH_UNIT"
+check "ratewatch is not tied to multi-user.target" bash -c "! grep -q 'multi-user.target' '$WATCH_UNIT'"
+check "ratewatch SIGTERM exit counts as success" grep -qx "SuccessExitStatus=143" "$WATCH_UNIT"
+check "installer re-enables ratewatch (drops the old wants link)" \
+  grep -qF 'systemctl reenable "$UNIT_WATCH"' "$KIT/install-server.sh"
+
+# Interactive run with systemd on and no passwordless sudo: the installer must not
+# stop at a sudo password prompt; it leaves the units on disk and prints the commands.
+# Skipped as root: there the installer would really install the units.
+if [ "$(id -u)" = "0" ]; then
+  echo "  skip sudo fallback (running as root)"
+else
+  SUDO_HOME="$WORK/home-sudo"
+  mkdir -p "$SUDO_HOME" "$WORK/sudobin"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >> "$FAKE_SUDO_LOG"' 'exit 1' \
+    > "$WORK/sudobin/sudo"
+  chmod +x "$WORK/sudobin/sudo"
+  : > "$WORK/sudo.log"
+  if HOME="$SUDO_HOME" PATH="$WORK/sudobin:$PATH" FAKE_SUDO_LOG="$WORK/sudo.log" \
+     TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" \
+     AGENT_NAME=sudobot OWNER_CHAT_ID="$OWNER" TIMEZONE=UTC WEBHOOK_PORT=$((PORT + 2)) \
+     BASE_DIR="$SUDO_HOME/agents" timeout 120 bash "$KIT/install-server.sh" --no-cron --no-live-test \
+     < /dev/null > "$WORK/install-sudo.log" 2>&1; then
+    ok "installer without passwordless sudo exits 0"
+  else
+    bad "installer without passwordless sudo exits 0 (log below)"
+    tail -20 "$WORK/install-sudo.log"
+  fi
+  SUDO_UNITS="$SUDO_HOME/agents/sudobot/.claude/systemd"
+  check "sudo only probed non-interactively" bash -c \
+    "test -s '$WORK/sudo.log' && ! grep -qv '^-n ' '$WORK/sudo.log'"
+  check "units kept in the workspace" test -f "$SUDO_UNITS/sudobot-agent.service" -a \
+    -f "$SUDO_UNITS/sudobot-ratewatch.service"
+  check "printed install command points at the kept units" \
+    grep -qF "$SUDO_UNITS/sudobot-agent.service" "$WORK/install-sudo.log"
+fi
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
@@ -145,13 +281,21 @@ echo "== 6. install-fleet end-to-end"
 # Second agent next to testbot from section 4.
 if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=helper-two AGENT_ROLE="Research helper" \
-   OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 \
-   BASE_DIR="$FAKE_HOME/agents" \
+   OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
+   BASE_DIR="$FAKE_HOME/agents" FAKE_CLAUDE_FAIL=1 \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install2.log" 2>&1; then
-  ok "second agent installed"
+  ok "second agent installed (offline plugin install does not stop it)"
 else
   bad "second agent installed"; tail -10 "$WORK/install2.log"
 fi
+check "offline plugin install only warns" grep -q "WARN: marketplace .* unreachable" "$WORK/install2.log"
+check "Russian agent gets the typography rule inside Response format" python3 - \
+  "$FAKE_HOME/agents/helper-two/.claude/core/rules.md" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+section = text.split("## Response format", 1)[1].split("\n## ", 1)[0]
+assert section.count("- Russian typography: ") == 1, section
+PY
 # A reinstall leftover must be ignored by agent discovery.
 cp -a "$FAKE_HOME/agents/testbot" "$FAKE_HOME/agents/testbot.bak_20000101_000000"
 
@@ -345,6 +489,11 @@ if [ "$WITH_PLUGIN" = "1" ]; then
     && ok "bun install" || bad "bun install"
   (cd "$WORK/plugin-build/plugin" && bunx tsc --noEmit > "$WORK/tsc.log" 2>&1) \
     && ok "typecheck" || bad "typecheck"
+  # The plugin must accept the env the installer wrote (clean env: no host TELEGRAM_*).
+  check "installer channel.conf passes the plugin's RuntimeEnvSchema" \
+    env -i PATH="$PATH" HOME="$FAKE_HOME" bash -c "set -a; . '$SEC/channel.conf'; set +a; \
+      cd '$WORK/plugin-build/plugin' && bun -e \
+      \"const { RuntimeEnvSchema } = await import('./src/config.ts'); RuntimeEnvSchema.parse(process.env)\""
   (cd "$WORK/plugin-build/plugin" && bun test > "$WORK/test.log" 2>&1) \
     && ok "bun test ($(grep -oE '[0-9]+ pass' "$WORK/test.log" | tail -1))" \
     || { bad "bun test"; grep -E ' fail|✗' "$WORK/test.log" | head -10; }

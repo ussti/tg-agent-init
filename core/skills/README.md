@@ -20,13 +20,11 @@ their upstream projects under their own licenses (see each folder's LICENSE / NO
 
 ## 2. Install as plugins (official / upstream — not copied)
 
-Some tools are living plugins; install from source so you get updates:
+superpowers (TDD, debugging, planning, review, brainstorming) is installed by `install-server.sh`
+from the official marketplace (`superpowers@claude-plugins-official`). Other living plugins are
+optional; install from source so you get updates:
 
 ```text
-# superpowers (obra/superpowers, MIT) — TDD, debugging, planning, review, brainstorming
-/plugin marketplace add obra/superpowers
-/plugin install superpowers@superpowers-marketplace
-
 # Brave Search (brave/brave-search-skills, MIT) — optional web-search backend for deep-research
 /plugin marketplace add brave/brave-search-skills
 /plugin install brave-search-skills@brave-search
