@@ -39,6 +39,17 @@ ok "input_pending: NBSP-padded empty composer" "$(input_pending "$nbsp")" ""
 nbsptext=$(printf '\342\235\257\302\240 да, собери список\n%s\n' "$STATUS")
 ok "input_pending: NBSP + real text" "$(input_pending "$nbsptext")" "да, собери список"
 
+# --- composer_ghost (Claude Code prompt suggestion = dim SGR 2 text) ---
+# Live capture 2026-10-04: `capture-pane -e` composer line for a suggestion.
+ghost=$(printf '\033[39m\342\235\257\302\240\033[2mЗакрой остальные черновики\033[0m\n%s\n' "$STATUS")
+ok "composer_ghost: dim suggestion = ghost" "$(truthy composer_ghost "$ghost")" "true"
+typed=$(printf '\033[39m\342\235\257\302\240Да, ок\n%s\n' "$STATUS")
+ok "composer_ghost: default-colour typed text = real" "$(truthy composer_ghost "$typed")" "false"
+ok "composer_ghost: empty composer = not ghost" "$(truthy composer_ghost "$empty")" "false"
+ok "composer_ghost: plain capture without escapes = not ghost" "$(truthy composer_ghost "$stuck")" "false"
+dimarrow=$(printf '\033[38;5;246m\342\235\257\302\240\033[39mделай 1\n%s\n' "$STATUS")
+ok "composer_ghost: dim ARROW but default text = real" "$(truthy composer_ghost "$dimarrow")" "false"
+
 # --- turn_active ---
 active=$(printf '✻ Envisioning… (3s · ↓ 69 tokens)\n%s · esc to interrupt · ←\n' "$STATUS")
 ok "turn_active: generating" "$(truthy turn_active "$active")" "true"

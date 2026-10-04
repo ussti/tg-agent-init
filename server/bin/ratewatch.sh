@@ -105,6 +105,27 @@ input_pending() {
   esac
 }
 
+# Is the composer text a Claude Code prompt suggestion rather than typed input?
+# $1 = pane captured WITH escapes (`capture-pane -e`). After a turn the TUI
+# predicts the next prompt and draws it in the composer as dim (SGR 2) ghost
+# text; plain `capture-pane -p` strips the styling, so input_pending() reads it
+# as a stuck message. Enter does not submit a suggestion (Tab accepts it), so
+# every one got spooled and reported to the owner as «their» lost message
+# (a peer fleet, 2026-10-02..04). Real typed text renders in the default colour.
+# Only the styling of the TEXT counts: the arrow itself is sometimes drawn grey.
+composer_ghost() {
+  local line text
+  line=$(printf '%s\n' "$1" | grep '❯' | tail -1)
+  [ -n "$line" ] || return 1
+  text=${line#*❯}
+  text=${text//$'\xc2\xa0'/ }
+  text="${text#"${text%%[! ]*}"}"   # ltrim plain spaces only; ESC must survive
+  case "$text" in
+    $'\e[2m'* | $'\e[2;'* ) return 0 ;;
+  esac
+  return 1
+}
+
 # Is the pending text SAFE to retype? Retyping is the only action that actually
 # submits in this TUI (plain Enter had 0/12 success on 2026-07-31), but it
 # replaces the composer with what we read from the PANE — so it must never run
@@ -368,6 +389,7 @@ presses=0
 failures=0
 window_start=$SECONDS
 last_pending=""
+last_ghost=""        # last prompt suggestion logged, so each one is logged once
 stable_count=0
 first_seen=0        # epoch when the current pending text was first observed
 giveup_digest=""    # text we already failed to submit; skip it, keep serving others
@@ -514,6 +536,15 @@ while true; do
     fi
 
     pending="$(input_pending "$PANE")"
+    if [ -n "$pending" ] \
+      && composer_ghost "$(tmux capture-pane -t "$SESSION" -p -J -e 2>/dev/null || true)"; then
+      # A prompt suggestion, not a message: never press Enter, never spool it.
+      if [ "$pending" != "$last_ghost" ]; then
+        log "SKIP: prompt suggestion (dim ghost text), not input: ${pending:0:40}"
+        last_ghost="$pending"
+      fi
+      pending=""
+    fi
     if [ -n "$pending" ] && ! turn_active "$PANE" && ! blocking_modal "$PANE" && ! session_held "$PANE"; then
       if [ "$pending" = "$last_pending" ]; then
         stable_count=$(( stable_count + 1 ))
