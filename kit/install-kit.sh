@@ -181,6 +181,50 @@ install_deps() {
   fi
 }
 
+# Runtime for the document-skills plugin (docx/pdf/pptx/xlsx). No LibreOffice: it is ~1 GB,
+# and without it only formula recalculation, PDF conversion, slide previews and .doc are lost.
+readonly OFFICE_VENV="$HOME/.local/share/agent-kit/office-venv"
+readonly -a OFFICE_PY=(openpyxl pandas pypdf pdfplumber reportlab pypdfium2 pdf2image Pillow lxml
+  defusedxml "markitdown[pptx,docx,xlsx,pdf]")
+readonly -a OFFICE_NODE=(docx pptxgenjs pdf-lib pdfjs-dist react-icons react react-dom sharp)
+readonly -a OFFICE_CMDS=(pandoc:pandoc pdftoppm:poppler-utils pdftotext:poppler-utils qpdf:qpdf)
+
+# Install the missing system packages as root or with passwordless sudo, else print the command.
+install_office_apt() {
+  local pair pkgs=() cmd
+  for pair in "${OFFICE_CMDS[@]}"; do
+    command -v "${pair%%:*}" > /dev/null || pkgs+=("${pair#*:}")
+  done
+  "$KIT_PYTHON" -c 'import ensurepip, venv' < /dev/null > /dev/null 2>&1 || pkgs+=(python3-venv)
+  [ "${#pkgs[@]}" -gt 0 ] || return 0
+  mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+  cmd="apt-get install -y --no-install-recommends ${pkgs[*]}"
+  if [ "$(id -u)" = 0 ]; then
+    try env DEBIAN_FRONTEND=noninteractive $cmd && return 0
+  elif command -v sudo > /dev/null; then
+    try sudo -n $cmd && return 0
+  fi
+  warn "office: system packages not installed; run: sudo apt-get update && sudo $cmd"
+}
+
+install_office() {
+  KIT_PYTHON="${KIT_PYTHON:-python3}"
+  install_office_apt
+  if [ -x "$OFFICE_VENV/bin/python" ] \
+     || try "$KIT_PYTHON" -m venv --system-site-packages "$OFFICE_VENV"; then
+    try "$OFFICE_VENV/bin/python" -m pip install --upgrade "${OFFICE_PY[@]}" \
+      || warn "office python libraries not installed; later: $OFFICE_VENV/bin/python -m pip install ${OFFICE_PY[*]}"
+  else
+    warn "office python libraries skipped: no python venv (install python3-venv, then rerun kit/install-kit.sh)"
+  fi
+  if command -v npm > /dev/null; then
+    try npm install -g --prefix "$LOCAL_PREFIX" "${OFFICE_NODE[@]}" \
+      || warn "office node libraries not installed; later: npm install -g --prefix ~/.local ${OFFICE_NODE[*]}"
+  else
+    warn "npm not found: office node libraries skipped"
+  fi
+}
+
 install_plugins() {
   local m p claude_bin="${CLAUDE_BIN:-$(command -v claude || true)}"
   [ -n "$claude_bin" ] || { warn "claude not found: plugins skipped"; return 0; }
@@ -196,6 +240,7 @@ install_plugins() {
 
 if [ "${KIT_SKIP_DEPS:-0}" != 1 ]; then
   install_deps
+  install_office
   install_plugins
 fi
 say "done"

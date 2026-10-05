@@ -113,6 +113,33 @@ esac
 exit 0
 EOF
 chmod +x "$WORK/bin/git"
+# Fake sudo: logs the command and never runs it (no real apt in tests); FAKE_SUDO_FAIL=1
+# acts like sudo that wants a password.
+cat > "$WORK/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+echo "sudo $*" >> "${FAKE_TOOLS_LOG:-/dev/null}"
+[ "${FAKE_SUDO_FAIL:-0}" = 1 ] && exit 1
+exit 0
+EOF
+chmod +x "$WORK/bin/sudo"
+# Fake python for the office venv (KIT_PYTHON): `-m venv DIR` makes DIR/bin/python, a logger;
+# FAKE_NO_VENV=1 acts like a python without the venv module.
+cat > "$WORK/bin/kitpython" <<'EOF'
+#!/usr/bin/env bash
+echo "kitpython $*" >> "${FAKE_TOOLS_LOG:-/dev/null}"
+case "$1" in
+  -c) [ "${FAKE_NO_VENV:-0}" = 1 ] && exit 1 ;;
+  -m) if [ "$2" = venv ]; then
+        [ "${FAKE_NO_VENV:-0}" = 1 ] && exit 1
+        d="${@: -1}"; mkdir -p "$d/bin"
+        printf '#!/usr/bin/env bash\necho "office-python $*" >> "${FAKE_TOOLS_LOG:-/dev/null}"\n' \
+          > "$d/bin/python"; chmod +x "$d/bin/python"
+      fi ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/kitpython"
+export KIT_PYTHON="$WORK/bin/kitpython"
 export PATH="$WORK/bin:$PATH"
 export FAKE_TOOLS_LOG="$WORK/tools.log"
 : > "$FAKE_TOOLS_LOG"
@@ -206,7 +233,7 @@ check "web-tool routing table in rules.md" bash -c \
   "grep -q '## Which internet tool' '$WS/core/rules.md' && \
    test \$(grep -cE '^\\| .* \\| (WebSearch|WebFetch|crawl4ai|agent-browser|perplexity-research|last30days)' '$WS/core/rules.md') -ge 6"
 check "web-tool rule not duplicated on re-run" bash -c \
-  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  "HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
    && test \$(grep -c '## Which internet tool' '$WS/core/rules.md') = 1"
 check "TOOLS.md kit table has a row for every kit skill" bash -c \
   "grep -v '^#' '$WS/kit/manifest.tsv' | grep -v '^\$' | cut -f2 | \
@@ -218,7 +245,7 @@ check "TOOLS.md has no deep-research row, kit supersedes the base table" bash -c
 check "TOOLS.md has the later commands" bash -c \
   "grep -q 'agent-keys add' '$WS/tools/TOOLS.md' && grep -q 'agent-login' '$WS/tools/TOOLS.md'"
 check "kit table not duplicated in TOOLS.md on re-run" bash -c \
-  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  "HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
    && test \$(grep -c '^## Default kit' '$WS/tools/TOOLS.md') = 1 \
    && ! grep -q '^| deep-research |' '$WS/tools/TOOLS.md'"
 check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
@@ -289,7 +316,7 @@ check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
 check "re-running install-kit replaces a plain skill dir by a link and keeps the old one" bash -c "
   rm '$WS/skills/quick-reminders' && mkdir '$WS/skills/quick-reminders' \
-  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
   && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
 check "agent-browser from npm, pinned, no root" \
@@ -300,6 +327,35 @@ check "last30days cloned at the pinned commit and linked" bash -c \
   "grep -q 'git clone https://github.com/mvanhorn/last30days-skill' '$FAKE_TOOLS_LOG' && \
    grep -q 'checkout e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$FAKE_TOOLS_LOG' && \
    grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+OFFICE_VENV="$FAKE_HOME/.local/share/agent-kit/office-venv"
+check "office: python venv with system packages, office libraries via pip" bash -c \
+  "grep -q 'kitpython -m venv --system-site-packages $OFFICE_VENV' '$FAKE_TOOLS_LOG' && \
+   for m in openpyxl pandas pypdf pdfplumber reportlab pypdfium2 pdf2image Pillow lxml defusedxml \
+     'markitdown\\[pptx,docx,xlsx,pdf\\]'; do \
+     grep -q \"^office-python -m pip install .*\$m\" '$FAKE_TOOLS_LOG' || { echo \$m; exit 1; }; done"
+check "office: node libraries into ~/.local, not root" bash -c \
+  "line=\$(grep '^npm install -g --prefix $FAKE_HOME/.local .*pptxgenjs' '$FAKE_TOOLS_LOG' | head -1); \
+   for m in docx pptxgenjs pdf-lib pdfjs-dist react-icons react react-dom sharp; do \
+     printf '%s\n' \$line | grep -qx -- \"\$m\" || { echo \$m; exit 1; }; done"
+check "office: LibreOffice is not installed" bash -c \
+  "! grep -qi libreoffice '$FAKE_TOOLS_LOG' && ! grep -q 'libreoffice-' '$KIT/kit/install-kit.sh'"
+check "office: each missing system command is asked from apt, present ones are not" bash -c \
+  "for pair in pandoc:pandoc pdftoppm:poppler-utils qpdf:qpdf; do c=\${pair%%:*} p=\${pair#*:}; \
+     if command -v \$c >/dev/null; then ! grep -q \"apt-get install .* \$p\" '$FAKE_TOOLS_LOG' || exit 1; \
+     else grep -q \"^sudo -n apt-get install -y --no-install-recommends .*\$p\" '$FAKE_TOOLS_LOG' || exit 1; fi; done"
+check "office: no sudo for apt when nothing is missing" bash -c "
+  d='$WORK/office-full'; mkdir -p \"\$d/bin\" \"\$d/home\"
+  for c in pandoc pdftoppm pdftotext qpdf; do printf '#!/bin/sh\n' > \"\$d/bin/\$c\"; chmod +x \"\$d/bin/\$c\"; done
+  FAKE_TOOLS_LOG=\"\$d/log\" HOME=\"\$d/home\" PATH=\"\$d/bin:\$PATH\" \
+    bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1
+  grep -q 'office-python -m pip install' \"\$d/log\" && ! grep -q '^sudo' \"\$d/log\""
+check "office: sudo wants a password -> warning with the exact apt command" bash -c "
+  d='$WORK/office-nosudo'; mkdir -p \"\$d/home\"; cp -r '$WS' \"\$d/ws\"
+  FAKE_SUDO_FAIL=1 FAKE_NO_VENV=1 FAKE_TOOLS_LOG=\"\$d/log\" HOME=\"\$d/home\" \
+    PATH=\"$WORK/bin:/usr/bin:/bin\" \
+    bash \"\$d/ws/kit/install-kit.sh\" \"\$d/ws\" \"\$d/cfg\" > \"\$d/out\" 2>&1
+  grep -q 'sudo apt-get install -y --no-install-recommends .*python3-venv' \"\$d/out\" && \
+  grep -q 'office python libraries skipped' \"\$d/out\""
 check "browser setup steps run after install" bash -c \
   "grep -qx 'agent-browser install' '$FAKE_TOOLS_LOG' && grep -qx 'crawl4ai-setup ' '$FAKE_TOOLS_LOG'"
 check "agent-browser safety config installed" \
@@ -310,13 +366,13 @@ check "kit plugins installed into the agent's config dir" bash -c \
    grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
 check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
   n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
-  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && [ \"\$(grep -c 'git clone' '$FAKE_TOOLS_LOG')\" = \"\$n\" ] \
   && grep -q ' fetch' '$FAKE_TOOLS_LOG' \
   && grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
 check "existing agent-browser config is preserved on rerun" bash -c "
   echo '{\"marker\":1}' > '$FAKE_HOME/.agent-browser/config.json' \
-  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && jq -e '.marker == 1 and (has(\"maxOutput\") | not)' '$FAKE_HOME/.agent-browser/config.json'"
 check "unpinned last30days is never linked; a failed attempt does not block the rerun" bash -c "
   W='$WORK/pin'; mkdir -p \"\$W/ws\" \
@@ -528,6 +584,21 @@ check "run-agent LAUNCH_CMD still exports agent.conf" bash -c \
   "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch2' 1 | grep -qx 'AGENT_X=from_conf'"
 check "run-agent LAUNCH_CMD works without keys.env" bash -c \
   "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch3' 0 | grep -qx 'AGENT_X=from_conf'"
+# The office block of run-agent, run for real: venv python first on PATH, node finds ~/.local modules.
+office_env() {
+  local home="$1"
+  HOME="$home" bash -c "
+    LAUNCH_CMD=''
+    $(sed -n '/^# office runtime begin/,/^# office runtime end/p' "$KIT/server/bin/run-agent.sh")
+    env -i PATH=/usr/bin:/bin bash -c \"\${LAUNCH_CMD#; }; echo PATH=\\\$PATH; echo NODE_PATH=\\\$NODE_PATH\""
+}
+mkdir -p "$WORK/oh1/.local/share/agent-kit/office-venv/bin" "$WORK/oh2"
+check "run-agent: office venv first on PATH, NODE_PATH set" bash -c \
+  "KIT='$KIT'; $(declare -f office_env); out=\$(office_env '$WORK/oh1'); \
+   grep -qx 'PATH=$WORK/oh1/.local/share/agent-kit/office-venv/bin:/usr/bin:/bin' <<<\"\$out\" && \
+   grep -qx 'NODE_PATH=$WORK/oh1/.local/lib/node_modules' <<<\"\$out\""
+check "run-agent: no venv -> PATH untouched" bash -c \
+  "KIT='$KIT'; $(declare -f office_env); office_env '$WORK/oh2' | grep -qx 'PATH=/usr/bin:/bin'"
 check "installer puts ~/.local/bin on PATH before the login step" bash -c \
   "awk '/export PATH=\"\\\$HOME\\/.local\\/bin:\\\$PATH\"/{p=NR} /Log in to \\\$svc now/{l=NR} END{exit !(p && l && p<l)}' '$KIT/install-server.sh'"
 

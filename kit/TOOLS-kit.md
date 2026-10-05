@@ -35,6 +35,12 @@ stays inert and says what to set; nothing else breaks. Every key and login is op
 | cal | Cal.com bookings | `CAL_API_KEY` | `agent-keys add cal` |
 | docx, pdf, pptx, xlsx | read and write Office files and PDF (plugin `document-skills`) | none | |
 
+The document-skills runtime is installed by the kit: Python libraries in
+`~/.local/share/agent-kit/office-venv` (first on PATH), Node libraries in `~/.local` (NODE_PATH),
+pandoc and poppler. LibreOffice (`soffice`) is NOT installed: formula recalculation, PDF
+conversion, slide thumbnails and .doc conversion are unavailable. When a skill needs `soffice`,
+tell the user and give the install command instead of retrying.
+
 ### Media
 
 | Skill | What it does | Key or login | Later command |

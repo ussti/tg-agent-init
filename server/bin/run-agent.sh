@@ -131,6 +131,12 @@ LAUNCH_CMD+="; export TELEGRAM_DM_DELIVERY_MODE=inbox TELEGRAM_DM_DELIVERY_STATE
 if [ -f "$AUTH_CONF" ]; then
   LAUNCH_CMD+="; export CLAUDE_CODE_OAUTH_TOKEN=\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' '$AUTH_CONF' | head -1 | tr -d '\"')"
 fi
+# office runtime begin: document-skills run python from the kit venv and require() node
+# libraries installed into ~/.local by kit/install-kit.sh
+OFFICE_VENV="$HOME/.local/share/agent-kit/office-venv"
+[ -d "$OFFICE_VENV/bin" ] && LAUNCH_CMD+="; export PATH='$OFFICE_VENV/bin':\"\$PATH\""
+LAUNCH_CMD+="; export NODE_PATH='$HOME/.local/lib/node_modules'"
+# office runtime end
 LAUNCH_CMD+="; export CLAUDE_CONFIG_DIR='${CLAUDE_CONFIG_DIR:?CLAUDE_CONFIG_DIR unset}'"
 LAUNCH_CMD+="; exec '$CLAUDE_BIN' --model '$MODEL' --permission-mode bypassPermissions"
 LAUNCH_CMD+=" --add-dir '$LIBRARY_DIR' --dangerously-load-development-channels server:dashi-channel"
