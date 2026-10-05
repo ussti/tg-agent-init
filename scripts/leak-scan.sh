@@ -31,7 +31,7 @@ SECRET_PATTERNS=(
   '-----BEGIN [A-Z ]*PRIVATE KEY-----'         # PEM private key
 )
 
-GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache)
+GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache --exclude-dir=.superpowers)
 # Basename matches: also skips patches/<same name>, which the passes below cover.
 VENDOR_EXCLUDES=(--exclude-dir=dashi-plugin --exclude-dir=public-gbrain-agentos)
 fail=0

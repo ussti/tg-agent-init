@@ -170,6 +170,12 @@ check "skill links are relative and stay inside the workspace" bash -c \
   "for l in '$WS'/skills/*; do [ -L \"\$l\" ] || continue; t=\$(readlink \"\$l\"); \
    case \"\$t\" in /*) exit 1 ;; esac; \
    case \"\$(readlink -f \"\$l\")\" in '$WS'/*) ;; *) exit 1 ;; esac; done"
+check "kit has no template placeholders" bash -c "! grep -rn '{{[A-Z_]*}}' '$KIT/kit'"
+check "kit skills carry no fleet paths" bash -c \
+  "! grep -rnE 'claude-lab|maimozg|/home/edgelab|shared/secrets' '$KIT/kit/skills'"
+check "system and dev skills linked" bash -c \
+  "for s in skill-finder agent-introspection learnings senior-brainstorm; do \
+   test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
 check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
 check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
