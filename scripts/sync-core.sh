@@ -24,7 +24,9 @@ trap 'find "$STAGE" -mindepth 0 -delete 2>/dev/null || true' EXIT
 
 echo "[sync-core] source: $SRC"
 mkdir -p "$STAGE/core/cron"
-cp -R "$SRC/templates" "$SRC/hooks" "$SRC/scripts" "$SRC/skills" "$STAGE/core/"
+cp -R "$SRC/templates" "$SRC/hooks" "$SRC/scripts" "$STAGE/core/"
+mkdir -p "$STAGE/core/skills"
+cp -R "$SRC/skills/onboard" "$STAGE/core/skills/"   # the rest of the kit lives in kit/
 cp "$SRC/cron/install-cron.sh" "$STAGE/core/cron/"
 
 python3 - "$STAGE/core" <<'PY'

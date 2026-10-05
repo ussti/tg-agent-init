@@ -183,7 +183,7 @@ cp "$T/tools/TOOLS.md.template"         "$AGENT_WS/tools/TOOLS.md"
 : > "$AGENT_WS/core/learnings/episodes.jsonl"
 cp "$C"/hooks/* "$AGENT_WS/hooks/"
 cp "$C"/scripts/*.sh "$C"/scripts/*.mjs "$AGENT_WS/scripts/"
-cp -R "$C"/skills/. "$AGENT_WS/skills/"
+cp -R "$C"/skills/onboard "$AGENT_WS/skills/"
 python3 "$KIT_DIR/scripts/render-template.py" --tree "$AGENT_WS"
 
 # Russian-speaking agent: typography rule goes into Response format, after the defaults.
@@ -207,12 +207,15 @@ esac
 # Channel rule on top of the core identity: the owner only reads Telegram.
 cat "$KIT_DIR/server/templates/channel-rules.md" >> "$AGENT_WS/core/rules.md"
 
+# Default kit: skills by category, upstream tools, plugins (kit/README.md).
+KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_WS" "$CLAUDE_CONFIG_DIR"
+
 # ---------------------------------------------------------------- server layer
 say "installing server scripts and hooks"
 cp "$KIT_DIR"/server/bin/* "$AGENT_WS/bin/"
 cp "$KIT_DIR"/server/hooks/* "$AGENT_WS/hooks/"
 chmod +x "$AGENT_WS"/bin/*.sh "$AGENT_WS"/hooks/*.sh "$AGENT_WS"/hooks/*.py "$AGENT_WS"/scripts/*.sh
-find "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
+find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
 render "$KIT_DIR/server/templates/agent.conf.template" "$AGENT_WS/agent.conf"
 
 say "writing secrets to $SECRETS_DIR (mode 600)"

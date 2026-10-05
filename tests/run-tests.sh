@@ -72,7 +72,7 @@ mkdir -p "$FAKE_HOME"
 OWNER=111222333
 PORT=18089
 DUMMY_TOKEN="987654321:$(printf 'x%.0s' $(seq 1 35))"
-if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
+if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=testbot OWNER_CHAT_ID="$OWNER" \
    OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT="$PORT" BASE_DIR="$FAKE_HOME/agents" \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install.log" 2>&1; then
@@ -158,6 +158,21 @@ check "style defaults prefilled in USER.md" bash -c \
 check "channel line filled by the installer" \
   grep -qx -- '- Telegram, text and voice -- primary' "$WS/core/USER.md"
 check "keys folder filled by the installer" grep -qx -- "- Keys folder: $SEC" "$WS/tools/TOOLS.md"
+check "kit copied into the workspace" test -f "$WS/kit/manifest.tsv"
+check "every manifest skill is a symlink that resolves to SKILL.md" bash -c '
+  while IFS=$'"'"'\t'"'"' read -r cat skill kind; do
+    case "$cat" in ""|\#*) continue ;; esac
+    [ -L "'"$WS"'/skills/$skill" ] || { echo "not a link: $skill"; exit 1; }
+    [ "$kind" = upstream ] && continue
+    [ -f "'"$WS"'/skills/$skill/SKILL.md" ] || { echo "no SKILL.md: $skill"; exit 1; }
+  done < "'"$WS"'/kit/manifest.tsv"'
+check "skill links are relative and stay inside the workspace" bash -c \
+  "for l in '$WS'/skills/*; do [ -L \"\$l\" ] || continue; t=\$(readlink \"\$l\"); \
+   case \"\$t\" in /*) exit 1 ;; esac; \
+   case \"\$(readlink -f \"\$l\")\" in '$WS'/*) ;; *) exit 1 ;; esac; done"
+check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
+check "deep-research and the old gws wrapper are gone" bash -c \
+  "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -r '$WS/skills/' 2>/dev/null"
 check "superpowers installed into the agent's config dir" bash -c \
   "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
      '$FAKE_CLAUDE_LOG' && \
@@ -279,7 +294,7 @@ fi
 
 echo "== 6. install-fleet end-to-end"
 # Second agent next to testbot from section 4.
-if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
+if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=helper-two AGENT_ROLE="Research helper" \
    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
    BASE_DIR="$FAKE_HOME/agents" FAKE_CLAUDE_FAIL=1 \
