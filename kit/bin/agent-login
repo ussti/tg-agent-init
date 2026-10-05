@@ -12,16 +12,24 @@ from __future__ import annotations
 
 import argparse
 import os
+import http.client
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-LOOPBACK_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1"})
+LOOPBACK_ADDRESS = re.compile(r"https?://(?:localhost|127\.0\.0\.1):(\d+)(?:[/?#]|$)")
+BAD_URL_CHARS = re.compile(r"[\s\x00-\x1f\x7f]")
+LISTENER_HOST = "127.0.0.1"
+STATUS_WAIT_S: float = 15.0
+VERCEL_CLI_VERSION = "62.2.0"
+GH_INSTALL_URL = "https://github.com/cli/cli#installation"
 CONSENT_URL = re.compile(r"https://accounts\.google\.com/\S+")
 URL_WAIT_S: float = 30.0
 FINISH_WAIT_S: float = 60.0
@@ -38,28 +46,49 @@ Google login needs your own OAuth client (one time, about 5 minutes):
 """
 
 
-def parse_redirect(raw: str) -> tuple[int, str]:
+def parse_redirect(raw: str, expected_port: int | None = None,
+                   expected_state: str | None = None) -> tuple[int, str]:
     """Port and query of the pasted localhost redirect URL.
 
     Args:
         raw: Address copied from the browser bar, e.g. http://localhost:43123/?code=...
+        expected_port: Port of gws-cli's listener (from the consent URL), if known.
+        expected_state: OAuth state from the consent URL, if known.
 
     Returns:
         The listener port and the raw query string.
 
     Raises:
-        ValueError: not a loopback URL, or no authorization code in it.
+        ValueError: not a loopback URL, wrong listener, or no authorization code in it.
     """
-    parts = urllib.parse.urlsplit(raw.strip())
+    text = raw.strip()
+    if BAD_URL_CHARS.search(text):
+        raise ValueError("the address contains spaces or line breaks; paste it as one line")
+    match = LOOPBACK_ADDRESS.match(text)
+    port = int(match.group(1)) if match else 0
+    if not match or not 0 < port <= MAX_PORT:
+        raise ValueError("this is not the localhost address from the browser bar")
+    if expected_port is not None and port != expected_port:
+        raise ValueError("this address is from another login attempt (wrong port)")
+    query = urllib.parse.urlsplit(text).query
+    params = urllib.parse.parse_qs(query)
+    if "code" not in params:
+        raise ValueError("no authorization code in the address (was access denied?)")
+    if expected_state and params.get("state", [expected_state]) != [expected_state]:
+        raise ValueError("this address is from another login attempt (wrong state)")
+    return port, query
+
+
+def consent_params(url: str) -> tuple[int | None, str | None]:
+    """Listener port (from redirect_uri) and state of a consent URL; None if absent."""
+    params = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    port = None
     try:
-        port = parts.port
+        port = urllib.parse.urlsplit(params.get("redirect_uri", [""])[0]).port
     except ValueError:
         port = None
-    if parts.hostname not in LOOPBACK_HOSTS or not port or port > MAX_PORT:
-        raise ValueError("this is not the localhost address from the browser bar")
-    if "code" not in urllib.parse.parse_qs(parts.query):
-        raise ValueError("no authorization code in the address (was access denied?)")
-    return port, parts.query
+    state = params["state"][0] if params.get("state") else None
+    return port, state
 
 
 def extract_consent_url(text: str) -> str | None:
@@ -85,46 +114,86 @@ def need(tool: str, hint: str) -> str:
     return path
 
 
+class HandoffError(Exception):
+    """The pasted code could not be delivered to gws-cli's listener."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
 def hand_code_to_listener(port: int, query: str) -> None:
-    """Deliver the pasted redirect query to gws-cli's waiting local server."""
+    """Deliver the pasted redirect query to gws-cli's waiting local server.
+
+    Always goes to 127.0.0.1, bypasses proxies and does not follow redirects.
+
+    Raises:
+        HandoffError: the listener is unreachable or answered with an error.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/?{query}", timeout=FINISH_WAIT_S).read()
-    except OSError as err:
-        raise SystemExit(f"agent-login: could not hand the code to gws-cli: {err}") from None
+        opener.open(f"http://{LISTENER_HOST}:{port}/?{query}", timeout=FINISH_WAIT_S).read()
+    except urllib.error.HTTPError as err:
+        if err.code >= 400:  # a 3xx is not followed but still means the listener got the code
+            raise HandoffError(f"gws-cli answered HTTP {err.code}") from None
+    except (OSError, http.client.HTTPException, ValueError) as err:
+        raise HandoffError(str(err)) from None
 
 
-def read_consent_url(proc: subprocess.Popen[str]) -> tuple[str | None, str]:
-    """Read gws-cli output until the consent URL shows up (or the wait runs out)."""
+def read_consent_url(proc: subprocess.Popen[str],
+                     wait_s: float | None = None) -> tuple[str | None, str]:
+    """Read gws-cli output until the consent URL shows up, it exits, or the wait runs out."""
     seen: list[str] = []
     found = threading.Event()
+    url: list[str] = []
 
     def pump() -> None:
         assert proc.stdout is not None
         for line in proc.stdout:  # keeps draining afterwards so gws-cli never blocks on a pipe
             seen.append(line)
-            if extract_consent_url("".join(seen)):
+            hit = extract_consent_url(line)
+            if hit and not url:
+                url.append(hit)
                 found.set()
+        found.set()  # EOF: gws-cli exited, stop waiting
 
     threading.Thread(target=pump, daemon=True).start()
-    found.wait(URL_WAIT_S)
-    text = "".join(seen)
-    return extract_consent_url(text), text
+    found.wait(URL_WAIT_S if wait_s is None else wait_s)
+    return (url[0] if url else None), "".join(seen)
+
+
+def is_logged_in(cmd: list[str]) -> bool:
+    """True when the status command exits 0 within the time limit."""
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=STATUS_WAIT_S).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _on_sigterm(signum: int, frame: object) -> None:
+    raise SystemExit("agent-login: terminated")
 
 
 def login_google(client_secret: str | None) -> int:
     """Import the OAuth client, then run gws-cli auth with paste-back."""
     gws = need("gws-cli", "Install: pipx install gws-cli==1.5.0")
-    status = subprocess.run([gws, "auth", "status"], capture_output=True, text=True)
-    if status.returncode == 0:
+    if is_logged_in([gws, "auth", "status"]):
         print("Google: already logged in. Re-login: gws-cli auth --force")
         return 0
     if not client_secret:
         print(GOOGLE_GUIDE)
-        client_secret = ask("Path to the downloaded JSON: ").strip()
-    secret_path = Path(client_secret).expanduser()
+        client_secret = ask("Path to the downloaded JSON: ")
+    secret_path = Path(client_secret.strip().strip("'\"")).expanduser()
     if not secret_path.is_file():
         raise SystemExit(f"agent-login: no file at {secret_path}")
-    subprocess.run([gws, "auth", "import-credentials", str(secret_path)], check=True)
+    try:
+        subprocess.run([gws, "auth", "import-credentials", str(secret_path)], check=True,
+                       capture_output=True, text=True)
+    except subprocess.CalledProcessError as err:
+        detail = (err.stderr or err.stdout or "").strip()[-300:]
+        raise SystemExit(f"agent-login: gws-cli rejected the JSON file: {detail}") from None
+    signal.signal(signal.SIGTERM, _on_sigterm)
     # PYTHONUNBUFFERED: gws-cli is Python; through a pipe it prints the URL only on exit.
     env = {**os.environ, "BROWSER": "false", "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen([gws, "auth"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -137,13 +206,18 @@ def login_google(client_secret: str | None) -> int:
         print("\n1. Open this link on your computer and allow access:\n\n" + url)
         print("\n2. The browser ends on a page that does not load (localhost) -- expected.")
         print("   Copy the whole address from the browser bar and paste it here.\n")
+        want_port, want_state = consent_params(url)
         while True:
             try:
-                port, query = parse_redirect(ask("Address: "))
+                port, query = parse_redirect(ask("Address: "), want_port, want_state)
+                hand_code_to_listener(port, query)
                 break
             except ValueError as err:
                 print(f"  {err}; try again")
-        hand_code_to_listener(port, query)
+            except HandoffError as err:
+                if proc.poll() is not None:
+                    raise SystemExit(f"agent-login: gws-cli already stopped ({err}); run again")
+                print(f"  could not deliver the address to gws-cli ({err}); try again")
         try:
             proc.wait(timeout=FINISH_WAIT_S)
         except subprocess.TimeoutExpired:
@@ -159,7 +233,7 @@ def login_google(client_secret: str | None) -> int:
 
 def login_github() -> int:
     """gh device flow: prints a code, the user enters it at github.com/login/device."""
-    gh = need("gh", "Install: sudo apt install gh")
+    gh = need("gh", f"Install page: {GH_INSTALL_URL} (the server admin may need to install it)")
     return subprocess.run([gh, "auth", "login", "--hostname", "github.com",
                            "--git-protocol", "https", "--web"]).returncode
 
@@ -169,7 +243,8 @@ def login_vercel() -> int:
     vercel = shutil.which("vercel")
     if not vercel:
         npx = need("npx", "Install Node.js first")
-        return subprocess.run([npx, "--yes", "vercel@latest", "login"]).returncode
+        cmd = [npx, "--yes", f"vercel@{VERCEL_CLI_VERSION}", "login"]
+        return subprocess.run(cmd).returncode
     return subprocess.run([vercel, "login"]).returncode
 
 
@@ -178,7 +253,7 @@ def show_status() -> int:
     checks = {"google": ["gws-cli", "auth", "status"], "github": ["gh", "auth", "status"],
               "vercel": ["vercel", "whoami"]}
     for name, cmd in checks.items():
-        ok = shutil.which(cmd[0]) and subprocess.run(cmd, capture_output=True).returncode == 0
+        ok = shutil.which(cmd[0]) and is_logged_in(cmd)
         print(f"{name:7} {'logged in' if ok else '-'}")
     return 0
 
