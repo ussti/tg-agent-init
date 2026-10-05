@@ -5,8 +5,9 @@
 #   1. entities — one extended regex per line, read from a list kept OUTSIDE
 #      the repo (the list itself names the people it protects).
 #   2. secrets  — generic credential shapes, always on.
-#   3. docs     — docs/ must carry no internal references (fleet paths and agent
-#      names, operator name, Telegram message numbers); always on.
+#   3. docs     — docs/ must carry no internal references (agent workspace paths,
+#      secrets dir, Telegram message numbers); always on. Names of people and
+#      agents belong in the entity list of pass 1, never in this file.
 #
 # vendor/dashi-plugin/ and vendor/public-gbrain-agentos/ are upstream code,
 # kept byte-identical to public commits: pass 1 tolerates upstream's own names
@@ -34,7 +35,7 @@ SECRET_PATTERNS=(
 )
 
 # Internal references that must not ship in docs/.
-DOCS_PATTERNS='claude-lab|maimozg|brandmozg|/home/edgelab|shared/secrets|\bKris|[Mm]sg [0-9]{4,}|Telegram msg'
+DOCS_PATTERNS='claude-lab|shared/secrets|[Mm]sg [0-9]{4,}|Telegram msg'
 
 GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache --exclude-dir=.superpowers)
 # Basename matches: also skips patches/<same name>, which the passes below cover.

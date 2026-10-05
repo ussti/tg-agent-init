@@ -255,7 +255,7 @@ check "skill links are relative and stay inside the workspace" bash -c \
    case \"\$(readlink -f \"\$l\")\" in '$WS'/*) ;; *) exit 1 ;; esac; done"
 check "kit has no template placeholders" bash -c "! grep -rn '{{[A-Z_]*}}' '$KIT/kit'"
 check "kit skills carry no fleet paths" bash -c \
-  "! grep -rnE 'claude-lab|maimozg|brandmozg|/home/edgelab|edgelab|shared/secrets|\\bKris\\b' '$KIT/kit/skills'"
+  "! grep -rnE 'claude-lab|shared/secrets' '$KIT/kit/skills'"
 check "system and dev skills linked" bash -c \
   "for s in skill-finder agent-introspection learnings senior-brainstorm; do \
    test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
