@@ -1,6 +1,7 @@
 
 ## Default kit
 
+This section supersedes the «Skills installed» table above.
 Skills come from the kit installed at `$AGENT_WS/kit`. A skill without its key or login
 stays inert and says what to set; nothing else breaks. Every key and login is optional.
 

@@ -67,6 +67,8 @@ append_tools_map() {
     say "adding the kit tool map to TOOLS.md"
     cat "$KIT/TOOLS-kit.md" >> "$tools"
   fi
+  # deep-research was removed from the kit; drop its stale row from the base table (idempotent)
+  sed -i '/^| deep-research |/d' "$tools"
 }
 append_tools_map
 

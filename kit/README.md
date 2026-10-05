@@ -64,7 +64,7 @@ Third-party programs come only from their official source, at the pinned version
 | gws | pipx `gws-cli==1.5.0` | MIT |
 | docx, pdf, pptx, xlsx | plugin `document-skills@anthropic-agent-skills` (marketplace `anthropics/skills`) | see upstream |
 | Vercel | plugin `vercel@claude-plugins-official`, CLI `vercel@62.2.0` | see upstream |
-| GitHub | `gh` from apt or the official site | see upstream |
+| GitHub | `gh`, install per https://github.com/cli/cli#installation | see upstream |
 | senior-brainstorm | our skill, `skills/dev/senior-brainstorm/LICENSE` | MIT |
 | skill-finder, agent-introspection, learnings, quick-reminders, onboard, perplexity-research, markdown-new, groq-voice, youtube-transcript, cal | our skills (some with an upstream base; no separate license file) | see upstream |
 
@@ -77,5 +77,5 @@ yt-dlp (for youtube-transcript) is installed with pipx from the official package
 2. Add a row to `kit/manifest.tsv`: `<category><TAB><skill><TAB>bundled`.
 3. Add the skill to `TOOLS-kit.md` and the table above. `tests/run-tests.sh` fails when a
    manifest skill is missing from the tool map.
-4. If the skill needs a key, add the service to `SERVICES` in `bin/agent-keys`.
+4. If the skill needs a key, add the service to `SERVICES` in `kit/bin/agent-keys`.
 5. Run `scripts/leak-scan.sh` and `tests/run-tests.sh`.

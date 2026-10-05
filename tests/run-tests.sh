@@ -200,14 +200,19 @@ check "web-tool routing table in rules.md" bash -c \
 check "web-tool rule not duplicated on re-run" bash -c \
   "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
    && test \$(grep -c '## Which internet tool' '$WS/core/rules.md') = 1"
-check "TOOLS.md lists every kit skill" bash -c \
-  "cut -f2 '$WS/kit/manifest.tsv' | grep -v '^#' | grep -v '^$' | \
-   while read -r s; do grep -q \"\\b\$s\\b\" '$WS/tools/TOOLS.md' || { echo \$s; exit 1; }; done"
+check "TOOLS.md kit table has a row for every kit skill" bash -c \
+  "grep -v '^#' '$WS/kit/manifest.tsv' | grep -v '^\$' | cut -f2 | \
+   while read -r s; do sed -n '/^## Default kit/,\$p' '$WS/tools/TOOLS.md' | \
+     grep -q \"^| \$s |\" || { echo \$s; exit 1; }; done"
+check "TOOLS.md has no deep-research row, kit supersedes the base table" bash -c \
+  "! grep -q '^| deep-research |' '$WS/tools/TOOLS.md' && \
+   grep -q 'supersedes the .Skills installed. table' '$WS/tools/TOOLS.md'"
 check "TOOLS.md has the later commands" bash -c \
   "grep -q 'agent-keys add' '$WS/tools/TOOLS.md' && grep -q 'agent-login' '$WS/tools/TOOLS.md'"
 check "kit table not duplicated in TOOLS.md on re-run" bash -c \
   "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
-   && test \$(grep -c '^## Default kit' '$WS/tools/TOOLS.md') = 1"
+   && test \$(grep -c '^## Default kit' '$WS/tools/TOOLS.md') = 1 \
+   && ! grep -q '^| deep-research |' '$WS/tools/TOOLS.md'"
 check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
   grep -q '^- Living syntax: ' '$WS/core/rules.md' && \
   grep -q '^- Numbers and facts only with a source' '$WS/core/rules.md'"
