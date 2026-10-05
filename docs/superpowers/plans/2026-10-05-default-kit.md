@@ -1374,7 +1374,7 @@ Note: `core/templates/` is overwritten by sync-core. So the TOOLS.md kit table m
 ```bash
 T=$(mktemp -d)
 HOME="$T" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
-  TG_AGENT_BOT_TOKEN="123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" AGENT_NAME=kitcheck OWNER_CHAT_ID=1 \
+  TG_AGENT_BOT_TOKEN="123456789:$(printf 'x%.0s' $(seq 1 35))" AGENT_NAME=kitcheck OWNER_CHAT_ID=1 \
   bash install-server.sh --no-systemd --no-cron --no-live-test 2>&1 | tee "$T/install.log"
 ls -la "$T/agents/kitcheck/.claude/skills"
 HOME="$T" "$T/.local/bin/agent-browser" --version
