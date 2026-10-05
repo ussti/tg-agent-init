@@ -60,18 +60,22 @@ Telegram ID, порт вебхука и токен бота (ввод скрыт
 папке секретов (права 600). Через Telegram ключи не вводят.
 
 ```bash
-~/agents/<имя>/.claude/kit/bin/agent-keys list            # какие ключи заданы
-~/agents/<имя>/.claude/kit/bin/agent-keys add <сервис>    # добавить или заменить ключ
+# установщик в конце печатает эти команды с правильными SECRETS_DIR и AGENT_NAME
+SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys list
+SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys add <сервис>
 ~/agents/<имя>/.claude/kit/bin/agent-login google         # или github, vercel, status
 ```
+
+Входы gh, vercel и gws-cli хранятся в домашней папке пользователя Unix, поэтому их разделяют
+все агенты этого пользователя.
 
 Сервисы ключей: groq, perplexity, cal, brave, scrapecreators, transcriptapi, jina. Новый
 ключ работает после перезапуска агента. Для входа в Google нужен свой OAuth-клиент:
 `agent-login google` печатает пошаговую инструкцию. Состав набора, источники и лицензии:
 [kit/README.md](kit/README.md).
 
-Плагин superpowers установщик ставит сам (из официального маркетплейса Claude Code). Если сети
-нет, установка не останавливается, в логе будет предупреждение и команда для ручной установки.
+Плагины superpowers, vercel и document-skills установщик ставит сам (из официальных
+маркетплейсов Claude Code). Если сети нет, установка не останавливается, в логе будет предупреждение и команда для ручной установки.
 
 Когда агент взял сообщение в работу, на нём появляется 👀: хук ставит реакцию в начале
 хода, а если это не удалось, её ставит хук в конце хода. Хуки агента живут в настройках
@@ -89,7 +93,11 @@ Code того же пользователя их не запускают.
 Установка без вопросов: `TG_AGENT_NONINTERACTIVE=1`, ответы в переменных окружения с
 теми же именами, что в `install-server.sh` (`AGENT_NAME`, `OWNER_CHAT_ID`, `TIMEZONE`…),
 токен в `TG_AGENT_BOT_TOKEN`, ключ Groq в `TG_AGENT_GROQ_KEY`, OAuth в
-`TG_AGENT_CLAUDE_OAUTH`.
+`TG_AGENT_CLAUDE_OAUTH`. Ключи сервисов: `TG_AGENT_KEY_<ID сервиса заглавными>`, то есть
+`TG_AGENT_KEY_GROQ`, `TG_AGENT_KEY_PERPLEXITY`, `TG_AGENT_KEY_CAL`, `TG_AGENT_KEY_BRAVE`,
+`TG_AGENT_KEY_SCRAPECREATORS`, `TG_AGENT_KEY_TRANSCRIPTAPI`, `TG_AGENT_KEY_JINA`
+(старое имя `TG_AGENT_KEY_TRANSCRIPT` тоже работает). Неверное значение останавливает
+установку до того, как что-то перенесено в `.bak`.
 
 ## Команда агентов
 
