@@ -38,6 +38,12 @@ trap cleanup EXIT
 
 echo "== 1. leak scan"
 check "leak-scan clean" bash "$KIT/scripts/leak-scan.sh"
+check "leak-scan flags an internal reference in docs/ and hides the value" bash -c "
+  W='$WORK/leakdocs'; mkdir -p \"\$W/docs\" \"\$W/scripts\" \
+  && cp '$KIT/scripts/leak-scan.sh' \"\$W/scripts/\" \
+  && echo 'copy ~/.claude-lab/x' > \"\$W/docs/a.md\" \
+  && ! out=\$(LEAK_ENTITIES_FILE=/nonexistent bash \"\$W/scripts/leak-scan.sh\" 2>&1) \
+  && echo \"\$out\" | grep -q 'docs/a.md:1' && ! echo \"\$out\" | grep -q 'claude-lab'"
 
 echo "== 2. syntax"
 while IFS= read -r f; do

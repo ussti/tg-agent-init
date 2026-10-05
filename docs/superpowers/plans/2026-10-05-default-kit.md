@@ -17,8 +17,8 @@ a pinned commit, plugin marketplaces); keys go into `$SECRETS_DIR/keys.env` (mod
 **Tech Stack:** bash (installer, `set -euo pipefail`), Python 3 stdlib (`agent-keys`,
 `agent-login`, unittest), Claude Code plugin CLI, npm, pipx, git.
 
-**Spec:** the approved list in this plan's «Approved kit» section (Kris, Telegram msg 14365 +
-approval 14366 «Все ок», web-tool routing promised in msg 14370). There is no separate spec file;
+**Spec:** the approved list in this plan's «Approved kit» section (operator approval +
+a second operator approval, web-tool routing promised in a later operator message). There is no separate spec file;
 that section is the spec.
 
 ## Approved kit (the spec)
@@ -38,7 +38,7 @@ that section is the spec.
 | research | crawl4ai | pipx `crawl4ai==0.9.4` (Apache-2.0) + our skill | none |
 | research | last30days | git `mvanhorn/last30days-skill@e93c8249` (MIT) | optional `BRAVE_API_KEY`, `SCRAPECREATORS_API_KEY` |
 | office | gws | pipx `gws-cli==1.5.0` (MIT), full access, + our skill | Google login (own OAuth client) |
-| office | cal | ours (inbox `tools/cal`, key path generalised) + skill | `CAL_API_KEY` |
+| office | cal | ours (internal cal tool, key path generalised) + skill | `CAL_API_KEY` |
 | office | docx / pdf / pptx / xlsx | plugin `document-skills@anthropic-agent-skills` (marketplace `anthropics/skills`) | none |
 | media | groq-voice | ours (already in `core/skills`) | `GROQ_API_KEY` (free) |
 | media | youtube-transcript | ours (yt-dlp via pipx) | optional `TRANSCRIPT_API_KEY` (paid) |
@@ -252,7 +252,7 @@ git commit -m "feat(kit): папка kit/ с категориями скилло
 ```bash
 check "kit has no template placeholders" bash -c "! grep -rn '{{[A-Z_]*}}' '$KIT/kit'"
 check "kit skills carry no fleet paths" bash -c \
-  "! grep -rnE 'claude-lab|maimozg|/home/edgelab|shared/secrets' '$KIT/kit/skills'"
+  "! grep -rnE '<internal fleet path, agent-name and secrets-dir patterns>' '$KIT/kit/skills'"
 check "system and dev skills linked" bash -c \
   "for s in skill-finder agent-introspection learnings senior-brainstorm; do \
    test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
@@ -263,16 +263,16 @@ check "system and dev skills linked" bash -c \
 - [ ] **Step 3: Copy and generalise**
 
 ```bash
-cp -RL ~/.claude-lab/shared/skills/skill-finder        kit/skills/system/
-cp -RL ~/.claude-lab/shared/skills/agent-introspection kit/skills/system/
-cp -RL ~/.claude-lab/shared/skills/learnings           kit/skills/system/
-cp -RL ~/.claude-lab/maimozg/.claude/skills/senior-brainstorm kit/skills/dev/
-grep -rnE 'claude-lab|maimozg|edgelab|Kris|shared/' kit/skills/system kit/skills/dev
+cp -RL <internal skill source>/skill-finder        kit/skills/system/
+cp -RL <internal skill source>/agent-introspection kit/skills/system/
+cp -RL <internal skill source>/learnings           kit/skills/system/
+cp -RL <internal skill source>/senior-brainstorm kit/skills/dev/
+grep -rnE '<fleet path, agent-name, operator-name patterns>' kit/skills/system kit/skills/dev
 ```
 
 Fix every hit by hand:
 - `learnings/SKILL.md`: fleet engine path → `$CLAUDE_PROJECT_DIR/scripts/learnings-engine.mjs` (the core installs it into `$AGENT_WS/scripts/`); remove fleet agent names from examples.
-- `agent-introspection/SKILL.md`: taken as is (Kris, msg 14360); only the «staging server» line in «Автор» stays, it names no person.
+- `agent-introspection/SKILL.md`: taken as is (operator approval); only the «staging server» line in «Автор» stays, it names no person.
 - `senior-brainstorm`: keep its LICENSE (MIT); if the folder has none, add the MIT text with the upstream author from its SKILL.md header.
 
 Add rows:
@@ -381,7 +381,7 @@ description: >
 
 Body: `gws-cli --help`, per-service `gws-cli <service> --help`, `gws-cli auth status`, the confirm-first rule for send / delete / share.
 
-- [ ] **Step 8: cal** — copy `~/.claude-lab/inbox/.claude/tools/cal` to `kit/skills/office/cal/cal`; replace the secrets-file read with:
+- [ ] **Step 8: cal** — copy the internal cal tool to `kit/skills/office/cal/cal`; replace the secrets-file read with:
 
 ```python
 API_KEY_ENV: str = "CAL_API_KEY"
@@ -1374,7 +1374,7 @@ Note: `core/templates/` is overwritten by sync-core. So the TOOLS.md kit table m
 ```bash
 T=$(mktemp -d)
 HOME="$T" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
-  TG_AGENT_BOT_TOKEN="123456789:$(printf 'x%.0s' $(seq 1 35))" AGENT_NAME=kitcheck OWNER_CHAT_ID=1 \
+  TG_AGENT_BOT_TOKEN="123456789:$(printf 'x%.0s' $(seq 1 35))" AGENT_NAME=kitcheck OWNER_CHAT_ID=10001 WEBHOOK_PORT=18189 \
   bash install-server.sh --no-systemd --no-cron --no-live-test 2>&1 | tee "$T/install.log"
 ls -la "$T/agents/kitcheck/.claude/skills"
 HOME="$T" "$T/.local/bin/agent-browser" --version
@@ -1383,7 +1383,7 @@ HOME="$T" "$T/.local/bin/crwl" --help | head -3
 CLAUDE_CONFIG_DIR="$T/.claude-agent-kitcheck" claude plugin list
 ```
 
-Expected: every manifest skill resolves, the four CLIs answer, `claude plugin list` shows superpowers, vercel, document-skills. Record versions in the PR. Remove `$T` afterwards only with Kris's go (it is outside the repo, but deletion is red zone).
+Expected: every manifest skill resolves, the four CLIs answer, `claude plugin list` shows superpowers, vercel, document-skills. Record versions in the PR. Remove `$T` afterwards only with operator go (it is outside the repo, but deletion is red zone).
 - [ ] **Step 3:** `bash scripts/leak-scan.sh` clean; `git diff origin/main --stat` reviewed.
 - [ ] **Step 4:** cross-review with superpowers:requesting-code-review on the whole branch.
-- [ ] **Step 5:** push branch, open PR to `main` (Russian title, body: what changed, tests, real-install result, «🤖 Generated with [Claude Code](https://claude.com/claude-code)»). Merge — Kris.
+- [ ] **Step 5:** push branch, open PR to `main` (Russian title, body: what changed, tests, real-install result, «🤖 Generated with [Claude Code](https://claude.com/claude-code)»). Merge — operator.
