@@ -54,12 +54,35 @@ readonly -a KIT_PLUGINS=(
   "document-skills@anthropic-agent-skills"
 )
 
-# Run a command silently; stdin closed so nothing can wait for input.
-try() { "$@" < /dev/null > /dev/null 2>&1; }
+readonly NET_TIMEOUT=600  # seconds; a hung download must not hang the whole install
 
-# Point skills/last30days at the downloaded upstream copy, if there is one.
+# Run a command silently with a time limit; stdin closed so nothing can wait for input.
+try() {
+  if command -v timeout > /dev/null; then
+    timeout "$NET_TIMEOUT" "$@" < /dev/null > /dev/null 2>&1
+  else
+    "$@" < /dev/null > /dev/null 2>&1
+  fi
+}
+
+# Read the pinned repo/commit of the last30days skill into LAST30_REPO / LAST30_COMMIT.
+read_last30_pin() {
+  LAST30_REPO="$(sed -n 's/^repo=//p' "$KIT/skills/research/last30days/UPSTREAM")"
+  LAST30_COMMIT="$(sed -n 's/^commit=//p' "$KIT/skills/research/last30days/UPSTREAM")"
+}
+
+# True when dir is a checkout whose HEAD is exactly the pinned commit.
+is_pinned_checkout() {
+  local dir="$1" head
+  head="$(git -C "$dir" rev-parse HEAD 2> /dev/null < /dev/null || true)"
+  [ -n "$LAST30_COMMIT" ] && [ "$head" = "$LAST30_COMMIT" ] \
+    && [ -f "$dir/skills/last30days/SKILL.md" ]
+}
+
+# Point skills/last30days at the downloaded upstream copy, only if it sits on the pin.
 relink_last30days() {
-  if [ -f "$KIT/vendor/last30days/skills/last30days/SKILL.md" ]; then
+  read_last30_pin
+  if is_pinned_checkout "$KIT/vendor/last30days"; then
     ln -sfn "../kit/vendor/last30days/skills/last30days" "$AGENT_WS/skills/last30days"
   fi
 }
@@ -81,33 +104,40 @@ install_deps() {
   if command -v pipx > /dev/null; then
     local pkg
     for pkg in "gws-cli==$GWS_CLI_VERSION" "crawl4ai==$CRAWL4AI_VERSION" yt-dlp; do
-      try pipx install "$pkg" || warn "$pkg not installed; later: pipx install '$pkg'"
+      try pipx install --force "$pkg" || warn "$pkg not installed; later: pipx install --force '$pkg'"
     done
   else
     warn "pipx not found: gws-cli, crawl4ai, yt-dlp skipped (sudo apt install pipx, then rerun)"
   fi
 
   if command -v agent-browser > /dev/null; then
-    try agent-browser install || warn "agent-browser: Chrome download failed; later: agent-browser install"
+    try agent-browser install || warn "agent-browser: Chrome download failed; later: agent-browser install (if Chrome lacks system libraries: sudo agent-browser install --with-deps)"
   fi
   if command -v crawl4ai-setup > /dev/null; then
     try crawl4ai-setup || warn "crawl4ai: browser setup failed; later: crawl4ai-setup"
   fi
 
-  local repo commit dest
-  repo="$(sed -n 's/^repo=//p' "$KIT/skills/research/last30days/UPSTREAM")"
-  commit="$(sed -n 's/^commit=//p' "$KIT/skills/research/last30days/UPSTREAM")"
+  local dest tmp
+  read_last30_pin
   dest="$KIT/vendor/last30days"
+  mkdir -p "$KIT/vendor"
   if [ -d "$dest/.git" ]; then  # rerun: update the existing checkout instead of cloning
-    try git -C "$dest" fetch || true
-    try git -C "$dest" checkout "$commit" || true
+    try git -C "$dest" fetch || warn "last30days: fetch failed (offline?); keeping the current checkout"
+    try git -C "$dest" checkout "$LAST30_COMMIT" \
+      || warn "last30days: checkout of $LAST30_COMMIT failed; later: git -C $dest checkout $LAST30_COMMIT"
+  elif [ -e "$dest" ]; then
+    warn "last30days: $dest exists but is not a git checkout; move it aside (mv '$dest' '$dest.old'), then rerun kit/install-kit.sh"
   else
-    try git clone "$repo" "$dest" && try git -C "$dest" checkout "$commit" || true
+    tmp="$(mktemp -d "$KIT/vendor/.last30days.XXXXXX")"
+    if try git clone "$LAST30_REPO" "$tmp/src" && try git -C "$tmp/src" checkout "$LAST30_COMMIT" \
+       && is_pinned_checkout "$tmp/src"; then
+      mv "$tmp/src" "$dest" && rmdir "$tmp"
+    fi
   fi
-  if [ -f "$dest/skills/last30days/SKILL.md" ]; then
+  if is_pinned_checkout "$dest"; then
     relink_last30days
   else
-    warn "last30days not downloaded; the skill tells the agent how to fix it"
+    warn "last30days not installed at the pinned commit; the skill tells the agent how to fix it"
   fi
 }
 

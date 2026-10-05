@@ -70,20 +70,36 @@ export FAKE_CLAUDE_LOG="$WORK/claude.log"
 # Fake upstream tools: log every call, no network. FAKE_TOOLS_FAIL=1 makes them fail
 # (offline). A fake `git clone` leaves a checkout with the last30days SKILL.md.
 mkdir -p "$WORK/bin"
-for tool in npm pipx git agent-browser crawl4ai-setup; do
+for tool in npm pipx agent-browser crawl4ai-setup; do
   cat > "$WORK/bin/$tool" <<EOF
 #!/usr/bin/env bash
 echo "$tool \$*" >> "\${FAKE_TOOLS_LOG:-/dev/null}"
 [ "\${FAKE_TOOLS_FAIL:-0}" = 1 ] && exit 1
-if [ "$tool" = git ] && [ "\$1" = clone ]; then
-  d="\${@: -1}"; mkdir -p "\$d/.git" "\$d/skills/last30days"
-  printf -- '---\nname: last30days\ndescription: upstream. Use when testing.\n---\n' \
-    > "\$d/skills/last30days/SKILL.md"
-fi
 exit 0
 EOF
   chmod +x "$WORK/bin/$tool"
 done
+# Fake git: clone leaves a checkout with the last30days SKILL.md; checkout records the
+# commit (FAKE_GIT_CHECKOUT_FAIL=1 makes it fail); rev-parse HEAD answers with it.
+cat > "$WORK/bin/git" <<'EOF'
+#!/usr/bin/env bash
+echo "git $*" >> "${FAKE_TOOLS_LOG:-/dev/null}"
+[ "${FAKE_TOOLS_FAIL:-0}" = 1 ] && exit 1
+dir=""
+if [ "$1" = -C ]; then dir="$2"; shift 2; fi
+case "$1" in
+  clone)
+    d="${@: -1}"; mkdir -p "$d/.git" "$d/skills/last30days"
+    printf -- '---\nname: last30days\ndescription: upstream. Use when testing.\n---\n' \
+      > "$d/skills/last30days/SKILL.md" ;;
+  checkout)
+    [ "${FAKE_GIT_CHECKOUT_FAIL:-0}" = 1 ] && exit 1
+    echo "$2" > "$dir/.git/PINNED" ;;
+  rev-parse) cat "$dir/.git/PINNED" 2>/dev/null || echo 0000000 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/git"
 export PATH="$WORK/bin:$PATH"
 export FAKE_TOOLS_LOG="$WORK/tools.log"
 : > "$FAKE_TOOLS_LOG"
@@ -231,8 +247,8 @@ check "re-running install-kit replaces a plain skill dir by a link and keeps the
   && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
 check "agent-browser from npm, pinned, no root" \
   grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@0.38.2" "$FAKE_TOOLS_LOG"
-check "python tools from pipx, pinned" bash -c "grep -q 'pipx install gws-cli==1.5.0' '$FAKE_TOOLS_LOG' && \
-  grep -q 'pipx install crawl4ai==0.9.4' '$FAKE_TOOLS_LOG' && grep -q 'pipx install yt-dlp' '$FAKE_TOOLS_LOG'"
+check "python tools from pipx, pinned" bash -c "grep -q 'pipx install --force gws-cli==1.5.0' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install --force crawl4ai==0.9.4' '$FAKE_TOOLS_LOG' && grep -q 'pipx install --force yt-dlp' '$FAKE_TOOLS_LOG'"
 check "last30days cloned at the pinned commit and linked" bash -c \
   "grep -q 'git clone https://github.com/mvanhorn/last30days-skill' '$FAKE_TOOLS_LOG' && \
    grep -q 'checkout e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$FAKE_TOOLS_LOG' && \
@@ -251,6 +267,17 @@ check "rerun on the same workspace keeps last30days upstream, no second clone" b
   && [ \"\$(grep -c 'git clone' '$FAKE_TOOLS_LOG')\" = \"\$n\" ] \
   && grep -q ' fetch' '$FAKE_TOOLS_LOG' \
   && grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+check "existing agent-browser config is preserved on rerun" bash -c "
+  echo '{\"marker\":1}' > '$FAKE_HOME/.agent-browser/config.json' \
+  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && jq -e '.marker == 1 and (has(\"maxOutput\") | not)' '$FAKE_HOME/.agent-browser/config.json'"
+check "unpinned last30days is never linked; a failed attempt does not block the rerun" bash -c "
+  W='$WORK/pin'; mkdir -p \"\$W/ws\" \
+  && FAKE_GIT_CHECKOUT_FAIL=1 HOME='$WORK/pin-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'Not installed yet' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && [ ! -e \"\$W/ws/kit/vendor/last30days\" ] \
+  && HOME='$WORK/pin-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'description: upstream' \"\$W/ws/skills/last30days/SKILL.md\""
 check "superpowers installed into the agent's config dir" bash -c \
   "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
      '$FAKE_CLAUDE_LOG' && \
@@ -377,7 +404,7 @@ if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGE
    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
    BASE_DIR="$FAKE_HOME/agents" FAKE_CLAUDE_FAIL=1 \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install2.log" 2>&1; then
-  ok "second agent installed (offline plugin install does not stop it)"
+  ok "second agent installed (npm, pipx, git and plugin installs all fail; the install still finishes)"
 else
   bad "second agent installed"; tail -10 "$WORK/install2.log"
 fi
@@ -387,7 +414,7 @@ check "offline: last30days keeps the stub" grep -q "Not installed yet" \
   "$FAKE_HOME/agents/helper-two/.claude/skills/last30days/SKILL.md"
 # No npm/pipx at all: the rest of the kit must still install.
 NT="$WORK/notools"; mkdir -p "$NT/bin" "$NT/ws"
-for t in bash env sed cp rm find chmod mkdir ln mv date dirname ls cat; do
+for t in bash env sed cp rm find chmod mkdir ln mv date dirname ls cat mktemp rmdir; do
   ln -sf "$(command -v "$t")" "$NT/bin/$t"
 done
 check "no npm/pipx: other kit items still installed" bash -c \
