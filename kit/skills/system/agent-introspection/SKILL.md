@@ -1,6 +1,6 @@
 ---
 name: agent-introspection
-description: Self-audit, code quality improvement through clarifying questions, and proactive learning. Use when writing code, making decisions, completing tasks, or during weekly self-audit. Triggers on code review, task completion, weekly introspection, and when user says "интроспекция" or "аудит".
+description: Self-audit, code quality improvement through clarifying questions, and proactive learning. Use when writing code, making decisions, completing tasks, or during weekly self-audit. Not for logging a single mistake or a user correction — use learnings. Triggers on code review, task completion, weekly introspection, and when user says "интроспекция" or "аудит".
 ---
 
 # Agent Introspection -- Расширенная версия

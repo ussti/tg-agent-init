@@ -5,6 +5,7 @@ description: >
   3 слоя: Episodes (сырой лог) → Learnings (scored) → Rules (promoted).
   Используй когда: (1) пользователь поправил действие, (2) обнаружена ошибка,
   (3) нужен отчёт по learnings, (4) lint/audit накопленных уроков.
+  Not for reviewing your own work and process — use agent-introspection.
 ---
 
 ## Wiring

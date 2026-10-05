@@ -1,6 +1,6 @@
 ---
 name: groq-voice
-description: Transcribe an audio file (voice message, recording) to text via Groq Whisper. Use when the user sends audio or asks to transcribe a voice note / audio file. Requires GROQ_API_KEY.
+description: Transcribe an audio file (voice message, recording) to text via Groq Whisper. Use when the user sends audio or asks to transcribe a voice note / audio file. Not for a YouTube link — use youtube-transcript. Requires GROQ_API_KEY.
 ---
 
 # Groq Voice — audio transcription

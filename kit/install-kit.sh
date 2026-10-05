@@ -43,6 +43,19 @@ say "linking skills"
 mkdir -p "$AGENT_WS/skills"
 link_skills
 
+# Web-tool routing rule: appended once, the heading is the idempotency guard.
+append_web_rule() {
+  local rules="$AGENT_WS/core/rules.md"
+  [ -f "$rules" ] || { warn "no $rules: web-tool rule skipped"; return 0; }
+  if grep -q '^## Which internet tool' "$rules"; then
+    say "web-tool rule already in rules.md"
+  else
+    say "adding the web-tool rule to rules.md"
+    cat "$KIT/rules/web-tools.md" >> "$rules"
+  fi
+}
+append_web_rule
+
 readonly AGENT_BROWSER_VERSION="0.38.2"
 readonly CRAWL4AI_VERSION="0.9.4"
 readonly GWS_CLI_VERSION="1.5.0"

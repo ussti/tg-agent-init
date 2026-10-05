@@ -5,7 +5,7 @@ description: >
   markdown and can crawl a whole site by links. Use when a page is empty or broken
   without JavaScript, when the verbatim text is needed rather than a summary, or when
   a whole site must be pulled (site audit, docs dump). For a single ordinary article
-  or docs page prefer WebFetch / markdown-new, which are faster. Free, no API key.
+  or docs page prefer WebFetch / markdown-new, which are faster. Not for forms, login or clicks — use agent-browser. Free, no API key.
 ---
 
 # crawl4ai — local crawler

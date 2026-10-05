@@ -7,6 +7,7 @@ description: >
   (5) "нужен плагин/расширение/скилл для...", (6) "как подключить X к Claude Code",
   (7) any mention of skills.sh, (8) "найди скилл", (9) "find skill",
   (10) user shares a skills.sh link for review.
+  Not for writing a new skill or editing one — use skill-creator.
 ---
 
 # Skill Finder

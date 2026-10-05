@@ -1,6 +1,6 @@
 ---
 name: youtube-transcript
-description: Fetch the transcript / subtitles of a YouTube video as plain text. Use when the user shares a YouTube URL and wants its transcript, summary, or content. No API key (uses yt-dlp).
+description: Fetch the transcript / subtitles of a YouTube video as plain text. Use when the user shares a YouTube URL and wants its transcript, summary, or content. Not for an audio file or a voice message — use groq-voice. No API key (uses yt-dlp).
 ---
 
 # YouTube Transcript

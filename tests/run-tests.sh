@@ -194,6 +194,12 @@ check "secrets deny rules: Read and Edit, no redundant Write" jq -e --arg s "$SE
   '.permissions.deny | (index("Read(\($s)/**)") != null) and (index("Edit(\($s)/**)") != null)
    and (index("Write(\($s)/**)") == null)' "$PLUGIN/.claude/settings.json"
 check "channel rule appended to rules.md" grep -q "## Telegram channel" "$WS/core/rules.md"
+check "web-tool routing table in rules.md" bash -c \
+  "grep -q '## Which internet tool' '$WS/core/rules.md' && \
+   test \$(grep -cE '^\\| .* \\| (WebSearch|WebFetch|crawl4ai|agent-browser|perplexity-research|last30days)' '$WS/core/rules.md') -ge 6"
+check "web-tool rule not duplicated on re-run" bash -c \
+  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+   && test \$(grep -c '## Which internet tool' '$WS/core/rules.md') = 1"
 check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
   grep -q '^- Living syntax: ' '$WS/core/rules.md' && \
   grep -q '^- Numbers and facts only with a source' '$WS/core/rules.md'"

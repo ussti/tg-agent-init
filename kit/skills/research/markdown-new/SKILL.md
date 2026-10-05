@@ -1,6 +1,6 @@
 ---
 name: markdown-new
-description: Convert any web page / article URL to clean Markdown, cutting ~80% of tokens vs raw HTML. Use when reading web pages, articles, or docs. No API key (uses the free Jina Reader).
+description: Convert any web page / article URL to clean Markdown, cutting ~80% of tokens vs raw HTML. Use when reading web pages, articles, or docs. No API key (uses the free Jina Reader). Not for a whole site or a page that needs JavaScript — use crawl4ai; not for forms, login or clicks — use agent-browser.
 ---
 
 # markdown-new — URL to clean Markdown

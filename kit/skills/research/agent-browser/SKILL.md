@@ -4,8 +4,8 @@ description: >
   Browser automation CLI for AI agents. Use when the user needs to interact with a
   website: navigate pages, fill forms, click buttons, take screenshots, extract data,
   test a web app, log in to a site, or automate any browser task. Also for exploratory
-  testing and QA. For simply reading an ordinary article or docs page, lighter tools
-  (WebFetch, markdown-new, crawl4ai) are fine.
+  testing and QA. Not for just reading a page — use WebFetch or markdown-new;
+  not for pulling a whole site or verbatim text — use crawl4ai.
 allowed-tools: Bash(agent-browser:*), Bash(npx agent-browser:*)
 ---
 

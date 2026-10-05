@@ -5,6 +5,7 @@ description: >
   gathers and cross-checks many sources. Use when the user wants a detailed answer
   with sources, a serious fact-check, or a market / competitor overview.
   Not for quick facts or a single page — use the built-in WebSearch / WebFetch.
+  Not for what people discussed in the last 30 days (Reddit, X, HN threads) — use last30days.
   Needs PERPLEXITY_API_KEY; without it, say so and fall back to WebSearch.
 ---
 
