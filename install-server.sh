@@ -19,8 +19,6 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIT_DIR
 readonly LIVE_TEST_TIMEOUT_S=240
 readonly PORT_WAIT_S=90
-readonly PLUGIN_MARKETPLACE_REPO="anthropics/claude-plugins-official"
-readonly DEFAULT_PLUGINS=("superpowers@claude-plugins-official")
 
 DO_SYSTEMD=1
 DO_CRON=1
@@ -207,15 +205,11 @@ esac
 # Channel rule on top of the core identity: the owner only reads Telegram.
 cat "$KIT_DIR/server/templates/channel-rules.md" >> "$AGENT_WS/core/rules.md"
 
-# Default kit: skills by category, upstream tools, plugins (kit/README.md).
-KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_WS" "$CLAUDE_CONFIG_DIR"
-
 # ---------------------------------------------------------------- server layer
 say "installing server scripts and hooks"
 cp "$KIT_DIR"/server/bin/* "$AGENT_WS/bin/"
 cp "$KIT_DIR"/server/hooks/* "$AGENT_WS/hooks/"
 chmod +x "$AGENT_WS"/bin/*.sh "$AGENT_WS"/hooks/*.sh "$AGENT_WS"/hooks/*.py "$AGENT_WS"/scripts/*.sh
-find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
 render "$KIT_DIR/server/templates/agent.conf.template" "$AGENT_WS/agent.conf"
 
 say "writing secrets to $SECRETS_DIR (mode 600)"
@@ -294,21 +288,11 @@ for f in bash python typescript; do
   [ -f "$CLAUDE_CONFIG_DIR/rules/$f.md" ] || cp "$T/global-rules/$f.md" "$CLAUDE_CONFIG_DIR/rules/"
 done
 
-# Default plugins: rules.md makes superpowers mandatory, so it ships with the agent.
-# Both steps are idempotent and need no login; a failure (no network) only warns.
-say "installing default plugins: ${DEFAULT_PLUGINS[*]}"
-if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin marketplace add \
-     "$PLUGIN_MARKETPLACE_REPO" < /dev/null > /dev/null 2>&1; then
-  for p in "${DEFAULT_PLUGINS[@]}"; do
-    CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin install "$p" < /dev/null \
-      > /dev/null 2>&1 || say "WARN: could not install $p; later run:" \
-      "CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin install $p"
-  done
-else
-  say "WARN: marketplace $PLUGIN_MARKETPLACE_REPO unreachable; plugins not installed." \
-    "Later: CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin marketplace add" \
-    "$PLUGIN_MARKETPLACE_REPO, then claude plugin install ${DEFAULT_PLUGINS[*]}"
-fi
+# Default kit: skills by category, upstream tools, plugins (kit/README.md). Runs once the
+# config dir is prepared, because plugins install into it.
+export CLAUDE_BIN
+KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_WS" "$CLAUDE_CONFIG_DIR"
+find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
 
 if [ -z "$OAUTH" ] && [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
   echo

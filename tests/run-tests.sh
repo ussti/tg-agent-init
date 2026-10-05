@@ -67,12 +67,32 @@ chmod +x "$WORK/claudebin/claude"
 export PATH="$WORK/claudebin:$PATH"
 export FAKE_CLAUDE_LOG="$WORK/claude.log"
 : > "$FAKE_CLAUDE_LOG"
+# Fake upstream tools: log every call, no network. FAKE_TOOLS_FAIL=1 makes them fail
+# (offline). A fake `git clone` leaves a checkout with the last30days SKILL.md.
+mkdir -p "$WORK/bin"
+for tool in npm pipx git agent-browser crawl4ai-setup; do
+  cat > "$WORK/bin/$tool" <<EOF
+#!/usr/bin/env bash
+echo "$tool \$*" >> "\${FAKE_TOOLS_LOG:-/dev/null}"
+[ "\${FAKE_TOOLS_FAIL:-0}" = 1 ] && exit 1
+if [ "$tool" = git ] && [ "\$1" = clone ]; then
+  d="\${@: -1}"; mkdir -p "\$d/.git" "\$d/skills/last30days"
+  printf -- '---\nname: last30days\ndescription: upstream. Use when testing.\n---\n' \
+    > "\$d/skills/last30days/SKILL.md"
+fi
+exit 0
+EOF
+  chmod +x "$WORK/bin/$tool"
+done
+export PATH="$WORK/bin:$PATH"
+export FAKE_TOOLS_LOG="$WORK/tools.log"
+: > "$FAKE_TOOLS_LOG"
 FAKE_HOME="$WORK/home"
 mkdir -p "$FAKE_HOME"
 OWNER=111222333
 PORT=18089
 DUMMY_TOKEN="987654321:$(printf 'x%.0s' $(seq 1 35))"
-if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
+if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=testbot OWNER_CHAT_ID="$OWNER" \
    OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT="$PORT" BASE_DIR="$FAKE_HOME/agents" \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install.log" 2>&1; then
@@ -206,9 +226,31 @@ check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
 check "re-running install-kit replaces a plain skill dir by a link and keeps the old one" bash -c "
   rm '$WS/skills/quick-reminders' && mkdir '$WS/skills/quick-reminders' \
-  && KIT_SKIP_DEPS=1 bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
   && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
+check "agent-browser from npm, pinned, no root" \
+  grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@0.38.2" "$FAKE_TOOLS_LOG"
+check "python tools from pipx, pinned" bash -c "grep -q 'pipx install gws-cli==1.5.0' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install crawl4ai==0.9.4' '$FAKE_TOOLS_LOG' && grep -q 'pipx install yt-dlp' '$FAKE_TOOLS_LOG'"
+check "last30days cloned at the pinned commit and linked" bash -c \
+  "grep -q 'git clone https://github.com/mvanhorn/last30days-skill' '$FAKE_TOOLS_LOG' && \
+   grep -q 'checkout e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$FAKE_TOOLS_LOG' && \
+   grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+check "browser setup steps run after install" bash -c \
+  "grep -qx 'agent-browser install' '$FAKE_TOOLS_LOG' && grep -qx 'crawl4ai-setup ' '$FAKE_TOOLS_LOG'"
+check "agent-browser safety config installed" \
+  jq -e '.contentBoundaries == true and .maxOutput == 50000' "$FAKE_HOME/.agent-browser/config.json"
+check "kit plugins installed into the agent's config dir" bash -c \
+  "for p in superpowers@claude-plugins-official document-skills@anthropic-agent-skills \
+   vercel@claude-plugins-official; do grep -q \"plugin install \$p\" '$FAKE_CLAUDE_LOG' || exit 1; done; \
+   grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
+check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
+  n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
+  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && [ \"\$(grep -c 'git clone' '$FAKE_TOOLS_LOG')\" = \"\$n\" ] \
+  && grep -q ' fetch' '$FAKE_TOOLS_LOG' \
+  && grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
 check "superpowers installed into the agent's config dir" bash -c \
   "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
      '$FAKE_CLAUDE_LOG' && \
@@ -330,7 +372,7 @@ fi
 
 echo "== 6. install-fleet end-to-end"
 # Second agent next to testbot from section 4.
-if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
+if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 FAKE_TOOLS_FAIL=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=helper-two AGENT_ROLE="Research helper" \
    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
    BASE_DIR="$FAKE_HOME/agents" FAKE_CLAUDE_FAIL=1 \
@@ -339,6 +381,19 @@ if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGE
 else
   bad "second agent installed"; tail -10 "$WORK/install2.log"
 fi
+check "offline: install still finishes, kit skills linked" \
+  test -L "$FAKE_HOME/agents/helper-two/.claude/skills/gws"
+check "offline: last30days keeps the stub" grep -q "Not installed yet" \
+  "$FAKE_HOME/agents/helper-two/.claude/skills/last30days/SKILL.md"
+# No npm/pipx at all: the rest of the kit must still install.
+NT="$WORK/notools"; mkdir -p "$NT/bin" "$NT/ws"
+for t in bash env sed cp rm find chmod mkdir ln mv date dirname ls cat; do
+  ln -sf "$(command -v "$t")" "$NT/bin/$t"
+done
+check "no npm/pipx: other kit items still installed" bash -c \
+  "HOME='$NT/home' PATH='$NT/bin' CLAUDE_BIN='$WORK/claudebin/claude' \
+     bash '$KIT/kit/install-kit.sh' '$NT/ws' '$NT/cfg' >/dev/null 2>&1 \
+   && test -f '$NT/ws/skills/gws/SKILL.md' && grep -q '$NT/cfg plugin install superpowers' '$FAKE_CLAUDE_LOG'"
 check "offline plugin install only warns" grep -q "WARN: marketplace .* unreachable" "$WORK/install2.log"
 check "Russian agent gets the typography rule inside Response format" python3 - \
   "$FAKE_HOME/agents/helper-two/.claude/core/rules.md" <<'PY'
