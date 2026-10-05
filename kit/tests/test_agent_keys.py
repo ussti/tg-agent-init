@@ -29,16 +29,29 @@ ak = load_module()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    """Answers 200 for the good key, 401 otherwise, 500 on /boom."""
+    """Answers by path: /cNNN gives code NNN (302 points at Handler.redirect_to),
+    /boom gives 500, anything else 200 for a "good" key and 401 otherwise.
+    Every request is recorded in Handler.seen."""
+
+    seen: list = []
+    redirect_to: str = ""
 
     def _answer(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode() if length else ""
+        Handler.seen.append((self.path, dict(self.headers.items()), body))
         if self.path.startswith("/boom"):
             code = 500
+        elif self.path[2:5].isdigit() and self.path.startswith("/c"):
+            code = int(self.path[2:5])
         elif "good" in (self.headers.get("Authorization", "") + self.headers.get("x-api-key", "")):
             code = 200
         else:
             code = 401
         self.send_response(code)
+        if code == 302:
+            self.send_header("Location", Handler.redirect_to)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     do_GET = _answer
@@ -126,6 +139,67 @@ class ValidateTest(unittest.TestCase):
 
     def test_server_error_unverified(self) -> None:
         self.assertEqual(ak.validate(self.svc("/boom"), "good"), "unverified")
+
+    def test_status_mapping(self) -> None:
+        expected = {"/c401": "invalid", "/c403": "invalid", "/c402": "ok", "/c429": "ok",
+                    "/c404": "ok", "/c400": "ok", "/c500": "unverified", "/c503": "unverified",
+                    "/c200": "ok"}
+        for path, status in expected.items():
+            with self.subTest(path=path):
+                self.assertEqual(ak.validate(self.svc(path), "good"), status)
+
+    def test_credit_and_limit_notes(self) -> None:
+        status, note = ak.check(self.svc("/c402"), "good")
+        self.assertEqual(status, "ok")
+        self.assertIn("no credit", note)
+        status, note = ak.check(self.svc("/c429"), "good")
+        self.assertEqual(status, "ok")
+        self.assertIn("rate limit", note)
+
+    def test_redirect_not_followed_and_credentials_not_forwarded(self) -> None:
+        other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        try:
+            Handler.redirect_to = f"http://127.0.0.1:{other.server_port}/landing"
+            Handler.seen.clear()
+            status, note = ak.check(self.svc("/c302"), "good")
+            self.assertEqual(status, "unverified")
+            self.assertIn("redirect", note)
+            self.assertEqual([p for p, _, _ in Handler.seen], ["/c302"])
+        finally:
+            other.shutdown()
+
+    def test_headers_and_body_reach_server(self) -> None:
+        cases = (("bearer", "Authorization", "Bearer good"),
+                 ("x-api-key", "x-api-key", "good"),
+                 ("x-subscription-token", "X-Subscription-Token", "good"))
+        for auth, header, want in cases:
+            Handler.seen.clear()
+            svc = ak.Service("t", "T_KEY", "test", "here", "GET", self.base + "/c200", auth)
+            ak.validate(svc, "good")
+            sent = {k.lower(): v for k, v in Handler.seen[0][1].items()}
+            self.assertEqual(sent.get(header.lower()), want, auth)
+        Handler.seen.clear()
+        post = ak.Service("t", "T_KEY", "test", "here", "POST", self.base + "/c200", "bearer",
+                          body='{"ping": 1}', extra=(("cal-api-version", "x"),))
+        ak.validate(post, "good")
+        _, headers, body = Handler.seen[0]
+        self.assertEqual(body, '{"ping": 1}')
+        lowered = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(lowered.get("content-type"), "application/json")
+        self.assertEqual(lowered.get("cal-api-version"), "x")
+
+    def test_no_live_check_note(self) -> None:
+        jina = next(s for s in ak.SERVICES if s.id == "jina")
+        status, note = ak.check(jina, "good")
+        self.assertEqual(status, "unverified")
+        self.assertIn("no live check", note)
+
+    def test_http_exception_unverified(self) -> None:
+        import http.client
+        from unittest import mock
+        with mock.patch.object(ak.OPENER, "open", side_effect=http.client.BadStatusLine("x")):
+            self.assertEqual(ak.validate(self.svc(), "good"), "unverified")
 
     def test_unreachable_unverified(self) -> None:
         dead = ak.Service("t", "T_KEY", "test", "here", "GET", "http://127.0.0.1:9/x", "bearer")

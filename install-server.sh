@@ -148,6 +148,13 @@ done
 # agent-keys walkthrough, hidden input, Enter skips. Runs before VOICE_PROVIDER is used.
 KEYS_FILE="$SECRETS_DIR/keys.env"
 ( umask 077; mkdir -p "$SECRETS_DIR" )
+# A re-install moved the old secrets dir to .bak_<stamp>: carry the keys over so keys added
+# later with agent-keys survive. TG_AGENT_KEY_* values below win per name.
+if [ -f "$SECRETS_DIR.bak_$STAMP/keys.env" ]; then
+  say "carrying keys.env over from $SECRETS_DIR.bak_$STAMP"
+  ( umask 077; cp "$SECRETS_DIR.bak_$STAMP/keys.env" "$KEYS_FILE" )
+  chmod 600 "$KEYS_FILE"
+fi
 for kv in GROQ_API_KEY PERPLEXITY_API_KEY CAL_API_KEY BRAVE_API_KEY \
           SCRAPECREATORS_API_KEY TRANSCRIPT_API_KEY JINA_API_KEY; do
   envname="TG_AGENT_KEY_${kv%_API_KEY}"
@@ -180,6 +187,12 @@ if [ "$NONINTERACTIVE" != "1" ]; then
     python3 "$KIT_DIR/kit/bin/agent-keys" setup || true
 fi
 [ ! -f "$KEYS_FILE" ] || chmod 600 "$KEYS_FILE"
+# Keep the key values out of every later child process.
+unset AK_VALUE TG_AGENT_GROQ_KEY
+for kv in GROQ_API_KEY PERPLEXITY_API_KEY CAL_API_KEY BRAVE_API_KEY \
+          SCRAPECREATORS_API_KEY TRANSCRIPT_API_KEY JINA_API_KEY; do
+  unset "TG_AGENT_KEY_${kv%_API_KEY}"
+done
 if grep -q '^GROQ_API_KEY=' "$KEYS_FILE" 2>/dev/null; then VOICE_PROVIDER="groq"; fi
 
 export AGENT_NAME AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS \

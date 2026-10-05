@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import http.client
 import json
 import logging
 import os
@@ -151,15 +152,30 @@ def save_key(path: Path, name: str, value: str) -> None:
         raise
 
 
-def validate(service: Service, value: str, timeout: float = TIMEOUT_S) -> str:
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the key headers must not reach another host."""
+
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+CODE_NOTES: dict[int, str] = {
+    402: "the key is valid, but the account has no credit",
+    429: "the key is valid, but the account is over its rate limit",
+}
+
+
+def check(service: Service, value: str, timeout: float = TIMEOUT_S) -> tuple[str, str]:
     """Live-check a key.
 
     Returns:
-        "ok" when the service recognised the key, "invalid" on 401/403,
-        "unverified" when the service could not be reached or failed.
+        (status, note): status is "ok" when the service recognised the key, "invalid"
+        on 401/403, "unverified" when it could not be checked (unreachable, 5xx,
+        redirect, no live check). The note says why when there is something to say.
     """
     if not service.method:
-        return "unverified"
+        return "unverified", "this service has no live check"
     headers = {"User-Agent": "agent-keys", **dict(service.extra)}
     if service.auth == "bearer":
         headers["Authorization"] = f"Bearer {value}"
@@ -174,14 +190,23 @@ def validate(service: Service, value: str, timeout: float = TIMEOUT_S) -> str:
     request = urllib.request.Request(service.check_url, data=data, headers=headers,
                                      method=service.method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout):
-            return "ok"
+        with OPENER.open(request, timeout=timeout):
+            return "ok", ""
     except urllib.error.HTTPError as err:
         if err.code in REJECT_CODES:
-            return "invalid"
-        return "unverified" if err.code >= 500 else "ok"
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return "unverified"
+            return "invalid", "the service rejected this key"
+        if 300 <= err.code < 400:
+            return "unverified", f"the service redirected the request ({err.code})"
+        if err.code >= 500:
+            return "unverified", f"the service failed ({err.code})"
+        return "ok", CODE_NOTES.get(err.code, "")
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError):
+        return "unverified", "the service is unreachable"
+
+
+def validate(service: Service, value: str, timeout: float = TIMEOUT_S) -> str:
+    """Live-check a key; "ok" | "invalid" | "unverified" (see check for the reason)."""
+    return check(service, value, timeout)[0]
 
 
 def keys_path() -> Path:
@@ -211,7 +236,7 @@ def ask_one(service: Service, path: Path) -> None:
     if current:
         print("  already set; Enter keeps it")
     while True:
-        raw = getpass.getpass("  key (hidden, Enter to skip): ")
+        raw = getpass.getpass("  key (hidden, Enter to skip): ")  # EOF/Ctrl-C: see main
         try:
             value = clean_value(raw)
         except ValueError as err:
@@ -220,14 +245,17 @@ def ask_one(service: Service, path: Path) -> None:
         if not value:
             print("  skipped" + (f"; later: agent-keys add {service.id}" if not current else ""))
             return
-        status = validate(service, value)
+        status, note = check(service, value)
         if status == "invalid":
-            print("  the service rejected this key; try again or Enter to skip")
+            print(f"  {note}; try again or Enter to skip")
             continue
         save_key(path, service.env, value)
-        note = {"ok": "checked, saved",
-                "unverified": "saved, but not checked (service unreachable)"}[status]
-        print(f"  {note}")
+        if status == "ok":
+            print("  checked, saved" + (f"; {note}" if note else ""))
+        elif service.method:
+            print(f"  saved, but not checked: {note}")
+        else:
+            print(f"  saved; {note}")
         return
 
 
@@ -245,8 +273,12 @@ def main(argv: list[str] | None = None) -> int:
         print(render_list(path))
         return 0
     targets = SERVICES if args.cmd == "setup" else [s for s in SERVICES if s.id == args.service]
-    for service in targets:
-        ask_one(service, path)
+    try:
+        for service in targets:
+            ask_one(service, path)
+    except (EOFError, KeyboardInterrupt):
+        print("\nstopped; keys entered so far are saved")
+        return 130
     unit = f"{os.environ.get('AGENT_NAME', '<agent>')}-agent.service"
     print(f"\nRestart the agent to load new keys: sudo systemctl restart {unit}")
     return 0

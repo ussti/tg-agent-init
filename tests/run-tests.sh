@@ -409,6 +409,36 @@ else
     grep -qF "$SUDO_UNITS/sudobot-agent.service" "$WORK/install-sudo.log"
 fi
 
+echo "== 4c. keys: re-install, invalid and empty values"
+# keys_install HOME LOG [VAR=value ...]: installer run into HOME with the extra env.
+keys_install() {
+  local home="$1" log="$2"; shift 2
+  mkdir -p "$home"
+  env "$@" HOME="$home" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 \
+    TG_AGENT_TEST_SKIP_BUN=1 TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=keysbot \
+    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18091 \
+    BASE_DIR="$home/agents" \
+    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$log" 2>&1
+}
+KH="$WORK/keyshome"
+check "keys install: first run" keys_install "$KH" "$WORK/keys1.log" \
+  TG_AGENT_KEY_CAL=cal_test_123 TG_AGENT_KEY_BRAVE=brave_test_1
+check "keys install: re-run with a new brave value and an empty jina" keys_install "$KH" \
+  "$WORK/keys2.log" TG_AGENT_KEY_BRAVE=brave_new_2 TG_AGENT_KEY_JINA=
+KSEC="$KH/.config/tg-agent/keysbot"
+check "re-install keeps the earlier key, one line per name" bash -c \
+  "[ \"\$(grep -c '^CAL_API_KEY=' '$KSEC/keys.env')\" = 1 ] && grep -qx 'CAL_API_KEY=\"cal_test_123\"' '$KSEC/keys.env'"
+check "re-install: env value wins per name, once" bash -c \
+  "[ \"\$(grep -c '^BRAVE_API_KEY=' '$KSEC/keys.env')\" = 1 ] && grep -qx 'BRAVE_API_KEY=\"brave_new_2\"' '$KSEC/keys.env'"
+check "re-install: keys.env mode 600" test "$(stat -c %a "$KSEC/keys.env")" = 600
+check "empty TG_AGENT_KEY_* is skipped" bash -c "! grep -q '^JINA_API_KEY' '$KSEC/keys.env'"
+BAD_VALUE='bad$value'
+keys_install_fails() { ! keys_install "$@"; }
+check "invalid TG_AGENT_KEY_* fails the installer" keys_install_fails "$WORK/badhome" \
+  "$WORK/keysbad.log" "TG_AGENT_KEY_CAL=$BAD_VALUE"
+check "invalid key value never printed" bash -c "! grep -qF 'bad\$value' '$WORK/keysbad.log' && \
+  grep -q 'TG_AGENT_KEY_CAL' '$WORK/keysbad.log'"
+
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
 if bash "$KIT/scripts/build-gbrain.sh" "$GB_BUILD" > "$WORK/gbrain-build.log" 2>&1; then
