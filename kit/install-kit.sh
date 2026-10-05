@@ -56,6 +56,20 @@ append_web_rule() {
 }
 append_web_rule
 
+# Tool map: the kit table is appended to tools/TOOLS.md once (core/templates is overwritten
+# by sync-core, so the table cannot live there); the heading is the idempotency guard.
+append_tools_map() {
+  local tools="$AGENT_WS/tools/TOOLS.md"
+  [ -f "$tools" ] || { warn "no $tools: kit tool map skipped"; return 0; }
+  if grep -q '^## Default kit' "$tools"; then
+    say "kit tool map already in TOOLS.md"
+  else
+    say "adding the kit tool map to TOOLS.md"
+    cat "$KIT/TOOLS-kit.md" >> "$tools"
+  fi
+}
+append_tools_map
+
 readonly AGENT_BROWSER_VERSION="0.38.2"
 readonly CRAWL4AI_VERSION="0.9.4"
 readonly GWS_CLI_VERSION="1.5.0"
