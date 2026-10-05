@@ -135,6 +135,49 @@ WEBHOOK_TOKEN="$(openssl rand -hex 24)"
 VOICE_PROVIDER="none"  # becomes "groq" in the keys step when a Groq key is known
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
+# Skill keys: service id -> env name the skills read. The unattended variable is
+# TG_AGENT_KEY_<SERVICE ID upper-cased> (TG_AGENT_KEY_TRANSCRIPT is the old name for
+# transcriptapi, TG_AGENT_GROQ_KEY the old name for groq; both stay accepted).
+KEY_SERVICES="groq:GROQ_API_KEY perplexity:PERPLEXITY_API_KEY cal:CAL_API_KEY brave:BRAVE_API_KEY
+scrapecreators:SCRAPECREATORS_API_KEY transcriptapi:TRANSCRIPT_API_KEY jina:JINA_API_KEY"
+key_var() { printf 'TG_AGENT_KEY_%s' "$(tr '[:lower:]' '[:upper:]' <<<"$1")"; }
+# Fill the derived variable from an old alias when it is empty.
+for pair in $KEY_SERVICES; do
+  svc="${pair%%:*}"; envname="$(key_var "$svc")"
+  [ -z "${!envname:-}" ] || continue
+  case "$svc" in
+    groq) [ -z "${TG_AGENT_GROQ_KEY:-}" ] || printf -v "$envname" '%s' "$TG_AGENT_GROQ_KEY" ;;
+    transcriptapi) [ -z "${TG_AGENT_KEY_TRANSCRIPT:-}" ] \
+      || printf -v "$envname" '%s' "$TG_AGENT_KEY_TRANSCRIPT" ;;
+  esac
+done
+# Check every value now, before anything is moved aside: a typo must not cost a
+# working agent. The value travels in the environment, never in argv (readable in /proc).
+ak_py() {  # ak_py check|save ENVNAME KEYNAME FILE
+  AK_MODE="$1" AK_ENV="$2" AK_NAME="$3" AK_VALUE="${!2}" AGENT_KEYS_FILE="$4" \
+    python3 - "$KIT_DIR/kit/bin/agent-keys" <<'PY'
+import importlib.machinery, importlib.util, os, sys
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("agent_keys", sys.argv[1])
+spec = importlib.util.spec_from_loader("agent_keys", loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules["agent_keys"] = module
+loader.exec_module(module)
+try:
+    value = module.clean_value(os.environ["AK_VALUE"])
+    if os.environ["AK_MODE"] == "save":
+        module.save_key(Path(os.environ["AGENT_KEYS_FILE"]), os.environ["AK_NAME"], value)
+except ValueError as err:
+    sys.exit(f"{os.environ['AK_ENV']}: {err}")
+PY
+}
+for pair in $KEY_SERVICES; do
+  envname="$(key_var "${pair%%:*}")"
+  [ -z "${!envname:-}" ] || ak_py check "$envname" "${pair#*:}" /dev/null \
+    || die "$envname: not a valid key"
+done
+
 for d in "$AGENT_HOME" "$SECRETS_DIR"; do
   if [ -e "$d" ]; then
     say "'$d' exists -> moving to $d.bak_$STAMP"
@@ -155,31 +198,21 @@ if [ -f "$SECRETS_DIR.bak_$STAMP/keys.env" ]; then
   ( umask 077; cp "$SECRETS_DIR.bak_$STAMP/keys.env" "$KEYS_FILE" )
   chmod 600 "$KEYS_FILE"
 fi
-for kv in GROQ_API_KEY PERPLEXITY_API_KEY CAL_API_KEY BRAVE_API_KEY \
-          SCRAPECREATORS_API_KEY TRANSCRIPT_API_KEY JINA_API_KEY; do
-  envname="TG_AGENT_KEY_${kv%_API_KEY}"
-  if [ "$kv" = GROQ_API_KEY ] && [ -z "${!envname:-}" ] && [ -n "${TG_AGENT_GROQ_KEY:-}" ]; then
-    printf -v "$envname" '%s' "$TG_AGENT_GROQ_KEY"
+# Pre-keys.env installs kept the Groq key in channel.conf: carry it over unless keys.env has one.
+OLD_CHANNEL_CONF="$SECRETS_DIR.bak_$STAMP/channel.conf"
+if [ -f "$OLD_CHANNEL_CONF" ] && ! grep -q '^GROQ_API_KEY=' "$KEYS_FILE" 2>/dev/null; then
+  old_groq="$(sed -n 's/^GROQ_API_KEY="\([A-Za-z0-9._:\/+=-]*\)"$/\1/p' "$OLD_CHANNEL_CONF" | head -1)"
+  if [ -n "$old_groq" ]; then
+    say "carrying the Groq key over from the old channel.conf into keys.env"
+    TG_AGENT_KEY_GROQ_OLD="$old_groq" ak_py save TG_AGENT_KEY_GROQ_OLD GROQ_API_KEY "$KEYS_FILE" \
+      || say "WARN: the old Groq key could not be carried over"
   fi
-  if [ -n "${!envname:-}" ]; then
-    # The value travels in the environment, never in argv (readable in /proc).
-    AK_NAME="$kv" AK_VALUE="${!envname}" AGENT_KEYS_FILE="$KEYS_FILE" \
-      python3 - "$KIT_DIR/kit/bin/agent-keys" <<'PY' || die "$envname: not a valid key"
-import importlib.machinery, importlib.util, os, sys
-from pathlib import Path
-
-loader = importlib.machinery.SourceFileLoader("agent_keys", sys.argv[1])
-spec = importlib.util.spec_from_loader("agent_keys", loader)
-module = importlib.util.module_from_spec(spec)
-sys.modules["agent_keys"] = module
-loader.exec_module(module)
-try:
-    module.save_key(Path(os.environ["AGENT_KEYS_FILE"]), os.environ["AK_NAME"],
-                    module.clean_value(os.environ["AK_VALUE"]))
-except ValueError as err:
-    sys.exit(f"{os.environ['AK_NAME']}: {err}")
-PY
-  fi
+  unset old_groq TG_AGENT_KEY_GROQ_OLD
+fi
+for pair in $KEY_SERVICES; do
+  envname="$(key_var "${pair%%:*}")"
+  [ -z "${!envname:-}" ] || ak_py save "$envname" "${pair#*:}" "$KEYS_FILE" \
+    || die "$envname: not a valid key"
 done
 if [ "$NONINTERACTIVE" != "1" ]; then
   say "keys for skills -- all optional, Enter skips, add later with agent-keys add <service>"
@@ -188,11 +221,8 @@ if [ "$NONINTERACTIVE" != "1" ]; then
 fi
 [ ! -f "$KEYS_FILE" ] || chmod 600 "$KEYS_FILE"
 # Keep the key values out of every later child process.
-unset AK_VALUE TG_AGENT_GROQ_KEY
-for kv in GROQ_API_KEY PERPLEXITY_API_KEY CAL_API_KEY BRAVE_API_KEY \
-          SCRAPECREATORS_API_KEY TRANSCRIPT_API_KEY JINA_API_KEY; do
-  unset "TG_AGENT_KEY_${kv%_API_KEY}"
-done
+unset AK_VALUE TG_AGENT_GROQ_KEY TG_AGENT_KEY_TRANSCRIPT
+for pair in $KEY_SERVICES; do unset "$(key_var "${pair%%:*}")"; done
 if grep -q '^GROQ_API_KEY=' "$KEYS_FILE" 2>/dev/null; then VOICE_PROVIDER="groq"; fi
 
 export AGENT_NAME AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS \
@@ -438,8 +468,13 @@ fi
 echo
 echo "== Done. Agent '$AGENT_NAME' (@$BOT_USERNAME)"
 echo "  workspace:  $AGENT_HOME"
-echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
-echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
+if [ "$DO_SYSTEMD" = "1" ]; then
+  echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
+  echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
+else
+  echo "  start it:   '$AGENT_WS/bin/run-agent.sh'   (--no-systemd: no units were installed;"
+  echo "              keep it running in tmux or nohup; then: tmux attach -t $AGENT_NAME-agent)"
+fi
 echo "  add keys:   SECRETS_DIR='$SECRETS_DIR' AGENT_NAME='$AGENT_NAME' \\"
 echo "              '$AGENT_WS/kit/bin/agent-keys' add <service>   (list | setup; then restart the agent)"
 echo "  logins:     '$AGENT_WS/kit/bin/agent-login' google | github | vercel | status"

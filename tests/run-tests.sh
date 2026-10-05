@@ -460,6 +460,63 @@ check "invalid TG_AGENT_KEY_* fails the installer" keys_install_fails "$WORK/bad
 check "invalid key value never printed" bash -c "! grep -qF 'bad\$value' '$WORK/keysbad.log' && \
   grep -q 'TG_AGENT_KEY_CAL' '$WORK/keysbad.log'"
 
+# TG_AGENT_KEY_* is derived from the service id; the old TRANSCRIPT name stays an alias.
+keys_install "$WORK/trhome" "$WORK/keystr.log" TG_AGENT_KEY_TRANSCRIPTAPI=tr_test_1 \
+  TG_AGENT_KEY_GROQ=gsk_derived_1 || true
+check "TG_AGENT_KEY_TRANSCRIPTAPI lands as TRANSCRIPT_API_KEY" \
+  grep -qx 'TRANSCRIPT_API_KEY="tr_test_1"' "$WORK/trhome/.config/tg-agent/keysbot/keys.env"
+check "TG_AGENT_KEY_GROQ lands as GROQ_API_KEY" \
+  grep -qx 'GROQ_API_KEY="gsk_derived_1"' "$WORK/trhome/.config/tg-agent/keysbot/keys.env"
+keys_install "$WORK/tralias" "$WORK/keystr2.log" TG_AGENT_KEY_TRANSCRIPT=tr_alias_1 || true
+check "old TG_AGENT_KEY_TRANSCRIPT alias still accepted" \
+  grep -qx 'TRANSCRIPT_API_KEY="tr_alias_1"' "$WORK/tralias/.config/tg-agent/keysbot/keys.env"
+# A bad value is caught in preflight, before the existing workspace is moved aside.
+baks_before="$(ls -d "$KH"/agents/keysbot.bak_* "$KH"/.config/tg-agent/keysbot.bak_* 2>/dev/null | wc -l)"
+keys_install_fails "$KH" "$WORK/keysbad2.log" "TG_AGENT_KEY_CAL=$BAD_VALUE" || true
+check "bad key on a reinstall leaves the workspace and secrets in place" bash -c \
+  "[ -f '$KH/agents/keysbot/.claude/agent.conf' ] && [ -f '$KSEC/keys.env' ] && \
+   [ \"\$(ls -d '$KH'/agents/keysbot.bak_* '$KH'/.config/tg-agent/keysbot.bak_* 2>/dev/null | wc -l)\" = $baks_before ]"
+check "bad key on a reinstall is refused with its variable name" \
+  grep -q 'TG_AGENT_KEY_CAL' "$WORK/keysbad2.log"
+# An agent installed before keys.env kept the Groq key in channel.conf: carry it over.
+GH_OLD="$WORK/groqhome"
+keys_install "$GH_OLD" "$WORK/groq1.log" || true
+GSEC="$GH_OLD/.config/tg-agent/keysbot"
+printf 'GROQ_API_KEY="gsk_old_conf"\n' >> "$GSEC/channel.conf"
+keys_install "$GH_OLD" "$WORK/groq2.log" || true
+check "reinstall migrates GROQ_API_KEY from the old channel.conf into keys.env" \
+  grep -qx 'GROQ_API_KEY="gsk_old_conf"' "$GSEC/keys.env"
+check "migrated groq key enables voice" jq -e '.voice.provider == "groq"' \
+  "$GH_OLD/agents/keysbot/.claude/state/telegram/config.json"
+keys_install "$GH_OLD" "$WORK/groq3.log" TG_AGENT_KEY_GROQ=gsk_fresh_9 || true
+check "an explicit groq key beats the old channel.conf one" bash -c \
+  "grep -qx 'GROQ_API_KEY=\"gsk_fresh_9\"' '$GSEC/keys.env' && \
+   [ \"\$(grep -c '^GROQ_API_KEY=' '$GSEC/keys.env')\" = 1 ]"
+check "--no-systemd banner: no systemctl hint, manual start shown" bash -c \
+  "! grep -q 'systemctl status' '$WORK/keys1.log' && grep -q 'run-agent.sh' '$WORK/keys1.log'"
+check "banner prints add-keys with the SECRETS_DIR prefix" \
+  grep -q "SECRETS_DIR='$KSEC' AGENT_NAME='keysbot'" "$WORK/keys2.log"
+# run-agent's LAUNCH_CMD prefix, run for real: keys.env must reach the pane's environment.
+launch_prefix_env() {
+  local dir="$1" with_keys="$2"
+  mkdir -p "$dir"
+  printf 'AGENT_X=from_conf\n' > "$dir/agent.conf"; : > "$dir/channel.conf"
+  [ "$with_keys" = 1 ] && printf 'CAL_API_KEY="cal_behaviour_1"\n' > "$dir/keys.env"
+  bash -c "
+    keys_conf() { echo '$dir/keys.env'; }
+    TG_AGENT_CONF='$dir/agent.conf'; CHANNEL_CONF='$dir/channel.conf'
+    $(sed -n '/^KEYS_CONF=/,/^LAUNCH_CMD+=\"; set +a\"/p' "$KIT/server/bin/run-agent.sh")
+    env -i PATH=\"\$PATH\" bash -c \"\$LAUNCH_CMD; env\"" 
+}
+check "run-agent LAUNCH_CMD exports keys.env values" bash -c \
+  "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch1' 1 | grep -qx 'CAL_API_KEY=cal_behaviour_1'"
+check "run-agent LAUNCH_CMD still exports agent.conf" bash -c \
+  "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch2' 1 | grep -qx 'AGENT_X=from_conf'"
+check "run-agent LAUNCH_CMD works without keys.env" bash -c \
+  "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch3' 0 | grep -qx 'AGENT_X=from_conf'"
+check "installer puts ~/.local/bin on PATH before the login step" bash -c \
+  "awk '/export PATH=\"\\\$HOME\\/.local\\/bin:\\\$PATH\"/{p=NR} /Log in to \\\$svc now/{l=NR} END{exit !(p && l && p<l)}' '$KIT/install-server.sh'"
+
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
 if bash "$KIT/scripts/build-gbrain.sh" "$GB_BUILD" > "$WORK/gbrain-build.log" 2>&1; then
