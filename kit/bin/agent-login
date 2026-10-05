@@ -193,16 +193,23 @@ def login_google(client_secret: str | None) -> int:
     except subprocess.CalledProcessError as err:
         detail = (err.stderr or err.stdout or "").strip()[-300:]
         raise SystemExit(f"agent-login: gws-cli rejected the JSON file: {detail}") from None
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    previous_handler = signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        return _google_flow(gws)
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
+def _google_flow(gws: str) -> int:
+    """Run `gws-cli auth` and relay the pasted redirect; the child dies on any abort."""
     # PYTHONUNBUFFERED: gws-cli is Python; through a pipe it prints the URL only on exit.
     env = {**os.environ, "BROWSER": "false", "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen([gws, "auth"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, env=env)
-    url, seen = read_consent_url(proc)
-    if not url:
-        proc.kill()
-        raise SystemExit("agent-login: gws-cli printed no login URL:\n" + seen[-500:])
     try:
+        url, seen = read_consent_url(proc)
+        if not url:
+            raise SystemExit("agent-login: gws-cli printed no login URL:\n" + seen[-500:])
         print("\n1. Open this link on your computer and allow access:\n\n" + url)
         print("\n2. The browser ends on a page that does not load (localhost) -- expected.")
         print("   Copy the whole address from the browser bar and paste it here.\n")
@@ -221,7 +228,6 @@ def login_google(client_secret: str | None) -> int:
         try:
             proc.wait(timeout=FINISH_WAIT_S)
         except subprocess.TimeoutExpired:
-            proc.kill()
             raise SystemExit("agent-login: gws-cli did not finish; run again") from None
     except BaseException:
         if proc.poll() is None:

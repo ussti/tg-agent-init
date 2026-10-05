@@ -352,6 +352,28 @@ class LoginGoogleE2ETest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 2)
 
+    def test_gws_gone_after_failed_handoff_stops_with_message(self) -> None:
+        procs: list[subprocess.Popen] = []
+        real_popen = subprocess.Popen
+        real_hand = al.hand_code_to_listener
+
+        def spy_popen(*args: object, **kwargs: object) -> subprocess.Popen:
+            proc = real_popen(*args, **kwargs)
+            if args[0][1:] == ["auth"]:  # skip status / import-credentials runs
+                procs.append(proc)
+            return proc
+
+        def hand_then_die(port: int, query: str) -> None:
+            real_hand(port, "finish=1")  # fake gws-cli exits on any request
+            procs[0].wait(timeout=10)
+            raise al.HandoffError("listener gone")
+
+        with mock.patch.object(subprocess, "Popen", spy_popen), \
+                mock.patch.object(al, "hand_code_to_listener", hand_then_die):
+            with self.assertRaises(SystemExit) as ctx:
+                self._run([lambda: self._pasted()])
+        self.assertIn("already stopped", str(ctx.exception))
+
     def test_quoted_secret_path_is_accepted(self) -> None:
         queue = [f'"{self.secret}"', lambda: self._pasted()]
 
@@ -375,6 +397,82 @@ class LoginGoogleE2ETest(unittest.TestCase):
         self.assertEqual(self._run([]), 0)
         self.assertIn("already logged in", self.out.getvalue())
         self.assertFalse((self.home / "imported").exists())
+
+
+SILENT_GWS = """\
+#!{python}
+import os, pathlib, sys, time
+home = pathlib.Path(os.environ["HOME"])
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+if sys.argv[1:3] == ["auth", "import-credentials"]:
+    sys.exit(0)
+(home / "gws.pid").write_text(str(os.getpid()))
+time.sleep(60)
+"""
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+class SigtermDuringUrlWaitTest(unittest.TestCase):
+    def test_gws_cli_is_killed_when_agent_login_gets_sigterm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "home").mkdir()
+            (root / "bin").mkdir()
+            fake = root / "bin" / "gws-cli"
+            fake.write_text(SILENT_GWS.format(python=sys.executable))
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            secret = root / "c.json"
+            secret.write_text("{}")
+            env = {**os.environ, "HOME": str(root / "home"),
+                   "PATH": f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}"}
+            proc = subprocess.Popen([sys.executable, str(KIT / "bin" / "agent-login"), "google",
+                                     "--client-secret", str(secret)], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            gws_pid = 0
+            try:
+                pid_file = root / "home" / "gws.pid"
+                deadline = time.monotonic() + 10
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(pid_file.exists(), "fake gws-cli never started")
+                time.sleep(0.2)
+                gws_pid = int(pid_file.read_text())
+                proc.terminate()
+                proc.wait(timeout=10)
+                deadline = time.monotonic() + 5
+                while _pid_alive(gws_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(_pid_alive(gws_pid), "gws-cli survived SIGTERM")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                if gws_pid and _pid_alive(gws_pid):
+                    os.kill(gws_pid, 9)
+
+
+class SigtermHandlerRestoredTest(unittest.TestCase):
+    def test_previous_handler_is_restored(self) -> None:
+        import signal
+        marker = lambda *a: None  # noqa: E731
+        previous = signal.signal(signal.SIGTERM, marker)
+        try:
+            tests = LoginGoogleE2ETest("test_full_flow")
+            tests.setUp()
+            try:
+                tests.test_full_flow()
+            finally:
+                tests.doCleanups()
+            self.assertIs(signal.getsignal(signal.SIGTERM), marker)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 class SmallBehaviourTest(unittest.TestCase):
