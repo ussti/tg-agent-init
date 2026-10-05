@@ -17,7 +17,9 @@ warn() { echo "[kit] WARN: $*" >&2; }
 
 say "copying kit into $KIT"
 mkdir -p "$KIT"
-cp -R "$SRC_KIT"/. "$KIT/"
+if [ "$SRC_KIT" != "$KIT" ]; then  # re-run from the installed copy: nothing to copy
+  cp -R "$SRC_KIT"/. "$KIT/"
+fi
 rm -rf "$KIT/tests"
 find "$KIT/skills" "$KIT/bin" -name '*.sh' -exec chmod +x {} +
 chmod +x "$KIT"/bin/* 2>/dev/null || true
@@ -26,7 +28,15 @@ link_skills() {
   local cat skill kind
   while IFS=$'\t' read -r cat skill kind; do
     case "$cat" in ''|\#*) continue ;; esac
-    ln -sfn "../kit/skills/$cat/$skill" "$AGENT_WS/skills/$skill"
+    local dest="$AGENT_WS/skills/$skill"
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+      # a real folder from an older install: keep it outside skills/ (no duplicates for Claude)
+      local backup="$AGENT_WS/skills-replaced/$skill.$(date +%Y%m%d%H%M%S)"
+      mkdir -p "$AGENT_WS/skills-replaced"
+      say "moving existing $dest to $backup"
+      mv "$dest" "$backup"
+    fi
+    ln -sfn "../kit/skills/$cat/$skill" "$dest"
   done < "$KIT/manifest.tsv"
 }
 say "linking skills"

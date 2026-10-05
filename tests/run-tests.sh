@@ -172,7 +172,12 @@ check "skill links are relative and stay inside the workspace" bash -c \
    case \"\$(readlink -f \"\$l\")\" in '$WS'/*) ;; *) exit 1 ;; esac; done"
 check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
 check "deep-research and the old gws wrapper are gone" bash -c \
-  "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -r '$WS/skills/' 2>/dev/null"
+  "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
+check "re-running install-kit replaces a plain skill dir by a link and keeps the old one" bash -c "
+  rm '$WS/skills/quick-reminders' && mkdir '$WS/skills/quick-reminders' \
+  && KIT_SKIP_DEPS=1 bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
+  && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
 check "superpowers installed into the agent's config dir" bash -c \
   "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
      '$FAKE_CLAUDE_LOG' && \
