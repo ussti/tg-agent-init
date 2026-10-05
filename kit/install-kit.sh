@@ -67,8 +67,14 @@ try() {
 
 # Read the pinned repo/commit of the last30days skill into LAST30_REPO / LAST30_COMMIT.
 read_last30_pin() {
-  LAST30_REPO="$(sed -n 's/^repo=//p' "$KIT/skills/research/last30days/UPSTREAM")"
-  LAST30_COMMIT="$(sed -n 's/^commit=//p' "$KIT/skills/research/last30days/UPSTREAM")"
+  local file="$KIT/skills/research/last30days/UPSTREAM"
+  LAST30_REPO="" LAST30_COMMIT=""
+  if [ -r "$file" ]; then
+    LAST30_REPO="$(sed -n 's/^repo=//p' "$file" || true)"
+    LAST30_COMMIT="$(sed -n 's/^commit=//p' "$file" || true)"
+  else
+    warn "last30days: $file missing; the skill stays a stub"
+  fi
 }
 
 # True when dir is a checkout whose HEAD is exactly the pinned commit.
@@ -111,7 +117,7 @@ install_deps() {
   fi
 
   if command -v agent-browser > /dev/null; then
-    try agent-browser install || warn "agent-browser: Chrome download failed; later: agent-browser install (if Chrome lacks system libraries: sudo agent-browser install --with-deps)"
+    try agent-browser install || warn "agent-browser: Chrome download failed; later: agent-browser install (if Chrome lacks system libraries: sudo $LOCAL_PREFIX/bin/agent-browser install --with-deps)"
   fi
   if command -v crawl4ai-setup > /dev/null; then
     try crawl4ai-setup || warn "crawl4ai: browser setup failed; later: crawl4ai-setup"
@@ -121,18 +127,23 @@ install_deps() {
   read_last30_pin
   dest="$KIT/vendor/last30days"
   mkdir -p "$KIT/vendor"
-  if [ -d "$dest/.git" ]; then  # rerun: update the existing checkout instead of cloning
+  if [ -z "$LAST30_REPO" ] || [ -z "$LAST30_COMMIT" ]; then
+    warn "last30days: no pinned repo/commit in UPSTREAM; skipped"
+  elif [ -d "$dest/.git" ]; then  # rerun: update the existing checkout instead of cloning
     try git -C "$dest" fetch || warn "last30days: fetch failed (offline?); keeping the current checkout"
     try git -C "$dest" checkout "$LAST30_COMMIT" \
       || warn "last30days: checkout of $LAST30_COMMIT failed; later: git -C $dest checkout $LAST30_COMMIT"
   elif [ -e "$dest" ]; then
     warn "last30days: $dest exists but is not a git checkout; move it aside (mv '$dest' '$dest.old'), then rerun kit/install-kit.sh"
   else
-    tmp="$(mktemp -d "$KIT/vendor/.last30days.XXXXXX")"
+    tmp="$(mktemp -d "$KIT/vendor/.last30days.XXXXXX")" \
+      || { warn "last30days: cannot create a temp dir; later: rerun kit/install-kit.sh"; return 0; }
     if try git clone "$LAST30_REPO" "$tmp/src" && try git -C "$tmp/src" checkout "$LAST30_COMMIT" \
        && is_pinned_checkout "$tmp/src"; then
-      mv "$tmp/src" "$dest" && rmdir "$tmp"
+      mv "$tmp/src" "$dest" || warn "last30days: could not move the checkout into place"
     fi
+    # the installer owns this temp dir: drop whatever is left of the attempt
+    case "$tmp" in "$KIT/vendor/.last30days."*) rm -rf -- "$tmp" ;; esac
   fi
   if is_pinned_checkout "$dest"; then
     relink_last30days

@@ -80,7 +80,8 @@ EOF
   chmod +x "$WORK/bin/$tool"
 done
 # Fake git: clone leaves a checkout with the last30days SKILL.md; checkout records the
-# commit (FAKE_GIT_CHECKOUT_FAIL=1 makes it fail); rev-parse HEAD answers with it.
+# commit (FAKE_GIT_CHECKOUT_FAIL=1 makes it fail); rev-parse HEAD answers with it
+# (FAKE_GIT_HEAD overrides the answer).
 cat > "$WORK/bin/git" <<'EOF'
 #!/usr/bin/env bash
 echo "git $*" >> "${FAKE_TOOLS_LOG:-/dev/null}"
@@ -95,7 +96,7 @@ case "$1" in
   checkout)
     [ "${FAKE_GIT_CHECKOUT_FAIL:-0}" = 1 ] && exit 1
     echo "$2" > "$dir/.git/PINNED" ;;
-  rev-parse) cat "$dir/.git/PINNED" 2>/dev/null || echo 0000000 ;;
+  rev-parse) echo "${FAKE_GIT_HEAD:-$(cat "$dir/.git/PINNED" 2>/dev/null || echo 0000000)}" ;;
 esac
 exit 0
 EOF
@@ -278,6 +279,21 @@ check "unpinned last30days is never linked; a failed attempt does not block the 
   && [ ! -e \"\$W/ws/kit/vendor/last30days\" ] \
   && HOME='$WORK/pin-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
   && grep -q 'description: upstream' \"\$W/ws/skills/last30days/SKILL.md\""
+check "failed clone leaves no temp dir behind" bash -c "
+  ! ls -d \"$WORK/pin/ws/kit/vendor\"/.last30days.* >/dev/null 2>&1"
+check "checkout ok but HEAD is not the pin: stub stays, nothing linked to vendor" bash -c "
+  W='$WORK/pin2'; mkdir -p \"\$W/ws\" \
+  && FAKE_GIT_HEAD=deadbeef HOME='$WORK/pin2-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'Not installed yet' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && [ ! -e \"\$W/ws/kit/vendor/last30days\" ] \
+  && ! ls -d \"\$W/ws/kit/vendor\"/.last30days.* >/dev/null 2>&1"
+check "rerun over a vendor checkout that moved off the pin: link falls back to the stub" bash -c "
+  W='$WORK/pin3'; mkdir -p \"\$W/ws\" \
+  && HOME='$WORK/pin3-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'description: upstream' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && FAKE_GIT_HEAD=deadbeef HOME='$WORK/pin3-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >\"\$W/log\" 2>&1 \
+  && grep -q 'Not installed yet' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && grep -q 'WARN: last30days' \"\$W/log\""
 check "superpowers installed into the agent's config dir" bash -c \
   "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
      '$FAKE_CLAUDE_LOG' && \
