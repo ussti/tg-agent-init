@@ -74,7 +74,7 @@ def parse_redirect(raw: str, expected_port: int | None = None,
     params = urllib.parse.parse_qs(query)
     if "code" not in params:
         raise ValueError("no authorization code in the address (was access denied?)")
-    if expected_state and params.get("state", [expected_state]) != [expected_state]:
+    if expected_state and params.get("state") != [expected_state]:
         raise ValueError("this address is from another login attempt (wrong state)")
     return port, query
 
@@ -106,9 +106,20 @@ def ask(prompt: str) -> str:
         raise SystemExit("agent-login: cancelled") from None
 
 
+def find_tool(tool: str) -> str | None:
+    """Path of a CLI tool: PATH first, then ~/.local/bin (pipx and npm --prefix put it there)."""
+    found = shutil.which(tool)
+    if found:
+        return found
+    local = Path(os.path.expanduser("~")) / ".local" / "bin" / tool
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return None
+
+
 def need(tool: str, hint: str) -> str:
     """Path of a CLI tool or exit with an install hint."""
-    path = shutil.which(tool)
+    path = find_tool(tool)
     if not path:
         raise SystemExit(f"agent-login: {tool} not found. {hint}")
     return path
@@ -244,22 +255,33 @@ def login_github() -> int:
                            "--git-protocol", "https", "--web"]).returncode
 
 
+def vercel_command(subcommand: str) -> list[str] | None:
+    """Vercel CLI command: the installed binary, else the pinned npx fallback, else None."""
+    vercel = find_tool("vercel")
+    if vercel:
+        return [vercel, subcommand]
+    npx = find_tool("npx")
+    if npx:
+        return [npx, "--yes", f"vercel@{VERCEL_CLI_VERSION}", subcommand]
+    return None
+
+
 def login_vercel() -> int:
     """Vercel CLI login (device flow when there is no browser)."""
-    vercel = shutil.which("vercel")
-    if not vercel:
-        npx = need("npx", "Install Node.js first")
-        cmd = [npx, "--yes", f"vercel@{VERCEL_CLI_VERSION}", "login"]
-        return subprocess.run(cmd).returncode
-    return subprocess.run([vercel, "login"]).returncode
+    cmd = vercel_command("login")
+    if not cmd:
+        raise SystemExit("agent-login: npx not found. Install Node.js first")
+    return subprocess.run(cmd).returncode
 
 
 def show_status() -> int:
     """One line per login, never tokens."""
-    checks = {"google": ["gws-cli", "auth", "status"], "github": ["gh", "auth", "status"],
-              "vercel": ["vercel", "whoami"]}
+    gws, gh = find_tool("gws-cli"), find_tool("gh")
+    checks = {"google": [gws, "auth", "status"] if gws else None,
+              "github": [gh, "auth", "status"] if gh else None,
+              "vercel": vercel_command("whoami")}
     for name, cmd in checks.items():
-        ok = shutil.which(cmd[0]) and is_logged_in(cmd)
+        ok = bool(cmd) and is_logged_in(cmd)
         print(f"{name:7} {'logged in' if ok else '-'}")
     return 0
 

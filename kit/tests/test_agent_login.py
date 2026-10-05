@@ -187,8 +187,12 @@ class ParseRedirectStrictTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             al.parse_redirect("http://localhost:5000/?code=c&state=x", 5000, "y")
 
-    def test_state_missing_in_paste_is_tolerated(self) -> None:
-        self.assertEqual(al.parse_redirect("http://localhost:5000/?code=c", 5000, "y")[0], 5000)
+    def test_state_missing_in_paste_is_rejected_when_consent_url_had_one(self) -> None:
+        with self.assertRaises(ValueError):
+            al.parse_redirect("http://localhost:5000/?code=c", 5000, "y")
+
+    def test_state_missing_is_fine_when_consent_url_had_none(self) -> None:
+        self.assertEqual(al.parse_redirect("http://localhost:5000/?code=c", 5000, None)[0], 5000)
 
     def test_rejects_inner_whitespace_and_control_chars(self) -> None:
         for bad in ("http://localhost:5000/?code=a b", "http://localhost:5000/?code=a\nb",
@@ -508,7 +512,8 @@ class SmallBehaviourTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["/x/vercel", "login"])
 
     def test_gh_hint_has_no_sudo_and_points_to_install_page(self) -> None:
-        with mock.patch("shutil.which", return_value=None):
+        with mock.patch("shutil.which", return_value=None), \
+                mock.patch.dict(os.environ, {"HOME": tempfile.mkdtemp()}):
             with self.assertRaises(SystemExit) as ctx:
                 al.login_github()
         message = str(ctx.exception)
@@ -530,10 +535,59 @@ class InputTest(unittest.TestCase):
 
 class NeedTest(unittest.TestCase):
     def test_missing_tool_exits_with_hint(self) -> None:
-        with mock.patch("shutil.which", return_value=None):
+        with mock.patch("shutil.which", return_value=None), \
+                mock.patch.dict(os.environ, {"HOME": tempfile.mkdtemp()}):
             with self.assertRaises(SystemExit) as ctx:
                 al.need("gws-cli", "Install it")
         self.assertIn("Install it", str(ctx.exception))
+
+    def test_tool_in_local_bin_is_found_without_path(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        (home / ".local" / "bin").mkdir(parents=True)
+        fake = home / ".local" / "bin" / "gws-cli"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"HOME": str(home), "PATH": "/nonexistent"}):
+            self.assertEqual(al.need("gws-cli", "Install it"), str(fake))
+
+    def test_non_executable_in_local_bin_is_ignored(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "gws-cli").write_text("x")
+        with mock.patch.dict(os.environ, {"HOME": str(home), "PATH": "/nonexistent"}):
+            with self.assertRaises(SystemExit):
+                al.need("gws-cli", "Install it")
+
+    def test_agent_login_binary_finds_gws_cli_only_in_local_bin(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        (home / ".local" / "bin").mkdir(parents=True)
+        fake = home / ".local" / "bin" / "gws-cli"
+        fake.write_text("#!/bin/sh\n[ \"$1\" = auth ] && [ \"$2\" = status ] && exit 0\nexit 1\n")
+        fake.chmod(0o755)
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+        res = subprocess.run([sys.executable, str(KIT / "bin" / "agent-login"), "google"],
+                             capture_output=True, text=True, env=env, input="")
+        self.assertIn("already logged in", res.stdout)
+
+
+class StatusTest(unittest.TestCase):
+    def test_vercel_status_uses_pinned_npx_when_no_binary(self) -> None:
+        calls = []
+
+        def fake_logged_in(cmd):
+            calls.append(cmd)
+            return True
+
+        def fake_which(tool):
+            return None if tool in ("vercel", "gws-cli", "gh") else f"/x/{tool}"
+
+        with mock.patch("shutil.which", side_effect=fake_which), \
+                mock.patch.dict(os.environ, {"HOME": tempfile.mkdtemp()}), \
+                mock.patch.object(al, "is_logged_in", side_effect=fake_logged_in), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            al.show_status()
+        self.assertIn(["/x/npx", "--yes", f"vercel@{al.VERCEL_CLI_VERSION}", "whoami"], calls)
+        self.assertIn("vercel  logged in", out.getvalue())
 
 
 if __name__ == "__main__":

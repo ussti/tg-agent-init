@@ -339,6 +339,8 @@ KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_W
 find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
 
 # Optional logins (Google needs gws-cli from the kit install above). Interactive only.
+# pipx and npm --prefix put the tools in ~/.local/bin, often not on this shell's PATH yet.
+export PATH="$HOME/.local/bin:$PATH"
 if [ "$NONINTERACTIVE" != "1" ]; then
   say "logins -- optional, each can be done later"
   for svc in google github vercel; do
