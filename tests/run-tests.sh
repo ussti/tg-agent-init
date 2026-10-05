@@ -319,6 +319,12 @@ check "unpinned last30days is never linked; a failed attempt does not block the 
   && [ ! -e \"\$W/ws/kit/vendor/last30days\" ] \
   && HOME='$WORK/pin-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
   && grep -q 'description: upstream' \"\$W/ws/skills/last30days/SKILL.md\""
+check "install-kit without core/rules.md and tools/TOOLS.md warns and still succeeds" bash -c "
+  W='$WORK/norules'; mkdir -p \"\$W/ws\" \
+  && HOME='$WORK/norules-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" > \"\$W/log\" 2>&1 \
+  && grep -q 'no .*core/rules.md: web-tool rule skipped' \"\$W/log\" \
+  && grep -q 'no .*tools/TOOLS.md: kit tool map skipped' \"\$W/log\" \
+  && [ ! -e \"\$W/ws/core/rules.md\" ] && [ -L \"\$W/ws/skills/quick-reminders\" ]"
 check "failed clone leaves no temp dir behind" bash -c "
   ! ls -d \"$WORK/pin/ws/kit/vendor\"/.last30days.* >/dev/null 2>&1"
 check "checkout ok but HEAD is not the pin: stub stays, nothing linked to vendor" bash -c "
