@@ -148,6 +148,16 @@ class ValidateTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(ak.validate(self.svc(path), "good"), status)
 
+    def test_brave_422_is_invalid_but_other_services_422_is_not(self) -> None:
+        brave = next(s for s in ak.SERVICES if s.id == "brave")
+        stub = ak.Service("brave", brave.env, "t", "here", "GET", self.base + "/c422",
+                          brave.auth, reject=brave.reject)
+        self.assertEqual(ak.validate(stub, "good"), "invalid")
+        other = next(s for s in ak.SERVICES if s.id == "groq")
+        stub = ak.Service("groq", other.env, "t", "here", "GET", self.base + "/c422",
+                          other.auth, reject=other.reject)
+        self.assertEqual(ak.validate(stub, "good"), "ok")
+
     def test_credit_and_limit_notes(self) -> None:
         status, note = ak.check(self.svc("/c402"), "good")
         self.assertEqual(status, "ok")
@@ -204,6 +214,23 @@ class ValidateTest(unittest.TestCase):
     def test_unreachable_unverified(self) -> None:
         dead = ak.Service("t", "T_KEY", "test", "here", "GET", "http://127.0.0.1:9/x", "bearer")
         self.assertEqual(ak.validate(dead, "good", timeout=1.0), "unverified")
+
+
+class RestartHintTest(unittest.TestCase):
+    def test_no_sudo_hint_anywhere_and_none_during_install(self) -> None:
+        tmp = tempfile.mkdtemp()
+        import io
+        from unittest import mock
+        for env, expect_hint in (({"SECRETS_DIR": tmp}, True),
+                                 ({"AGENT_KEYS_FILE": tmp + "/keys.env"}, False)):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ak.getpass, "getpass", return_value=""), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                os.environ.pop("AGENT_KEYS_FILE" if "SECRETS_DIR" in env else "SECRETS_DIR", None)
+                ak.main(["add", "jina"])
+            text = out.getvalue()
+            self.assertNotIn("sudo", text)
+            self.assertEqual("Restart the agent" in text, expect_hint)
 
 
 class ListTest(unittest.TestCase):

@@ -49,6 +49,7 @@ class Service:
         auth: "bearer", "x-api-key" or "x-subscription-token".
         body: JSON body for POST checks.
         extra: extra headers.
+        reject: HTTP codes that mean the key is wrong (Brave answers 422).
     """
 
     id: str
@@ -60,6 +61,7 @@ class Service:
     auth: str = "bearer"
     body: str = ""
     extra: tuple[tuple[str, str], ...] = ()
+    reject: frozenset[int] = REJECT_CODES
 
 
 SERVICES: tuple[Service, ...] = (
@@ -77,7 +79,7 @@ SERVICES: tuple[Service, ...] = (
     Service("brave", "BRAVE_API_KEY", "web search for last30days (2,000 free / month)",
             "https://api.search.brave.com/app/keys", "GET",
             "https://api.search.brave.com/res/v1/web/search?q=test&count=1",
-            auth="x-subscription-token"),
+            auth="x-subscription-token", reject=frozenset({401, 403, 422})),
     Service("scrapecreators", "SCRAPECREATORS_API_KEY",
             "TikTok / Instagram / X for last30days (10,000 free calls)",
             "https://scrapecreators.com", "GET",
@@ -171,7 +173,7 @@ def check(service: Service, value: str, timeout: float = TIMEOUT_S) -> tuple[str
 
     Returns:
         (status, note): status is "ok" when the service recognised the key, "invalid"
-        on 401/403, "unverified" when it could not be checked (unreachable, 5xx,
+        on a rejected key (401/403, 422 for Brave), "unverified" when it could not be checked (unreachable, 5xx,
         redirect, no live check). The note says why when there is something to say.
     """
     if not service.method:
@@ -193,7 +195,7 @@ def check(service: Service, value: str, timeout: float = TIMEOUT_S) -> tuple[str
         with OPENER.open(request, timeout=timeout):
             return "ok", ""
     except urllib.error.HTTPError as err:
-        if err.code in REJECT_CODES:
+        if err.code in service.reject:
             return "invalid", "the service rejected this key"
         if 300 <= err.code < 400:
             return "unverified", f"the service redirected the request ({err.code})"
@@ -279,8 +281,10 @@ def main(argv: list[str] | None = None) -> int:
     except (EOFError, KeyboardInterrupt):
         print("\nstopped; keys entered so far are saved")
         return 130
-    unit = f"{os.environ.get('AGENT_NAME', '<agent>')}-agent.service"
-    print(f"\nRestart the agent to load new keys: sudo systemctl restart {unit}")
+    if not os.environ.get("AGENT_KEYS_FILE"):  # the installer sets it; no agent runs yet
+        session = f"{os.environ.get('AGENT_NAME', '<agent>')}-agent"
+        print(f"\nRestart the agent to load new keys: tmux kill-session -t {session}"
+              " (the service starts it again; with --no-systemd run bin/run-agent.sh)")
     return 0
 
 
