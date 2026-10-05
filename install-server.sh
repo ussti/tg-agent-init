@@ -99,17 +99,12 @@ if [ -z "$BOT_TOKEN" ] && [ "$NONINTERACTIVE" != "1" ]; then
 fi
 [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]] || die "bot token format is wrong"
 
-GROQ_KEY="${TG_AGENT_GROQ_KEY:-}"
-if [ -z "$GROQ_KEY" ] && [ "$NONINTERACTIVE" != "1" ]; then
-  read -r -s -p "Groq key for voice messages (optional, enter to skip): " GROQ_KEY || true
-  echo
-fi
 OAUTH="${TG_AGENT_CLAUDE_OAUTH:-}"
 if [ -z "$OAUTH" ] && [ "$NONINTERACTIVE" != "1" ]; then
   read -r -s -p "Claude long-lived token from 'claude setup-token' (optional, enter to skip): " OAUTH || true
   echo
 fi
-for v in BOT_TOKEN GROQ_KEY OAUTH; do check_plain "$v" "${!v}"; done
+for v in BOT_TOKEN OAUTH; do check_plain "$v" "${!v}"; done
 
 # ---------------------------------------------------------------- bot check
 if [ "${TG_AGENT_TEST_SKIP_GETME:-0}" = "1" ]; then
@@ -137,8 +132,7 @@ RUN_USER="$(id -un)"
 RUN_GROUP="$(id -gn)"
 USER_HOME="$HOME"
 WEBHOOK_TOKEN="$(openssl rand -hex 24)"
-VOICE_PROVIDER="none"
-[ -n "$GROQ_KEY" ] && VOICE_PROVIDER="groq"
+VOICE_PROVIDER="none"  # becomes "groq" in the keys step when a Groq key is known
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
 for d in "$AGENT_HOME" "$SECRETS_DIR"; do
@@ -147,6 +141,46 @@ for d in "$AGENT_HOME" "$SECRETS_DIR"; do
     mv "$d" "$d.bak_$STAMP"
   fi
 done
+
+# ---------------------------------------------------------------- keys (optional)
+# Skill keys live in $SECRETS_DIR/keys.env (mode 600), sourced by run-agent.sh. Unattended:
+# TG_AGENT_KEY_<SERVICE> (TG_AGENT_GROQ_KEY is the legacy name for Groq). Interactive: the
+# agent-keys walkthrough, hidden input, Enter skips. Runs before VOICE_PROVIDER is used.
+KEYS_FILE="$SECRETS_DIR/keys.env"
+( umask 077; mkdir -p "$SECRETS_DIR" )
+for kv in GROQ_API_KEY PERPLEXITY_API_KEY CAL_API_KEY BRAVE_API_KEY \
+          SCRAPECREATORS_API_KEY TRANSCRIPT_API_KEY JINA_API_KEY; do
+  envname="TG_AGENT_KEY_${kv%_API_KEY}"
+  if [ "$kv" = GROQ_API_KEY ] && [ -z "${!envname:-}" ] && [ -n "${TG_AGENT_GROQ_KEY:-}" ]; then
+    printf -v "$envname" '%s' "$TG_AGENT_GROQ_KEY"
+  fi
+  if [ -n "${!envname:-}" ]; then
+    # The value travels in the environment, never in argv (readable in /proc).
+    AK_NAME="$kv" AK_VALUE="${!envname}" AGENT_KEYS_FILE="$KEYS_FILE" \
+      python3 - "$KIT_DIR/kit/bin/agent-keys" <<'PY' || die "$envname: not a valid key"
+import importlib.machinery, importlib.util, os, sys
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("agent_keys", sys.argv[1])
+spec = importlib.util.spec_from_loader("agent_keys", loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules["agent_keys"] = module
+loader.exec_module(module)
+try:
+    module.save_key(Path(os.environ["AGENT_KEYS_FILE"]), os.environ["AK_NAME"],
+                    module.clean_value(os.environ["AK_VALUE"]))
+except ValueError as err:
+    sys.exit(f"{os.environ['AK_NAME']}: {err}")
+PY
+  fi
+done
+if [ "$NONINTERACTIVE" != "1" ]; then
+  say "keys for skills -- all optional, Enter skips, add later with agent-keys add <service>"
+  AGENT_KEYS_FILE="$KEYS_FILE" AGENT_NAME="$AGENT_NAME" \
+    python3 "$KIT_DIR/kit/bin/agent-keys" setup || true
+fi
+[ ! -f "$KEYS_FILE" ] || chmod 600 "$KEYS_FILE"
+if grep -q '^GROQ_API_KEY=' "$KEYS_FILE" 2>/dev/null; then VOICE_PROVIDER="groq"; fi
 
 export AGENT_NAME AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS \
   TIMEZONE LANGUAGE PRIMARY_MODEL OWNER_CHAT_ID AGENT_HOME AGENT_WS SECRETS_DIR \
@@ -218,9 +252,6 @@ say "writing secrets to $SECRETS_DIR (mode 600)"
   mkdir -p "$SECRETS_DIR"
   export BOT_TOKEN WEBHOOK_TOKEN
   render "$KIT_DIR/server/templates/channel.conf.template" "$SECRETS_DIR/channel.conf"
-  if [ -n "$GROQ_KEY" ]; then
-    printf 'GROQ_API_KEY="%s"\n' "$GROQ_KEY" >> "$SECRETS_DIR/channel.conf"
-  fi
   if [ -n "$OAUTH" ]; then
     printf 'CLAUDE_CODE_OAUTH_TOKEN="%s"\n' "$OAUTH" > "$SECRETS_DIR/claude-auth.conf"
   fi
@@ -381,4 +412,6 @@ echo "== Done. Agent '$AGENT_NAME' (@$BOT_USERNAME)"
 echo "  workspace:  $AGENT_HOME"
 echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
 echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
+echo "  add keys:   SECRETS_DIR='$SECRETS_DIR' AGENT_NAME='$AGENT_NAME' \\"
+echo "              '$AGENT_WS/kit/bin/agent-keys' add <service>   (list | setup; then restart the agent)"
 echo "  next:       write /onboard to the bot -- it asks about you and fills the profile"

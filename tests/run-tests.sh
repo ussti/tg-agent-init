@@ -51,6 +51,8 @@ find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || tr
 
 echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
+check "agent-keys unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_keys.py'
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.
@@ -110,7 +112,8 @@ OWNER=111222333
 PORT=18089
 DUMMY_TOKEN="987654321:$(printf 'x%.0s' $(seq 1 35))"
 if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
-   TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=testbot OWNER_CHAT_ID="$OWNER" \
+   TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" TG_AGENT_KEY_CAL=cal_test_123 TG_AGENT_GROQ_KEY=gsk_test_1 \
+   AGENT_NAME=testbot OWNER_CHAT_ID="$OWNER" \
    OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT="$PORT" BASE_DIR="$FAKE_HOME/agents" \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install.log" 2>&1; then
   ok "installer exits 0"
@@ -129,6 +132,20 @@ check "agent.conf sources in bash" \
   bash -c "set -a; . '$WS/agent.conf'; [ \"\$OPERATOR_NAME\" = 'Test Owner' ] && [ \"\$OWNER_CHAT_ID\" = $OWNER ]"
 check "secrets dir mode 700" test "$(stat -c %a "$SEC")" = 700
 check "channel.conf mode 600" test "$(stat -c %a "$SEC/channel.conf")" = 600
+check "keys.env mode 600 in the secrets dir" test "$(stat -c %a "$SEC/keys.env")" = 600
+check "key from env stored once" test "$(grep -c '^CAL_API_KEY=' "$SEC/keys.env")" = 1
+check "legacy TG_AGENT_GROQ_KEY lands in keys.env" grep -qx 'GROQ_API_KEY="gsk_test_1"' "$SEC/keys.env"
+check "keys never in the workspace" bash -c \
+  "! grep -rqE 'cal_test_123|gsk_test_1' '$FAKE_HOME/agents'"
+check "keys not duplicated into channel.conf" bash -c \
+  "! grep -qE 'cal_test_123|gsk_test_1|GROQ_API_KEY' '$SEC/channel.conf'"
+check "keys.env sources in bash with the exact values" bash -c \
+  "set -eu; . '$SEC/keys.env'; [ \"\$CAL_API_KEY\" = cal_test_123 ] && [ \"\$GROQ_API_KEY\" = gsk_test_1 ]"
+check "groq key from env enables voice (config.json)" jq -e '.voice.provider == "groq"' \
+  "$WS/state/telegram/config.json"
+check "run-agent sources keys.env when present" grep -q 'KEYS_CONF' "$WS/bin/run-agent.sh"
+check "lib.sh keys_conf points at keys.env" bash -c \
+  "export SECRETS_DIR=/x; . '$WS/bin/lib.sh'; [ \"\$(keys_conf)\" = /x/keys.env ]"
 check "bot token only in secrets dir" bash -c "! grep -rqF '$DUMMY_TOKEN' '$FAKE_HOME/agents'"
 check "config.json valid, all IDs = owner" jq -e \
   "[.allowed_user_ids[], .allowed_chat_ids[], .owner_chat_ids[], .permission_relay.allowed_user_ids[]] \
