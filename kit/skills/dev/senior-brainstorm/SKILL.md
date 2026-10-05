@@ -4,7 +4,8 @@ description: >
   Senior full-stack architect for educational SaaS platforms (Teachable/Thinkific/Kajabi level).
   Provides decision frameworks, stage-aware stack recommendations, architecture patterns,
   AI/LLM integration, agent-native design, security threat modeling, testing strategies,
-  and MCP integration guidance.
+  and MCP integration guidance. Use when the user asks how to build or architect an
+  educational platform, or which stack to choose.
   Triggers: /senior-brainstorm, "brainstorm", "architecture", "how to build",
   "stack selection", "tech choice", "architectural decision", "design this",
   "senior brainstorm", "platform stack".

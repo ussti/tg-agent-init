@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Cal.com CLI for the agent.
+
+Thin wrapper over Cal.com API v2. Reads the API key from the CAL_API_KEY
+environment variable (never echoes it).
+
+Usage:
+    cal me
+    cal calendars
+    cal events
+    cal event-create --title "Intro call" --slug intro --minutes 30
+    cal event-update --id 123 --buffer-after 15 --minimum-notice 720
+    cal schedule
+    cal schedule-set --days mon,tue,wed,thu,fri --start 10:00 --end 18:00
+    cal slots --event-id 123 --from 2026-09-22 --to 2026-09-26
+    cal bookings [--status upcoming|past|cancelled]
+    cal cancel --uid abc123 [--reason "..."]
+    cal reschedule --uid abc123 --start 2026-09-24T10:00:00Z
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+API_KEY_ENV: str = "CAL_API_KEY"
+API_BASE = "https://api.cal.com/v2"
+USER_AGENT = "agent-cal/1.0"
+TIMEOUT_S = 30
+
+# Cal.com pins behaviour per endpoint family via the cal-api-version header.
+VERSION_DEFAULT = "2024-08-13"
+VERSION_EVENT_TYPES = "2024-06-14"
+VERSION_SCHEDULES = "2024-06-11"
+VERSION_SLOTS = "2024-09-04"
+
+DAY_NAMES = {
+    "mon": "Monday",
+    "tue": "Tuesday",
+    "wed": "Wednesday",
+    "thu": "Thursday",
+    "fri": "Friday",
+    "sat": "Saturday",
+    "sun": "Sunday",
+}
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("cal")
+
+
+def load_api_key() -> str:
+    """Return the Cal.com API key from the environment.
+
+    Raises:
+        SystemExit: when the key is not set, with the command that adds it.
+    """
+    key = os.environ.get(API_KEY_ENV, "").strip()
+    if not key:
+        raise SystemExit("cal: CAL_API_KEY is not set. Add it: agent-keys add cal")
+    return key
+
+
+def request(
+    method: str,
+    path: str,
+    version: str = VERSION_DEFAULT,
+    params: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    """Call the Cal.com API and return the decoded ``data`` field.
+
+    Args:
+        method: HTTP verb.
+        path: Path below the API base, e.g. ``/event-types``.
+        version: Value for the ``cal-api-version`` header.
+        params: Optional query-string parameters.
+        payload: Optional JSON body.
+
+    Returns:
+        The ``data`` field of the response, or the whole body if absent.
+
+    Raises:
+        SystemExit: On any HTTP or transport error.
+    """
+    url = f"{API_BASE}{path}"
+    if params:
+        clean = {k: v for k, v in params.items() if v is not None}
+        url = f"{url}?{urllib.parse.urlencode(clean)}"
+    headers = {
+        "Authorization": f"Bearer {load_api_key()}",
+        "cal-api-version": version,
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+            parsed = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise SystemExit(f"HTTP {exc.code} on {method} {path}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"network error on {method} {path}: {exc.reason}") from exc
+    return parsed.get("data", parsed)
+
+
+def emit(data: Any) -> None:
+    """Print a result as indented JSON."""
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def cmd_me(_: argparse.Namespace) -> None:
+    """Show the account profile (name, timezone, default schedule)."""
+    emit(request("GET", "/me"))
+
+
+def cmd_calendars(_: argparse.Namespace) -> None:
+    """List connected calendars and which ones are checked for conflicts."""
+    data = request("GET", "/calendars", version=VERSION_EVENT_TYPES)
+    summary = []
+    for conn in data.get("connectedCalendars", []):
+        for cal in conn.get("calendars", []):
+            summary.append(
+                {
+                    "name": cal.get("name"),
+                    "integration": cal.get("integration"),
+                    "checked_for_conflicts": cal.get("isSelected"),
+                    "primary": cal.get("primary", False),
+                    "read_only": cal.get("readOnly"),
+                }
+            )
+    emit(summary)
+
+
+def cmd_events(_: argparse.Namespace) -> None:
+    """List event types with their booking links and limits."""
+    data = request("GET", "/event-types", version=VERSION_EVENT_TYPES)
+    emit(
+        [
+            {
+                "id": ev.get("id"),
+                "title": ev.get("title"),
+                "slug": ev.get("slug"),
+                "minutes": ev.get("lengthInMinutes"),
+                "hidden": ev.get("hidden"),
+                "locations": ev.get("locations"),
+                "minimum_notice_min": ev.get("minimumBookingNotice"),
+                "buffer_before_min": ev.get("beforeEventBuffer"),
+                "buffer_after_min": ev.get("afterEventBuffer"),
+            }
+            for ev in data
+        ]
+    )
+
+
+def build_location(location: str) -> dict[str, Any]:
+    """Build a Cal.com locations entry from a short flag value.
+
+    ``cal-video`` (and other integration slugs) map to
+    ``{"type": "integration", "integration": <slug>}`` -- the API rejects a
+    bare ``type`` of ``integrations:daily``, which was this CLI's old default.
+    """
+    if location in {"address", "link", "phone"}:
+        return {"type": location}
+    return {"type": "integration", "integration": location}
+
+
+def cmd_event_create(args: argparse.Namespace) -> None:
+    """Create an event type."""
+    payload: dict[str, Any] = {
+        "title": args.title,
+        "slug": args.slug,
+        "lengthInMinutes": args.minutes,
+        "locations": [build_location(args.location)],
+    }
+    if args.description:
+        payload["description"] = args.description
+    emit(request("POST", "/event-types", version=VERSION_EVENT_TYPES, payload=payload))
+
+
+def cmd_event_update(args: argparse.Namespace) -> None:
+    """Patch an existing event type (only the flags passed are changed)."""
+    payload: dict[str, Any] = {}
+    if args.title is not None:
+        payload["title"] = args.title
+    if args.minutes is not None:
+        payload["lengthInMinutes"] = args.minutes
+    if args.buffer_before is not None:
+        payload["beforeEventBuffer"] = args.buffer_before
+    if args.buffer_after is not None:
+        payload["afterEventBuffer"] = args.buffer_after
+    if args.minimum_notice is not None:
+        payload["minimumBookingNotice"] = args.minimum_notice
+    if args.description is not None:
+        payload["description"] = args.description
+    if args.calendar is not None:
+        payload["destinationCalendar"] = {
+            "integration": "google_calendar",
+            "externalId": args.calendar,
+        }
+    if args.location is not None:
+        payload["locations"] = [build_location(args.location)]
+    if not payload:
+        raise SystemExit("nothing to update — pass at least one field")
+    emit(
+        request(
+            "PATCH",
+            f"/event-types/{args.id}",
+            version=VERSION_EVENT_TYPES,
+            payload=payload,
+        )
+    )
+
+
+def cmd_schedule(_: argparse.Namespace) -> None:
+    """Show availability schedules."""
+    emit(request("GET", "/schedules", version=VERSION_SCHEDULES))
+
+
+def cmd_schedule_set(args: argparse.Namespace) -> None:
+    """Replace the working hours of a schedule."""
+    days = [DAY_NAMES[d.strip().lower()] for d in args.days.split(",")]
+    schedule_id = args.id
+    if schedule_id is None:
+        me = request("GET", "/me")
+        schedule_id = me.get("defaultScheduleId")
+        if schedule_id is None:
+            raise SystemExit("no default schedule — pass --id")
+    payload = {
+        "availability": [
+            {"days": days, "startTime": args.start, "endTime": args.end}
+        ]
+    }
+    if args.timezone:
+        payload["timeZone"] = args.timezone
+    emit(
+        request(
+            "PATCH",
+            f"/schedules/{schedule_id}",
+            version=VERSION_SCHEDULES,
+            payload=payload,
+        )
+    )
+
+
+def cmd_slots(args: argparse.Namespace) -> None:
+    """Show free slots for an event type over a date range."""
+    params = {
+        "eventTypeId": args.event_id,
+        "start": args.date_from,
+        "end": args.date_to,
+        "timeZone": args.timezone,
+    }
+    emit(request("GET", "/slots", version=VERSION_SLOTS, params=params))
+
+
+def cmd_bookings(args: argparse.Namespace) -> None:
+    """List bookings, newest first."""
+    data = request("GET", "/bookings", params={"status": args.status})
+    emit(
+        [
+            {
+                "uid": b.get("uid"),
+                "title": b.get("title"),
+                "start": b.get("start"),
+                "end": b.get("end"),
+                "status": b.get("status"),
+                "attendees": [a.get("email") for a in b.get("attendees", [])],
+                "meeting_url": b.get("meetingUrl"),
+            }
+            for b in data
+        ]
+    )
+
+
+def cmd_cancel(args: argparse.Namespace) -> None:
+    """Cancel a booking by uid."""
+    payload = {"cancellationReason": args.reason} if args.reason else {}
+    emit(request("POST", f"/bookings/{args.uid}/cancel", payload=payload))
+
+
+def cmd_reschedule(args: argparse.Namespace) -> None:
+    """Move a booking to a new start time (ISO 8601, UTC)."""
+    payload: dict[str, Any] = {"start": args.start}
+    if args.reason:
+        payload["reschedulingReason"] = args.reason
+    emit(request("POST", f"/bookings/{args.uid}/reschedule", payload=payload))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Assemble the CLI parser."""
+    parser = argparse.ArgumentParser(prog="cal", description="Cal.com CLI for the agent")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("me", help="account profile").set_defaults(func=cmd_me)
+    sub.add_parser("calendars", help="connected calendars").set_defaults(func=cmd_calendars)
+    sub.add_parser("events", help="event types").set_defaults(func=cmd_events)
+    sub.add_parser("schedule", help="availability schedules").set_defaults(func=cmd_schedule)
+
+    create = sub.add_parser("event-create", help="create an event type")
+    create.add_argument("--title", required=True)
+    create.add_argument("--slug", required=True)
+    create.add_argument("--minutes", type=int, required=True)
+    create.add_argument("--description")
+    create.add_argument("--location", default="cal-video", help="location type")
+    create.set_defaults(func=cmd_event_create)
+
+    update = sub.add_parser("event-update", help="patch an event type")
+    update.add_argument("--id", type=int, required=True)
+    update.add_argument("--title")
+    update.add_argument("--minutes", type=int)
+    update.add_argument("--buffer-before", type=int)
+    update.add_argument("--buffer-after", type=int)
+    update.add_argument("--minimum-notice", type=int, help="minutes")
+    update.add_argument("--location")
+    update.add_argument("--description")
+    update.add_argument("--calendar", help="destination Google Calendar id/email")
+    update.set_defaults(func=cmd_event_update)
+
+    sched = sub.add_parser("schedule-set", help="replace working hours")
+    sched.add_argument("--id", type=int, help="schedule id (default: account default)")
+    sched.add_argument("--days", required=True, help="mon,tue,wed,thu,fri")
+    sched.add_argument("--start", required=True, help="HH:MM")
+    sched.add_argument("--end", required=True, help="HH:MM")
+    sched.add_argument("--timezone")
+    sched.set_defaults(func=cmd_schedule_set)
+
+    slots = sub.add_parser("slots", help="free slots for an event type")
+    slots.add_argument("--event-id", type=int, required=True)
+    slots.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD")
+    slots.add_argument("--to", dest="date_to", required=True, help="YYYY-MM-DD")
+    slots.add_argument("--timezone", default="UTC", help="IANA timezone, e.g. Europe/Berlin")
+    slots.set_defaults(func=cmd_slots)
+
+    bookings = sub.add_parser("bookings", help="list bookings")
+    bookings.add_argument("--status", default="upcoming",
+                          choices=["upcoming", "past", "cancelled", "recurring"])
+    bookings.set_defaults(func=cmd_bookings)
+
+    cancel = sub.add_parser("cancel", help="cancel a booking")
+    cancel.add_argument("--uid", required=True)
+    cancel.add_argument("--reason")
+    cancel.set_defaults(func=cmd_cancel)
+
+    resched = sub.add_parser("reschedule", help="move a booking")
+    resched.add_argument("--uid", required=True)
+    resched.add_argument("--start", required=True, help="ISO 8601, e.g. 2026-09-24T10:00:00Z")
+    resched.add_argument("--reason")
+    resched.set_defaults(func=cmd_reschedule)
+
+    return parser
+
+
+def main() -> int:
+    """Entry point."""
+    args = build_parser().parse_args()
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

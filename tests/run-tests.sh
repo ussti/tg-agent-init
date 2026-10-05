@@ -182,6 +182,22 @@ check "learnings ENGINE resolves to the installed engine and its tests" bash -c 
 check "agent.conf defines AGENT_WS and run-agent exports it" bash -c \
   "grep -q '^AGENT_WS=' '$KIT/server/templates/agent.conf.template' && \
    grep -qE 'set -a; \. .\\\$TG_AGENT_CONF' '$KIT/server/bin/run-agent.sh'"
+check "every kit skill description says when to use it" bash -c '
+  for f in '"$KIT"'/kit/skills/*/*/SKILL.md; do
+    awk "/^---/{n++} n==1" "$f" | grep -qiE "use (it )?when|use for|когда" || { echo "$f"; exit 1; }
+  done'
+check "perplexity falls back to WebSearch without a key" \
+  grep -q "WebSearch" "$KIT/kit/skills/research/perplexity-research/SKILL.md"
+check "cal tool reads CAL_API_KEY from the environment" \
+  grep -q "CAL_API_KEY" "$KIT/kit/skills/office/cal/cal"
+check "cal tool compiles" python3 -m py_compile "$KIT/kit/skills/office/cal/cal"
+check "research and office skills linked" bash -c \
+  "for s in perplexity-research agent-browser crawl4ai last30days gws cal; do \
+   test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
+check "last30days UPSTREAM pins repo and commit" bash -c \
+  "grep -qx 'repo=https://github.com/mvanhorn/last30days-skill' '$KIT/kit/skills/research/last30days/UPSTREAM' && \
+   grep -qx 'commit=e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$KIT/kit/skills/research/last30days/UPSTREAM'"
+check "agent-browser config is valid JSON" jq -e .args "$KIT/kit/config/agent-browser.json"
 check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
 check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
