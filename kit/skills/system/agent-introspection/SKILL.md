@@ -22,7 +22,7 @@ description: Self-audit, code quality improvement through clarifying questions, 
 Перед началом работы задай себе:
 
 - Достаточно ли у меня контекста? Что я НЕ знаю?
-- Есть ли похожее решение в памяти? (`memory_search`)
+- Есть ли похожее решение в `core/LEARNINGS.md` или среди эпизодов (`$ENGINE score`, скилл learnings)?
 - Какие edge cases я могу упустить?
 - Что может сломаться у других агентов/серверов?
 
@@ -138,8 +138,8 @@ source: "фидбек user|self-review|тест"
 15. Что самое высокорычажное я мог бы сделать в ближайшие 24 часа?
 
 ### Действия после интроспекции:
-- Запиши уроки в memory backend: `# Record learning via your memory system
-- Прочитай предыдущие уроки: `# Retrieve learnings via your memory system`
+- Запиши уроки через скилл learnings (переменная ENGINE определена в нём): `echo '{...}' | $ENGINE capture`
+- Прочитай предыдущие уроки: `$ENGINE score` и `$ENGINE promoted`
 - Конкретные предложения -- отправь user
 - Что можно сделать без команды -- сделай (если безопасно и откатимо)
 

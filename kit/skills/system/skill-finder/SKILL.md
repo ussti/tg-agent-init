@@ -29,7 +29,7 @@ Every skill maps to a GitHub repo: `github.com/{owner}/{repo}`.
 
 ### Phase 1: Search
 
-1. Fetch `https://skills.sh/search?q={query}` via `web_fetch`.
+1. Fetch `https://skills.sh/search?q={query}` via `WebFetch`.
 2. If empty (JS-rendered content missing) -- fallback: fetch `https://skills.sh/` and grep leaderboard, or search GitHub: `site:github.com SKILL.md {query}`.
 3. In parallel, check `https://skills.sh/official` -- does an official skill from the technology maker exist? Official skills are strongly preferred.
 4. Collect up to 5 candidates. For each, note: owner/repo, skill name, short description.
