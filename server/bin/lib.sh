@@ -39,3 +39,5 @@ conf_value() {
 # channel_conf / auth_conf: paths of the two secret files for this agent.
 channel_conf() { printf '%s/channel.conf' "${SECRETS_DIR:?SECRETS_DIR unset}"; }
 auth_conf()    { printf '%s/claude-auth.conf' "${SECRETS_DIR:?SECRETS_DIR unset}"; }
+# keys_conf: optional skill keys written by agent-keys (may not exist).
+keys_conf()    { printf '%s/keys.env' "${SECRETS_DIR:?SECRETS_DIR unset}"; }

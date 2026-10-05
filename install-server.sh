@@ -19,8 +19,6 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIT_DIR
 readonly LIVE_TEST_TIMEOUT_S=240
 readonly PORT_WAIT_S=90
-readonly PLUGIN_MARKETPLACE_REPO="anthropics/claude-plugins-official"
-readonly DEFAULT_PLUGINS=("superpowers@claude-plugins-official")
 
 DO_SYSTEMD=1
 DO_CRON=1
@@ -101,17 +99,12 @@ if [ -z "$BOT_TOKEN" ] && [ "$NONINTERACTIVE" != "1" ]; then
 fi
 [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]] || die "bot token format is wrong"
 
-GROQ_KEY="${TG_AGENT_GROQ_KEY:-}"
-if [ -z "$GROQ_KEY" ] && [ "$NONINTERACTIVE" != "1" ]; then
-  read -r -s -p "Groq key for voice messages (optional, enter to skip): " GROQ_KEY || true
-  echo
-fi
 OAUTH="${TG_AGENT_CLAUDE_OAUTH:-}"
 if [ -z "$OAUTH" ] && [ "$NONINTERACTIVE" != "1" ]; then
   read -r -s -p "Claude long-lived token from 'claude setup-token' (optional, enter to skip): " OAUTH || true
   echo
 fi
-for v in BOT_TOKEN GROQ_KEY OAUTH; do check_plain "$v" "${!v}"; done
+for v in BOT_TOKEN OAUTH; do check_plain "$v" "${!v}"; done
 
 # ---------------------------------------------------------------- bot check
 if [ "${TG_AGENT_TEST_SKIP_GETME:-0}" = "1" ]; then
@@ -139,9 +132,51 @@ RUN_USER="$(id -un)"
 RUN_GROUP="$(id -gn)"
 USER_HOME="$HOME"
 WEBHOOK_TOKEN="$(openssl rand -hex 24)"
-VOICE_PROVIDER="none"
-[ -n "$GROQ_KEY" ] && VOICE_PROVIDER="groq"
+VOICE_PROVIDER="none"  # becomes "groq" in the keys step when a Groq key is known
 STAMP="$(date +%Y%m%d_%H%M%S)"
+
+# Skill keys: service id -> env name the skills read. The unattended variable is
+# TG_AGENT_KEY_<SERVICE ID upper-cased> (TG_AGENT_KEY_TRANSCRIPT is the old name for
+# transcriptapi, TG_AGENT_GROQ_KEY the old name for groq; both stay accepted).
+KEY_SERVICES="groq:GROQ_API_KEY perplexity:PERPLEXITY_API_KEY cal:CAL_API_KEY brave:BRAVE_API_KEY
+scrapecreators:SCRAPECREATORS_API_KEY transcriptapi:TRANSCRIPT_API_KEY jina:JINA_API_KEY"
+key_var() { printf 'TG_AGENT_KEY_%s' "$(tr '[:lower:]' '[:upper:]' <<<"$1")"; }
+# Fill the derived variable from an old alias when it is empty.
+for pair in $KEY_SERVICES; do
+  svc="${pair%%:*}"; envname="$(key_var "$svc")"
+  [ -z "${!envname:-}" ] || continue
+  case "$svc" in
+    groq) [ -z "${TG_AGENT_GROQ_KEY:-}" ] || printf -v "$envname" '%s' "$TG_AGENT_GROQ_KEY" ;;
+    transcriptapi) [ -z "${TG_AGENT_KEY_TRANSCRIPT:-}" ] \
+      || printf -v "$envname" '%s' "$TG_AGENT_KEY_TRANSCRIPT" ;;
+  esac
+done
+# Check every value now, before anything is moved aside: a typo must not cost a
+# working agent. The value travels in the environment, never in argv (readable in /proc).
+ak_py() {  # ak_py check|save ENVNAME KEYNAME FILE
+  AK_MODE="$1" AK_ENV="$2" AK_NAME="$3" AK_VALUE="${!2}" AGENT_KEYS_FILE="$4" \
+    python3 - "$KIT_DIR/kit/bin/agent-keys" <<'PY'
+import importlib.machinery, importlib.util, os, sys
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("agent_keys", sys.argv[1])
+spec = importlib.util.spec_from_loader("agent_keys", loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules["agent_keys"] = module
+loader.exec_module(module)
+try:
+    value = module.clean_value(os.environ["AK_VALUE"])
+    if os.environ["AK_MODE"] == "save":
+        module.save_key(Path(os.environ["AGENT_KEYS_FILE"]), os.environ["AK_NAME"], value)
+except ValueError as err:
+    sys.exit(f"{os.environ['AK_ENV']}: {err}")
+PY
+}
+for pair in $KEY_SERVICES; do
+  envname="$(key_var "${pair%%:*}")"
+  [ -z "${!envname:-}" ] || ak_py check "$envname" "${pair#*:}" /dev/null \
+    || die "$envname: not a valid key"
+done
 
 for d in "$AGENT_HOME" "$SECRETS_DIR"; do
   if [ -e "$d" ]; then
@@ -149,6 +184,46 @@ for d in "$AGENT_HOME" "$SECRETS_DIR"; do
     mv "$d" "$d.bak_$STAMP"
   fi
 done
+
+# ---------------------------------------------------------------- keys (optional)
+# Skill keys live in $SECRETS_DIR/keys.env (mode 600), sourced by run-agent.sh. Unattended:
+# TG_AGENT_KEY_<SERVICE> (TG_AGENT_GROQ_KEY is the legacy name for Groq). Interactive: the
+# agent-keys walkthrough, hidden input, Enter skips. Runs before VOICE_PROVIDER is used.
+KEYS_FILE="$SECRETS_DIR/keys.env"
+( umask 077; mkdir -p "$SECRETS_DIR" )
+# A re-install moved the old secrets dir to .bak_<stamp>: carry the keys over so keys added
+# later with agent-keys survive. TG_AGENT_KEY_* values below win per name.
+if [ -f "$SECRETS_DIR.bak_$STAMP/keys.env" ]; then
+  say "carrying keys.env over from $SECRETS_DIR.bak_$STAMP"
+  ( umask 077; cp "$SECRETS_DIR.bak_$STAMP/keys.env" "$KEYS_FILE" )
+  chmod 600 "$KEYS_FILE"
+fi
+# Pre-keys.env installs kept the Groq key in channel.conf: carry it over unless keys.env has one.
+OLD_CHANNEL_CONF="$SECRETS_DIR.bak_$STAMP/channel.conf"
+if [ -f "$OLD_CHANNEL_CONF" ] && ! grep -q '^GROQ_API_KEY=' "$KEYS_FILE" 2>/dev/null; then
+  old_groq="$(sed -n 's/^GROQ_API_KEY="\([A-Za-z0-9._:\/+=-]*\)"$/\1/p' "$OLD_CHANNEL_CONF" | head -1)"
+  if [ -n "$old_groq" ]; then
+    say "carrying the Groq key over from the old channel.conf into keys.env"
+    TG_AGENT_KEY_GROQ_OLD="$old_groq" ak_py save TG_AGENT_KEY_GROQ_OLD GROQ_API_KEY "$KEYS_FILE" \
+      || say "WARN: the old Groq key could not be carried over"
+  fi
+  unset old_groq TG_AGENT_KEY_GROQ_OLD
+fi
+for pair in $KEY_SERVICES; do
+  envname="$(key_var "${pair%%:*}")"
+  [ -z "${!envname:-}" ] || ak_py save "$envname" "${pair#*:}" "$KEYS_FILE" \
+    || die "$envname: not a valid key"
+done
+if [ "$NONINTERACTIVE" != "1" ]; then
+  say "keys for skills -- all optional, Enter skips, add later with agent-keys add <service>"
+  AGENT_KEYS_FILE="$KEYS_FILE" AGENT_NAME="$AGENT_NAME" \
+    python3 "$KIT_DIR/kit/bin/agent-keys" setup || true
+fi
+[ ! -f "$KEYS_FILE" ] || chmod 600 "$KEYS_FILE"
+# Keep the key values out of every later child process.
+unset AK_VALUE TG_AGENT_GROQ_KEY TG_AGENT_KEY_TRANSCRIPT
+for pair in $KEY_SERVICES; do unset "$(key_var "${pair%%:*}")"; done
+if grep -q '^GROQ_API_KEY=' "$KEYS_FILE" 2>/dev/null; then VOICE_PROVIDER="groq"; fi
 
 export AGENT_NAME AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS \
   TIMEZONE LANGUAGE PRIMARY_MODEL OWNER_CHAT_ID AGENT_HOME AGENT_WS SECRETS_DIR \
@@ -183,7 +258,7 @@ cp "$T/tools/TOOLS.md.template"         "$AGENT_WS/tools/TOOLS.md"
 : > "$AGENT_WS/core/learnings/episodes.jsonl"
 cp "$C"/hooks/* "$AGENT_WS/hooks/"
 cp "$C"/scripts/*.sh "$C"/scripts/*.mjs "$AGENT_WS/scripts/"
-cp -R "$C"/skills/. "$AGENT_WS/skills/"
+cp -R "$C"/skills/onboard "$AGENT_WS/skills/"
 python3 "$KIT_DIR/scripts/render-template.py" --tree "$AGENT_WS"
 
 # Russian-speaking agent: typography rule goes into Response format, after the defaults.
@@ -212,7 +287,6 @@ say "installing server scripts and hooks"
 cp "$KIT_DIR"/server/bin/* "$AGENT_WS/bin/"
 cp "$KIT_DIR"/server/hooks/* "$AGENT_WS/hooks/"
 chmod +x "$AGENT_WS"/bin/*.sh "$AGENT_WS"/hooks/*.sh "$AGENT_WS"/hooks/*.py "$AGENT_WS"/scripts/*.sh
-find "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
 render "$KIT_DIR/server/templates/agent.conf.template" "$AGENT_WS/agent.conf"
 
 say "writing secrets to $SECRETS_DIR (mode 600)"
@@ -221,9 +295,6 @@ say "writing secrets to $SECRETS_DIR (mode 600)"
   mkdir -p "$SECRETS_DIR"
   export BOT_TOKEN WEBHOOK_TOKEN
   render "$KIT_DIR/server/templates/channel.conf.template" "$SECRETS_DIR/channel.conf"
-  if [ -n "$GROQ_KEY" ]; then
-    printf 'GROQ_API_KEY="%s"\n' "$GROQ_KEY" >> "$SECRETS_DIR/channel.conf"
-  fi
   if [ -n "$OAUTH" ]; then
     printf 'CLAUDE_CODE_OAUTH_TOKEN="%s"\n' "$OAUTH" > "$SECRETS_DIR/claude-auth.conf"
   fi
@@ -291,20 +362,25 @@ for f in bash python typescript; do
   [ -f "$CLAUDE_CONFIG_DIR/rules/$f.md" ] || cp "$T/global-rules/$f.md" "$CLAUDE_CONFIG_DIR/rules/"
 done
 
-# Default plugins: rules.md makes superpowers mandatory, so it ships with the agent.
-# Both steps are idempotent and need no login; a failure (no network) only warns.
-say "installing default plugins: ${DEFAULT_PLUGINS[*]}"
-if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin marketplace add \
-     "$PLUGIN_MARKETPLACE_REPO" < /dev/null > /dev/null 2>&1; then
-  for p in "${DEFAULT_PLUGINS[@]}"; do
-    CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$CLAUDE_BIN" plugin install "$p" < /dev/null \
-      > /dev/null 2>&1 || say "WARN: could not install $p; later run:" \
-      "CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin install $p"
+# Default kit: skills by category, upstream tools, plugins (kit/README.md). Runs once the
+# config dir is prepared, because plugins install into it.
+export CLAUDE_BIN
+KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_WS" "$CLAUDE_CONFIG_DIR"
+find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
+
+# Optional logins (Google needs gws-cli from the kit install above). Interactive only.
+# pipx and npm --prefix put the tools in ~/.local/bin, often not on this shell's PATH yet.
+export PATH="$HOME/.local/bin:$PATH"
+if [ "$NONINTERACTIVE" != "1" ]; then
+  say "logins -- optional, each can be done later"
+  for svc in google github vercel; do
+    read -r -p "Log in to $svc now? [y/N] " yn || yn=n
+    case "$yn" in
+      y|Y) python3 "$KIT_DIR/kit/bin/agent-login" "$svc" \
+             || say "WARN: $svc login not finished; later: $AGENT_WS/kit/bin/agent-login $svc" ;;
+      *) say "later: $AGENT_WS/kit/bin/agent-login $svc" ;;
+    esac
   done
-else
-  say "WARN: marketplace $PLUGIN_MARKETPLACE_REPO unreachable; plugins not installed." \
-    "Later: CLAUDE_CONFIG_DIR=\"$CLAUDE_CONFIG_DIR\" claude plugin marketplace add" \
-    "$PLUGIN_MARKETPLACE_REPO, then claude plugin install ${DEFAULT_PLUGINS[*]}"
 fi
 
 if [ -z "$OAUTH" ] && [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
@@ -392,6 +468,14 @@ fi
 echo
 echo "== Done. Agent '$AGENT_NAME' (@$BOT_USERNAME)"
 echo "  workspace:  $AGENT_HOME"
-echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
-echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
+if [ "$DO_SYSTEMD" = "1" ]; then
+  echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
+  echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
+else
+  echo "  start it:   '$AGENT_WS/bin/run-agent.sh'   (--no-systemd: no units were installed;"
+  echo "              keep it running in tmux or nohup; then: tmux attach -t $AGENT_NAME-agent)"
+fi
+echo "  add keys:   SECRETS_DIR='$SECRETS_DIR' AGENT_NAME='$AGENT_NAME' \\"
+echo "              '$AGENT_WS/kit/bin/agent-keys' add <service>   (list | setup; then restart the agent)"
+echo "  logins:     '$AGENT_WS/kit/bin/agent-login' google | github | vercel | status"
 echo "  next:       write /onboard to the bot -- it asks about you and fills the profile"

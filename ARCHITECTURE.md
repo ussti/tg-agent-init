@@ -43,6 +43,18 @@ cron: auth-monitor, snapshot, cleanup-media, learnings-lint, memory rotation
 The Claude session runs in the plugin dir, so `~/agents/<name>/.claude/CLAUDE.md` loads
 as an ancestor and core hooks are called with `CLAUDE_PROJECT_DIR=<agent home>`.
 
+## Default kit (kit/)
+
+`kit/` holds the skills every agent gets (grouped by category, listed in
+`kit/manifest.tsv`), the helper programs `agent-keys` and `agent-login`, the web-tool
+routing rule and the tool map. It sits outside `core/` because `core/` is synced from the
+core source repo and overwritten by `scripts/sync-core.sh`; anything the kit appends to
+`core/rules.md` or `tools/TOOLS.md` is therefore added by `kit/install-kit.sh`, once, with
+a heading as the idempotency guard. The installer copies the kit to `$AGENT_WS/kit`, links
+each skill into `$AGENT_WS/skills/`, and installs pinned upstream tools and plugins;
+optional items only warn on failure. Keys go to `keys.env` in the secrets directory, never
+into the agent home. See `kit/README.md`.
+
 ## Configuration
 
 Plugin precedence: env > `state/telegram/config.json` > built-in defaults. Upstream

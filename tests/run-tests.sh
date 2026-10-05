@@ -38,6 +38,12 @@ trap cleanup EXIT
 
 echo "== 1. leak scan"
 check "leak-scan clean" bash "$KIT/scripts/leak-scan.sh"
+check "leak-scan flags an internal reference in docs/ and hides the value" bash -c "
+  W='$WORK/leakdocs'; mkdir -p \"\$W/docs\" \"\$W/scripts\" \
+  && cp '$KIT/scripts/leak-scan.sh' \"\$W/scripts/\" \
+  && echo 'copy ~/.claude-lab/x' > \"\$W/docs/a.md\" \
+  && ! out=\$(LEAK_ENTITIES_FILE=/nonexistent bash \"\$W/scripts/leak-scan.sh\" 2>&1) \
+  && echo \"\$out\" | grep -q 'docs/a.md:1' && ! echo \"\$out\" | grep -q 'claude-lab'"
 
 echo "== 2. syntax"
 while IFS= read -r f; do
@@ -51,6 +57,12 @@ find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || tr
 
 echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
+check "agent-keys unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_keys.py'
+check "agent-login unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_login.py'
+check "kit skills unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_kit_skills.py'
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.
@@ -67,13 +79,51 @@ chmod +x "$WORK/claudebin/claude"
 export PATH="$WORK/claudebin:$PATH"
 export FAKE_CLAUDE_LOG="$WORK/claude.log"
 : > "$FAKE_CLAUDE_LOG"
+# Fake upstream tools: log every call, no network. FAKE_TOOLS_FAIL=1 makes them fail
+# (offline). A fake `git clone` leaves a checkout with the last30days SKILL.md.
+mkdir -p "$WORK/bin"
+for tool in npm pipx agent-browser crawl4ai-setup; do
+  cat > "$WORK/bin/$tool" <<EOF
+#!/usr/bin/env bash
+echo "$tool \$*" >> "\${FAKE_TOOLS_LOG:-/dev/null}"
+[ "\${FAKE_TOOLS_FAIL:-0}" = 1 ] && exit 1
+exit 0
+EOF
+  chmod +x "$WORK/bin/$tool"
+done
+# Fake git: clone leaves a checkout with the last30days SKILL.md; checkout records the
+# commit (FAKE_GIT_CHECKOUT_FAIL=1 makes it fail); rev-parse HEAD answers with it
+# (FAKE_GIT_HEAD overrides the answer).
+cat > "$WORK/bin/git" <<'EOF'
+#!/usr/bin/env bash
+echo "git $*" >> "${FAKE_TOOLS_LOG:-/dev/null}"
+[ "${FAKE_TOOLS_FAIL:-0}" = 1 ] && exit 1
+dir=""
+if [ "$1" = -C ]; then dir="$2"; shift 2; fi
+case "$1" in
+  clone)
+    d="${@: -1}"; mkdir -p "$d/.git" "$d/skills/last30days"
+    printf -- '---\nname: last30days\ndescription: upstream. Use when testing.\n---\n' \
+      > "$d/skills/last30days/SKILL.md" ;;
+  checkout)
+    [ "${FAKE_GIT_CHECKOUT_FAIL:-0}" = 1 ] && exit 1
+    echo "$2" > "$dir/.git/PINNED" ;;
+  rev-parse) echo "${FAKE_GIT_HEAD:-$(cat "$dir/.git/PINNED" 2>/dev/null || echo 0000000)}" ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/git"
+export PATH="$WORK/bin:$PATH"
+export FAKE_TOOLS_LOG="$WORK/tools.log"
+: > "$FAKE_TOOLS_LOG"
 FAKE_HOME="$WORK/home"
 mkdir -p "$FAKE_HOME"
 OWNER=111222333
 PORT=18089
 DUMMY_TOKEN="987654321:$(printf 'x%.0s' $(seq 1 35))"
 if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
-   TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=testbot OWNER_CHAT_ID="$OWNER" \
+   TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" TG_AGENT_KEY_CAL=cal_test_123 TG_AGENT_GROQ_KEY=gsk_test_1 \
+   AGENT_NAME=testbot OWNER_CHAT_ID="$OWNER" \
    OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT="$PORT" BASE_DIR="$FAKE_HOME/agents" \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install.log" 2>&1; then
   ok "installer exits 0"
@@ -92,6 +142,20 @@ check "agent.conf sources in bash" \
   bash -c "set -a; . '$WS/agent.conf'; [ \"\$OPERATOR_NAME\" = 'Test Owner' ] && [ \"\$OWNER_CHAT_ID\" = $OWNER ]"
 check "secrets dir mode 700" test "$(stat -c %a "$SEC")" = 700
 check "channel.conf mode 600" test "$(stat -c %a "$SEC/channel.conf")" = 600
+check "keys.env mode 600 in the secrets dir" test "$(stat -c %a "$SEC/keys.env")" = 600
+check "key from env stored once" test "$(grep -c '^CAL_API_KEY=' "$SEC/keys.env")" = 1
+check "legacy TG_AGENT_GROQ_KEY lands in keys.env" grep -qx 'GROQ_API_KEY="gsk_test_1"' "$SEC/keys.env"
+check "keys never in the workspace" bash -c \
+  "! grep -rqE 'cal_test_123|gsk_test_1' '$FAKE_HOME/agents'"
+check "keys not duplicated into channel.conf" bash -c \
+  "! grep -qE 'cal_test_123|gsk_test_1|GROQ_API_KEY' '$SEC/channel.conf'"
+check "keys.env sources in bash with the exact values" bash -c \
+  "set -eu; . '$SEC/keys.env'; [ \"\$CAL_API_KEY\" = cal_test_123 ] && [ \"\$GROQ_API_KEY\" = gsk_test_1 ]"
+check "groq key from env enables voice (config.json)" jq -e '.voice.provider == "groq"' \
+  "$WS/state/telegram/config.json"
+check "run-agent sources keys.env when present" grep -q 'KEYS_CONF' "$WS/bin/run-agent.sh"
+check "lib.sh keys_conf points at keys.env" bash -c \
+  "export SECRETS_DIR=/x; . '$WS/bin/lib.sh'; [ \"\$(keys_conf)\" = /x/keys.env ]"
 check "bot token only in secrets dir" bash -c "! grep -rqF '$DUMMY_TOKEN' '$FAKE_HOME/agents'"
 check "config.json valid, all IDs = owner" jq -e \
   "[.allowed_user_ids[], .allowed_chat_ids[], .owner_chat_ids[], .permission_relay.allowed_user_ids[]] \
@@ -138,6 +202,25 @@ check "secrets deny rules: Read and Edit, no redundant Write" jq -e --arg s "$SE
   '.permissions.deny | (index("Read(\($s)/**)") != null) and (index("Edit(\($s)/**)") != null)
    and (index("Write(\($s)/**)") == null)' "$PLUGIN/.claude/settings.json"
 check "channel rule appended to rules.md" grep -q "## Telegram channel" "$WS/core/rules.md"
+check "web-tool routing table in rules.md" bash -c \
+  "grep -q '## Which internet tool' '$WS/core/rules.md' && \
+   test \$(grep -cE '^\\| .* \\| (WebSearch|WebFetch|crawl4ai|agent-browser|perplexity-research|last30days)' '$WS/core/rules.md') -ge 6"
+check "web-tool rule not duplicated on re-run" bash -c \
+  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+   && test \$(grep -c '## Which internet tool' '$WS/core/rules.md') = 1"
+check "TOOLS.md kit table has a row for every kit skill" bash -c \
+  "grep -v '^#' '$WS/kit/manifest.tsv' | grep -v '^\$' | cut -f2 | \
+   while read -r s; do sed -n '/^## Default kit/,\$p' '$WS/tools/TOOLS.md' | \
+     grep -q \"^| \$s |\" || { echo \$s; exit 1; }; done"
+check "TOOLS.md has no deep-research row, kit supersedes the base table" bash -c \
+  "! grep -q '^| deep-research |' '$WS/tools/TOOLS.md' && \
+   grep -q 'supersedes the .Skills installed. table' '$WS/tools/TOOLS.md'"
+check "TOOLS.md has the later commands" bash -c \
+  "grep -q 'agent-keys add' '$WS/tools/TOOLS.md' && grep -q 'agent-login' '$WS/tools/TOOLS.md'"
+check "kit table not duplicated in TOOLS.md on re-run" bash -c \
+  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+   && test \$(grep -c '^## Default kit' '$WS/tools/TOOLS.md') = 1 \
+   && ! grep -q '^| deep-research |' '$WS/tools/TOOLS.md'"
 check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
   grep -q '^- Living syntax: ' '$WS/core/rules.md' && \
   grep -q '^- Numbers and facts only with a source' '$WS/core/rules.md'"
@@ -158,6 +241,111 @@ check "style defaults prefilled in USER.md" bash -c \
 check "channel line filled by the installer" \
   grep -qx -- '- Telegram, text and voice -- primary' "$WS/core/USER.md"
 check "keys folder filled by the installer" grep -qx -- "- Keys folder: $SEC" "$WS/tools/TOOLS.md"
+check "kit copied into the workspace" test -f "$WS/kit/manifest.tsv"
+check "every manifest skill is a symlink that resolves to SKILL.md" bash -c '
+  while IFS=$'"'"'\t'"'"' read -r cat skill kind; do
+    case "$cat" in ""|\#*) continue ;; esac
+    [ -L "'"$WS"'/skills/$skill" ] || { echo "not a link: $skill"; exit 1; }
+    [ "$kind" = upstream ] && continue
+    [ -f "'"$WS"'/skills/$skill/SKILL.md" ] || { echo "no SKILL.md: $skill"; exit 1; }
+  done < "'"$WS"'/kit/manifest.tsv"'
+check "skill links are relative and stay inside the workspace" bash -c \
+  "for l in '$WS'/skills/*; do [ -L \"\$l\" ] || continue; t=\$(readlink \"\$l\"); \
+   case \"\$t\" in /*) exit 1 ;; esac; \
+   case \"\$(readlink -f \"\$l\")\" in '$WS'/*) ;; *) exit 1 ;; esac; done"
+check "kit has no template placeholders" bash -c "! grep -rn '{{[A-Z_]*}}' '$KIT/kit'"
+check "kit skills carry no fleet paths" bash -c \
+  "! grep -rnE 'claude-lab|shared/secrets' '$KIT/kit/skills'"
+check "system and dev skills linked" bash -c \
+  "for s in skill-finder agent-introspection learnings senior-brainstorm; do \
+   test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
+check "learnings ENGINE resolves to the installed engine and its tests" bash -c \
+  "AGENT_WS='$WS' bash -c \"\$(grep -m1 '^ENGINE=' '$WS/skills/learnings/SKILL.md'); \
+   test -f \\\"\\\$ENGINE\\\" && test -f \\\"\\\${ENGINE%.mjs}.test.mjs\\\"\""
+check "agent.conf defines AGENT_WS and run-agent exports it" bash -c \
+  "grep -q '^AGENT_WS=' '$KIT/server/templates/agent.conf.template' && \
+   grep -qE 'set -a; \. .\\\$TG_AGENT_CONF' '$KIT/server/bin/run-agent.sh'"
+check "every kit skill description says when to use it" bash -c '
+  for f in '"$KIT"'/kit/skills/*/*/SKILL.md; do
+    awk "/^---/{n++} n==1" "$f" | grep -qiE "use (it )?when|use for|когда" || { echo "$f"; exit 1; }
+  done'
+check "perplexity falls back to WebSearch without a key" \
+  grep -q "WebSearch" "$KIT/kit/skills/research/perplexity-research/SKILL.md"
+check "cal tool reads CAL_API_KEY from the environment" \
+  grep -q "CAL_API_KEY" "$KIT/kit/skills/office/cal/cal"
+check "cal tool parses (no bytecode written)" \
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$KIT/kit/skills/office/cal/cal"
+check "research and office skills linked" bash -c \
+  "for s in perplexity-research agent-browser crawl4ai last30days gws cal; do \
+   test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
+check "last30days UPSTREAM pins repo and commit" bash -c \
+  "grep -qx 'repo=https://github.com/mvanhorn/last30days-skill' '$KIT/kit/skills/research/last30days/UPSTREAM' && \
+   grep -qx 'commit=e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$KIT/kit/skills/research/last30days/UPSTREAM'"
+check "agent-browser config has the exact values" jq -e \
+  '(.args | contains("--no-sandbox")) and .contentBoundaries == true
+   and .maxOutput == 50000 and .idleTimeout == "15m"' "$KIT/kit/config/agent-browser.json"
+check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
+check "deep-research and the old gws wrapper are gone" bash -c \
+  "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
+check "re-running install-kit replaces a plain skill dir by a link and keeps the old one" bash -c "
+  rm '$WS/skills/quick-reminders' && mkdir '$WS/skills/quick-reminders' \
+  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
+  && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
+check "agent-browser from npm, pinned, no root" \
+  grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@0.38.2" "$FAKE_TOOLS_LOG"
+check "python tools from pipx, pinned" bash -c "grep -q 'pipx install --force gws-cli==1.5.0' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install --force crawl4ai==0.9.4' '$FAKE_TOOLS_LOG' && grep -q 'pipx install --force yt-dlp' '$FAKE_TOOLS_LOG'"
+check "last30days cloned at the pinned commit and linked" bash -c \
+  "grep -q 'git clone https://github.com/mvanhorn/last30days-skill' '$FAKE_TOOLS_LOG' && \
+   grep -q 'checkout e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$FAKE_TOOLS_LOG' && \
+   grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+check "browser setup steps run after install" bash -c \
+  "grep -qx 'agent-browser install' '$FAKE_TOOLS_LOG' && grep -qx 'crawl4ai-setup ' '$FAKE_TOOLS_LOG'"
+check "agent-browser safety config installed" \
+  jq -e '.contentBoundaries == true and .maxOutput == 50000' "$FAKE_HOME/.agent-browser/config.json"
+check "kit plugins installed into the agent's config dir" bash -c \
+  "for p in superpowers@claude-plugins-official document-skills@anthropic-agent-skills \
+   vercel@claude-plugins-official; do grep -q \"plugin install \$p\" '$FAKE_CLAUDE_LOG' || exit 1; done; \
+   grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
+check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
+  n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
+  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && [ \"\$(grep -c 'git clone' '$FAKE_TOOLS_LOG')\" = \"\$n\" ] \
+  && grep -q ' fetch' '$FAKE_TOOLS_LOG' \
+  && grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+check "existing agent-browser config is preserved on rerun" bash -c "
+  echo '{\"marker\":1}' > '$FAKE_HOME/.agent-browser/config.json' \
+  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && jq -e '.marker == 1 and (has(\"maxOutput\") | not)' '$FAKE_HOME/.agent-browser/config.json'"
+check "unpinned last30days is never linked; a failed attempt does not block the rerun" bash -c "
+  W='$WORK/pin'; mkdir -p \"\$W/ws\" \
+  && FAKE_GIT_CHECKOUT_FAIL=1 HOME='$WORK/pin-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'Not installed yet' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && [ ! -e \"\$W/ws/kit/vendor/last30days\" ] \
+  && HOME='$WORK/pin-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'description: upstream' \"\$W/ws/skills/last30days/SKILL.md\""
+check "install-kit without core/rules.md and tools/TOOLS.md warns and still succeeds" bash -c "
+  W='$WORK/norules'; mkdir -p \"\$W/ws\" \
+  && HOME='$WORK/norules-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" > \"\$W/log\" 2>&1 \
+  && grep -q 'no .*core/rules.md: web-tool rule skipped' \"\$W/log\" \
+  && grep -q 'no .*tools/TOOLS.md: kit tool map skipped' \"\$W/log\" \
+  && [ ! -e \"\$W/ws/core/rules.md\" ] && [ -L \"\$W/ws/skills/quick-reminders\" ]"
+check "failed clone leaves no temp dir behind" bash -c "
+  ! ls -d \"$WORK/pin/ws/kit/vendor\"/.last30days.* >/dev/null 2>&1"
+check "checkout ok but HEAD is not the pin: stub stays, nothing linked to vendor" bash -c "
+  W='$WORK/pin2'; mkdir -p \"\$W/ws\" \
+  && FAKE_GIT_HEAD=deadbeef HOME='$WORK/pin2-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'Not installed yet' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && [ ! -e \"\$W/ws/kit/vendor/last30days\" ] \
+  && ! ls -d \"\$W/ws/kit/vendor\"/.last30days.* >/dev/null 2>&1"
+check "rerun over a vendor checkout that moved off the pin: link falls back to the stub" bash -c "
+  W='$WORK/pin3'; mkdir -p \"\$W/ws\" \
+  && HOME='$WORK/pin3-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >/dev/null 2>&1 \
+  && grep -q 'description: upstream' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && FAKE_GIT_HEAD=deadbeef HOME='$WORK/pin3-home' bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" >\"\$W/log\" 2>&1 \
+  && grep -q 'Not installed yet' \"\$W/ws/skills/last30days/SKILL.md\" \
+  && grep -q 'WARN: last30days' \"\$W/log\""
 check "superpowers installed into the agent's config dir" bash -c \
   "grep -qx '$FAKE_HOME/.claude-agent-testbot plugin marketplace add anthropics/claude-plugins-official' \
      '$FAKE_CLAUDE_LOG' && \
@@ -256,6 +444,93 @@ else
     grep -qF "$SUDO_UNITS/sudobot-agent.service" "$WORK/install-sudo.log"
 fi
 
+echo "== 4c. keys: re-install, invalid and empty values"
+# keys_install HOME LOG [VAR=value ...]: installer run into HOME with the extra env.
+keys_install() {
+  local home="$1" log="$2"; shift 2
+  mkdir -p "$home"
+  env "$@" HOME="$home" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 \
+    TG_AGENT_TEST_SKIP_BUN=1 TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=keysbot \
+    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18091 \
+    BASE_DIR="$home/agents" \
+    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$log" 2>&1
+}
+KH="$WORK/keyshome"
+check "keys install: first run" keys_install "$KH" "$WORK/keys1.log" \
+  TG_AGENT_KEY_CAL=cal_test_123 TG_AGENT_KEY_BRAVE=brave_test_1
+check "keys install: re-run with a new brave value and an empty jina" keys_install "$KH" \
+  "$WORK/keys2.log" TG_AGENT_KEY_BRAVE=brave_new_2 TG_AGENT_KEY_JINA=
+KSEC="$KH/.config/tg-agent/keysbot"
+check "re-install keeps the earlier key, one line per name" bash -c \
+  "[ \"\$(grep -c '^CAL_API_KEY=' '$KSEC/keys.env')\" = 1 ] && grep -qx 'CAL_API_KEY=\"cal_test_123\"' '$KSEC/keys.env'"
+check "re-install: env value wins per name, once" bash -c \
+  "[ \"\$(grep -c '^BRAVE_API_KEY=' '$KSEC/keys.env')\" = 1 ] && grep -qx 'BRAVE_API_KEY=\"brave_new_2\"' '$KSEC/keys.env'"
+check "re-install: keys.env mode 600" test "$(stat -c %a "$KSEC/keys.env")" = 600
+check "empty TG_AGENT_KEY_* is skipped" bash -c "! grep -q '^JINA_API_KEY' '$KSEC/keys.env'"
+BAD_VALUE='bad$value'
+keys_install_fails() { ! keys_install "$@"; }
+check "invalid TG_AGENT_KEY_* fails the installer" keys_install_fails "$WORK/badhome" \
+  "$WORK/keysbad.log" "TG_AGENT_KEY_CAL=$BAD_VALUE"
+check "invalid key value never printed" bash -c "! grep -qF 'bad\$value' '$WORK/keysbad.log' && \
+  grep -q 'TG_AGENT_KEY_CAL' '$WORK/keysbad.log'"
+
+# TG_AGENT_KEY_* is derived from the service id; the old TRANSCRIPT name stays an alias.
+keys_install "$WORK/trhome" "$WORK/keystr.log" TG_AGENT_KEY_TRANSCRIPTAPI=tr_test_1 \
+  TG_AGENT_KEY_GROQ=gsk_derived_1 || true
+check "TG_AGENT_KEY_TRANSCRIPTAPI lands as TRANSCRIPT_API_KEY" \
+  grep -qx 'TRANSCRIPT_API_KEY="tr_test_1"' "$WORK/trhome/.config/tg-agent/keysbot/keys.env"
+check "TG_AGENT_KEY_GROQ lands as GROQ_API_KEY" \
+  grep -qx 'GROQ_API_KEY="gsk_derived_1"' "$WORK/trhome/.config/tg-agent/keysbot/keys.env"
+keys_install "$WORK/tralias" "$WORK/keystr2.log" TG_AGENT_KEY_TRANSCRIPT=tr_alias_1 || true
+check "old TG_AGENT_KEY_TRANSCRIPT alias still accepted" \
+  grep -qx 'TRANSCRIPT_API_KEY="tr_alias_1"' "$WORK/tralias/.config/tg-agent/keysbot/keys.env"
+# A bad value is caught in preflight, before the existing workspace is moved aside.
+baks_before="$(ls -d "$KH"/agents/keysbot.bak_* "$KH"/.config/tg-agent/keysbot.bak_* 2>/dev/null | wc -l)"
+keys_install_fails "$KH" "$WORK/keysbad2.log" "TG_AGENT_KEY_CAL=$BAD_VALUE" || true
+check "bad key on a reinstall leaves the workspace and secrets in place" bash -c \
+  "[ -f '$KH/agents/keysbot/.claude/agent.conf' ] && [ -f '$KSEC/keys.env' ] && \
+   [ \"\$(ls -d '$KH'/agents/keysbot.bak_* '$KH'/.config/tg-agent/keysbot.bak_* 2>/dev/null | wc -l)\" = $baks_before ]"
+check "bad key on a reinstall is refused with its variable name" \
+  grep -q 'TG_AGENT_KEY_CAL' "$WORK/keysbad2.log"
+# An agent installed before keys.env kept the Groq key in channel.conf: carry it over.
+GH_OLD="$WORK/groqhome"
+keys_install "$GH_OLD" "$WORK/groq1.log" || true
+GSEC="$GH_OLD/.config/tg-agent/keysbot"
+printf 'GROQ_API_KEY="gsk_old_conf"\n' >> "$GSEC/channel.conf"
+keys_install "$GH_OLD" "$WORK/groq2.log" || true
+check "reinstall migrates GROQ_API_KEY from the old channel.conf into keys.env" \
+  grep -qx 'GROQ_API_KEY="gsk_old_conf"' "$GSEC/keys.env"
+check "migrated groq key enables voice" jq -e '.voice.provider == "groq"' \
+  "$GH_OLD/agents/keysbot/.claude/state/telegram/config.json"
+keys_install "$GH_OLD" "$WORK/groq3.log" TG_AGENT_KEY_GROQ=gsk_fresh_9 || true
+check "an explicit groq key beats the old channel.conf one" bash -c \
+  "grep -qx 'GROQ_API_KEY=\"gsk_fresh_9\"' '$GSEC/keys.env' && \
+   [ \"\$(grep -c '^GROQ_API_KEY=' '$GSEC/keys.env')\" = 1 ]"
+check "--no-systemd banner: no systemctl hint, manual start shown" bash -c \
+  "! grep -q 'systemctl status' '$WORK/keys1.log' && grep -q 'run-agent.sh' '$WORK/keys1.log'"
+check "banner prints add-keys with the SECRETS_DIR prefix" \
+  grep -q "SECRETS_DIR='$KSEC' AGENT_NAME='keysbot'" "$WORK/keys2.log"
+# run-agent's LAUNCH_CMD prefix, run for real: keys.env must reach the pane's environment.
+launch_prefix_env() {
+  local dir="$1" with_keys="$2"
+  mkdir -p "$dir"
+  printf 'AGENT_X=from_conf\n' > "$dir/agent.conf"; : > "$dir/channel.conf"
+  [ "$with_keys" = 1 ] && printf 'CAL_API_KEY="cal_behaviour_1"\n' > "$dir/keys.env"
+  bash -c "
+    keys_conf() { echo '$dir/keys.env'; }
+    TG_AGENT_CONF='$dir/agent.conf'; CHANNEL_CONF='$dir/channel.conf'
+    $(sed -n '/^KEYS_CONF=/,/^LAUNCH_CMD+=\"; set +a\"/p' "$KIT/server/bin/run-agent.sh")
+    env -i PATH=\"\$PATH\" bash -c \"\$LAUNCH_CMD; env\"" 
+}
+check "run-agent LAUNCH_CMD exports keys.env values" bash -c \
+  "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch1' 1 | grep -qx 'CAL_API_KEY=cal_behaviour_1'"
+check "run-agent LAUNCH_CMD still exports agent.conf" bash -c \
+  "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch2' 1 | grep -qx 'AGENT_X=from_conf'"
+check "run-agent LAUNCH_CMD works without keys.env" bash -c \
+  "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch3' 0 | grep -qx 'AGENT_X=from_conf'"
+check "installer puts ~/.local/bin on PATH before the login step" bash -c \
+  "awk '/export PATH=\"\\\$HOME\\/.local\\/bin:\\\$PATH\"/{p=NR} /Log in to \\\$svc now/{l=NR} END{exit !(p && l && p<l)}' '$KIT/install-server.sh'"
+
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
 if bash "$KIT/scripts/build-gbrain.sh" "$GB_BUILD" > "$WORK/gbrain-build.log" 2>&1; then
@@ -279,15 +554,28 @@ fi
 
 echo "== 6. install-fleet end-to-end"
 # Second agent next to testbot from section 4.
-if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
+if HOME="$FAKE_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 FAKE_TOOLS_FAIL=1 \
    TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=helper-two AGENT_ROLE="Research helper" \
    OWNER_CHAT_ID="$OWNER" OPERATOR_NAME="Test Owner" TIMEZONE=UTC WEBHOOK_PORT=18090 LANGUAGE=Russian \
    BASE_DIR="$FAKE_HOME/agents" FAKE_CLAUDE_FAIL=1 \
    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install2.log" 2>&1; then
-  ok "second agent installed (offline plugin install does not stop it)"
+  ok "second agent installed (npm, pipx, git and plugin installs all fail; the install still finishes)"
 else
   bad "second agent installed"; tail -10 "$WORK/install2.log"
 fi
+check "offline: install still finishes, kit skills linked" \
+  test -L "$FAKE_HOME/agents/helper-two/.claude/skills/gws"
+check "offline: last30days keeps the stub" grep -q "Not installed yet" \
+  "$FAKE_HOME/agents/helper-two/.claude/skills/last30days/SKILL.md"
+# No npm/pipx at all: the rest of the kit must still install.
+NT="$WORK/notools"; mkdir -p "$NT/bin" "$NT/ws"
+for t in bash env sed cp rm find chmod mkdir ln mv date dirname ls cat mktemp rmdir; do
+  ln -sf "$(command -v "$t")" "$NT/bin/$t"
+done
+check "no npm/pipx: other kit items still installed" bash -c \
+  "HOME='$NT/home' PATH='$NT/bin' CLAUDE_BIN='$WORK/claudebin/claude' \
+     bash '$KIT/kit/install-kit.sh' '$NT/ws' '$NT/cfg' >/dev/null 2>&1 \
+   && test -f '$NT/ws/skills/gws/SKILL.md' && grep -q '$NT/cfg plugin install superpowers' '$FAKE_CLAUDE_LOG'"
 check "offline plugin install only warns" grep -q "WARN: marketplace .* unreachable" "$WORK/install2.log"
 check "Russian agent gets the typography rule inside Response format" python3 - \
   "$FAKE_HOME/agents/helper-two/.claude/core/rules.md" <<'PY'

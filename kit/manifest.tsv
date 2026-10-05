@@ -1,0 +1,16 @@
+# category	skill	kind
+system	skill-creator	bundled
+system	quick-reminders	bundled
+research	markdown-new	bundled
+media	groq-voice	bundled
+media	youtube-transcript	bundled
+system	skill-finder	bundled
+system	agent-introspection	bundled
+system	learnings	bundled
+dev	senior-brainstorm	bundled
+research	perplexity-research	bundled
+research	agent-browser	bundled
+research	crawl4ai	bundled
+research	last30days	upstream
+office	gws	bundled
+office	cal	bundled

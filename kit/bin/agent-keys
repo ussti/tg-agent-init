@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""agent-keys -- add API keys for the agent's skills, hidden input, live check.
+
+Keys go into keys.env in the agent's secrets dir (mode 600). The agent pane
+sources that file at start, so a new key works after the agent restarts.
+
+Usage:
+    agent-keys setup            walk through every service, Enter skips
+    agent-keys add <service>    add or replace one key
+    agent-keys list             which keys are set (never shows values)
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import http.client
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+LOG = logging.getLogger("agent-keys")
+TIMEOUT_S: float = 10.0
+FILE_MODE: int = 0o600
+SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/+=-]+$")
+NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+LINE = re.compile(r'^([A-Z][A-Z0-9_]*)="([A-Za-z0-9._:/+=-]*)"$')
+REJECT_CODES: frozenset[int] = frozenset({401, 403})
+
+
+@dataclass(frozen=True)
+class Service:
+    """One key-bearing service.
+
+    Attributes:
+        id: short name used on the command line.
+        env: environment variable the skills read.
+        label: what the key unlocks, shown before the prompt.
+        url: where to get the key.
+        method: HTTP method of the check, or "" for no live check.
+        check_url: endpoint that answers 401/403 for a wrong key.
+        auth: "bearer", "x-api-key" or "x-subscription-token".
+        body: JSON body for POST checks.
+        extra: extra headers.
+        reject: HTTP codes that mean the key is wrong (Brave answers 422).
+    """
+
+    id: str
+    env: str
+    label: str
+    url: str
+    method: str = ""
+    check_url: str = ""
+    auth: str = "bearer"
+    body: str = ""
+    extra: tuple[tuple[str, str], ...] = ()
+    reject: frozenset[int] = REJECT_CODES
+
+
+SERVICES: tuple[Service, ...] = (
+    Service("groq", "GROQ_API_KEY", "voice messages → text (free)",
+            "https://console.groq.com/keys", "GET",
+            "https://api.groq.com/openai/v1/models"),
+    Service("perplexity", "PERPLEXITY_API_KEY", "deep research with sources (paid)",
+            "https://www.perplexity.ai/settings/api", "POST",
+            "https://api.perplexity.ai/chat/completions",
+            body=json.dumps({"model": "sonar", "max_tokens": 1,
+                             "messages": [{"role": "user", "content": "ping"}]})),
+    Service("cal", "CAL_API_KEY", "Cal.com bookings",
+            "https://app.cal.com/settings/developer/api-keys", "GET",
+            "https://api.cal.com/v2/me", extra=(("cal-api-version", "2024-08-13"),)),
+    Service("brave", "BRAVE_API_KEY", "web search for last30days (2,000 free / month)",
+            "https://api.search.brave.com/app/keys", "GET",
+            "https://api.search.brave.com/res/v1/web/search?q=test&count=1",
+            auth="x-subscription-token", reject=frozenset({401, 403, 422})),
+    Service("scrapecreators", "SCRAPECREATORS_API_KEY",
+            "TikTok / Instagram / X for last30days (10,000 free calls)",
+            "https://scrapecreators.com", "GET",
+            "https://api.scrapecreators.com/v1/reddit/search?query=test", auth="x-api-key"),
+    Service("transcriptapi", "TRANSCRIPT_API_KEY",
+            "YouTube transcripts when yt-dlp is blocked (paid, optional)",
+            "https://transcriptapi.com", "GET",
+            "https://transcriptapi.com/api/v2/youtube/transcript?video_url=dQw4w9WgXcQ"),
+    Service("jina", "JINA_API_KEY", "higher limits for markdown-new (optional)",
+            "https://jina.ai/reader"),
+)
+
+
+def clean_value(raw: str) -> str:
+    """Strip whitespace and refuse characters that break a KEY="value" file.
+
+    Args:
+        raw: the pasted value.
+
+    Returns:
+        The cleaned value.
+
+    Raises:
+        ValueError: when the value has quotes, $, backticks, backslashes or spaces.
+    """
+    value = raw.strip()
+    if value and not SAFE_VALUE.match(value):
+        raise ValueError("the key has characters a key never has (space, quote, $, `, \\)")
+    return value
+
+
+def load_keys(path: Path) -> dict[str, str]:
+    """Read KEY="value" lines; a missing file is an empty dict.
+
+    Lines whose value has shell-active characters are ignored, so a hand-edited
+    file can never carry them through a rewrite.
+    """
+    if not path.exists():
+        return {}
+    keys: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = LINE.match(line.strip())
+        if match:
+            keys[match.group(1)] = match.group(2)
+    return keys
+
+
+def save_key(path: Path, name: str, value: str) -> None:
+    """Set one key, replacing an old line; atomic write, mode 600.
+
+    Raises:
+        ValueError: when the name or value could break the shell-sourced file.
+    """
+    if not NAME.match(name):
+        raise ValueError(f"bad key name: {name!r}")
+    value = clean_value(value)
+    if not value:
+        raise ValueError("empty key value")
+    keys = load_keys(path)
+    keys[name] = value
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    body = "# agent keys -- written by agent-keys, sourced by run-agent.sh\n"
+    body += "".join(f'{k}="{v}"\n' for k, v in sorted(keys.items()))
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".keys.")
+    try:
+        os.fchmod(fd, FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the key headers must not reach another host."""
+
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+CODE_NOTES: dict[int, str] = {
+    402: "the key is valid, but the account has no credit",
+    429: "the key is valid, but the account is over its rate limit",
+}
+
+
+def check(service: Service, value: str, timeout: float = TIMEOUT_S) -> tuple[str, str]:
+    """Live-check a key.
+
+    Returns:
+        (status, note): status is "ok" when the service recognised the key, "invalid"
+        on a rejected key (401/403, 422 for Brave), "unverified" when it could not be checked (unreachable, 5xx,
+        redirect, no live check). The note says why when there is something to say.
+    """
+    if not service.method:
+        return "unverified", "this service has no live check"
+    headers = {"User-Agent": "agent-keys", **dict(service.extra)}
+    if service.auth == "bearer":
+        headers["Authorization"] = f"Bearer {value}"
+    elif service.auth == "x-api-key":
+        headers["x-api-key"] = value
+    else:
+        headers["X-Subscription-Token"] = value
+    data = None
+    if service.body:
+        data = service.body.encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(service.check_url, data=data, headers=headers,
+                                     method=service.method)
+    try:
+        with OPENER.open(request, timeout=timeout):
+            return "ok", ""
+    except urllib.error.HTTPError as err:
+        if err.code in service.reject:
+            return "invalid", "the service rejected this key"
+        if 300 <= err.code < 400:
+            return "unverified", f"the service redirected the request ({err.code})"
+        if err.code >= 500:
+            return "unverified", f"the service failed ({err.code})"
+        return "ok", CODE_NOTES.get(err.code, "")
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError):
+        return "unverified", "the service is unreachable"
+
+
+def validate(service: Service, value: str, timeout: float = TIMEOUT_S) -> str:
+    """Live-check a key; "ok" | "invalid" | "unverified" (see check for the reason)."""
+    return check(service, value, timeout)[0]
+
+
+def keys_path() -> Path:
+    """keys.env location: AGENT_KEYS_FILE, else $SECRETS_DIR/keys.env."""
+    explicit = os.environ.get("AGENT_KEYS_FILE")
+    if explicit:
+        return Path(explicit)
+    secrets = os.environ.get("SECRETS_DIR")
+    if not secrets:
+        raise SystemExit(
+            "agent-keys: SECRETS_DIR is not set (see the command printed by the installer)"
+        )
+    return Path(secrets) / "keys.env"
+
+
+def render_list(path: Path) -> str:
+    """One line per service: set / not set. Never prints values."""
+    keys = load_keys(path)
+    return "\n".join(f"{s.id:15} {'set' if keys.get(s.env) else '-':4} {s.label}"
+                     for s in SERVICES)
+
+
+def ask_one(service: Service, path: Path) -> None:
+    """Prompt for one key (hidden), check it, save it. Enter skips."""
+    current = load_keys(path).get(service.env)
+    print(f"\n{service.id}: {service.label}\n  get it: {service.url}")
+    if current:
+        print("  already set; Enter keeps it")
+    while True:
+        raw = getpass.getpass("  key (hidden, Enter to skip): ")  # EOF/Ctrl-C: see main
+        try:
+            value = clean_value(raw)
+        except ValueError as err:
+            print(f"  {err}; try again")
+            continue
+        if not value:
+            print("  skipped" + (f"; later: agent-keys add {service.id}" if not current else ""))
+            return
+        status, note = check(service, value)
+        if status == "invalid":
+            print(f"  {note}; try again or Enter to skip")
+            continue
+        save_key(path, service.env, value)
+        if status == "ok":
+            print("  checked, saved" + (f"; {note}" if note else ""))
+        elif service.method:
+            print(f"  saved, but not checked: {note}")
+        else:
+            print(f"  saved; {note}")
+        return
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(prog="agent-keys")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("setup")
+    add = sub.add_parser("add")
+    add.add_argument("service", choices=[s.id for s in SERVICES])
+    sub.add_parser("list")
+    args = parser.parse_args(argv)
+    path = keys_path()
+    if args.cmd == "list":
+        print(render_list(path))
+        return 0
+    targets = SERVICES if args.cmd == "setup" else [s for s in SERVICES if s.id == args.service]
+    try:
+        for service in targets:
+            ask_one(service, path)
+    except (EOFError, KeyboardInterrupt):
+        print("\nstopped; keys entered so far are saved")
+        return 130
+    if not os.environ.get("AGENT_KEYS_FILE"):  # the installer sets it; no agent runs yet
+        session = f"{os.environ.get('AGENT_NAME', '<agent>')}-agent"
+        print(f"\nRestart the agent to load new keys: tmux kill-session -t {session}"
+              " (the service starts it again; with --no-systemd run bin/run-agent.sh)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

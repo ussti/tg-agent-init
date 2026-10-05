@@ -5,6 +5,9 @@
 #   1. entities — one extended regex per line, read from a list kept OUTSIDE
 #      the repo (the list itself names the people it protects).
 #   2. secrets  — generic credential shapes, always on.
+#   3. docs     — docs/ must carry no internal references (agent workspace paths,
+#      secrets dir, Telegram message numbers); always on. Names of people and
+#      agents belong in the entity list of pass 1, never in this file.
 #
 # vendor/dashi-plugin/ and vendor/public-gbrain-agentos/ are upstream code,
 # kept byte-identical to public commits: pass 1 tolerates upstream's own names
@@ -31,7 +34,10 @@ SECRET_PATTERNS=(
   '-----BEGIN [A-Z ]*PRIVATE KEY-----'         # PEM private key
 )
 
-GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache)
+# Internal references that must not ship in docs/.
+DOCS_PATTERNS='claude-lab|shared/secrets|[Mm]sg [0-9]{4,}|Telegram msg'
+
+GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.cache --exclude-dir=.superpowers)
 # Basename matches: also skips patches/<same name>, which the passes below cover.
 VENDOR_EXCLUDES=(--exclude-dir=dashi-plugin --exclude-dir=public-gbrain-agentos)
 fail=0
@@ -84,6 +90,18 @@ for pat in "${SECRET_PATTERNS[@]}"; do
   fi
 done
 [ "$secret_fail" -eq 1 ] && fail=1
+
+# Docs pass: print only file:line, never the matched text.
+if [ -d "$KIT_ROOT/docs" ]; then
+  doc_hits="$(grep -rnIE -e "$DOCS_PATTERNS" "$KIT_ROOT/docs" | cut -d: -f1,2 || true)"
+  if [ -n "$doc_hits" ]; then
+    log "FAIL: internal reference in docs/ at:"
+    printf '%s\n' "$doc_hits"
+    fail=1
+  else
+    log "docs: clean"
+  fi
+fi
 
 # vendor_integrity DIR SUMFILE: the vendored tree must match its pinned hash.
 vendor_integrity() {

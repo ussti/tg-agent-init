@@ -123,7 +123,10 @@ tmux new-session -d -s "$SESSION" -c "$WORKDIR" -x "$PANE_COLS" -y "$PANE_ROWS"
 
 # 4. Launch the TUI. The pane sources agent.conf and the channel config itself;
 # the optional account OAuth token is a fallback for an expired per-agent login.
-LAUNCH_CMD="set -a; . '$TG_AGENT_CONF'; . '$CHANNEL_CONF'; set +a"
+KEYS_CONF="$(keys_conf)"
+LAUNCH_CMD="set -a; . '$TG_AGENT_CONF'; . '$CHANNEL_CONF'"
+[ -f "$KEYS_CONF" ] && LAUNCH_CMD+="; . '$KEYS_CONF'"
+LAUNCH_CMD+="; set +a"
 LAUNCH_CMD+="; export TELEGRAM_DM_DELIVERY_MODE=inbox TELEGRAM_DM_DELIVERY_STATE_DIR='$DM_STATE_DIR' TELEGRAM_DM_DELIVERY_CHAT_IDS='$DM_CHAT_IDS'"
 if [ -f "$AUTH_CONF" ]; then
   LAUNCH_CMD+="; export CLAUDE_CODE_OAUTH_TOKEN=\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' '$AUTH_CONF' | head -1 | tr -d '\"')"
