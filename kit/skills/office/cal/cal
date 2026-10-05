@@ -18,6 +18,8 @@ Usage:
     cal reschedule --uid abc123 --start 2026-09-24T10:00:00Z
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -226,7 +228,13 @@ def cmd_schedule(_: argparse.Namespace) -> None:
 
 def cmd_schedule_set(args: argparse.Namespace) -> None:
     """Replace the working hours of a schedule."""
-    days = [DAY_NAMES[d.strip().lower()] for d in args.days.split(",")]
+    tokens = [d.strip().lower() for d in args.days.split(",")]
+    unknown = [t for t in tokens if t not in DAY_NAMES]
+    if unknown:
+        raise SystemExit(
+            f"cal: unknown day(s) {', '.join(unknown)}; valid: {', '.join(DAY_NAMES)}"
+        )
+    days = [DAY_NAMES[t] for t in tokens]
     schedule_id = args.id
     if schedule_id is None:
         me = request("GET", "/me")

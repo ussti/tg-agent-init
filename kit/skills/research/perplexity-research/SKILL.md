@@ -15,7 +15,7 @@ Perplexity Sonar API. The key is read from the environment variable `PERPLEXITY_
 
 ## Usage
 
-1. Check that `PERPLEXITY_API_KEY` is set (see "No key" below if it is empty).
+1. Check the key: `[ -n "${PERPLEXITY_API_KEY:-}" ]` (see "No key" below if it is empty).
 2. Query the Sonar API.
 3. Return structured results with the sources it cites.
 
@@ -32,6 +32,17 @@ curl -X POST "https://api.perplexity.ai/chat/completions" \
     ]
   }'
 ```
+
+## Reading the response
+
+The answer is `choices[0].message.content`; the sources are in the top-level
+`citations` array (list of URLs). Pipe through jq:
+
+```bash
+... | jq -r '.choices[0].message.content, "", "Sources:", (.citations[]? | "- " + .)'
+```
+
+Always list the sources next to the answer.
 
 ## No key
 

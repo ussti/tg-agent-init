@@ -18,14 +18,21 @@ CAL="$AGENT_WS/skills/cal/cal"
 "$CAL" calendars                            # connected calendars
 "$CAL" events                               # event types and their limits
 "$CAL" event-create --title T --slug s --minutes 30
-"$CAL" event-update --id 123 --buffer-after 15 --minimum-notice 720
+"$CAL" event-update --id 123 --title T --minutes 45 --description D \
+    --buffer-before 5 --buffer-after 15 --minimum-notice 720 \
+    --location cal-video --calendar owner@example.com   # any subset of flags
 "$CAL" schedule                             # availability schedules
 "$CAL" schedule-set --days mon,tue,wed,thu,fri --start 10:00 --end 18:00
-"$CAL" slots --event-id 123 --from 2026-09-22 --to 2026-09-26
+"$CAL" slots --event-id 123 --from 2026-09-22 --to 2026-09-26 --timezone Europe/Berlin
 "$CAL" bookings --status upcoming           # upcoming | past | cancelled | recurring
 "$CAL" cancel --uid abc123 --reason "..."
 "$CAL" reschedule --uid abc123 --start 2026-09-24T10:00:00Z
 ```
+
+`slots` defaults to UTC: always pass `--timezone` with the user's own IANA timezone,
+otherwise the times shown are UTC. `--location` takes `address`, `link`, `phone` or an
+integration slug such as `cal-video`; `--calendar` is the destination Google Calendar
+id/email.
 
 ## Confirm first
 

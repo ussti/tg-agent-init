@@ -190,14 +190,17 @@ check "perplexity falls back to WebSearch without a key" \
   grep -q "WebSearch" "$KIT/kit/skills/research/perplexity-research/SKILL.md"
 check "cal tool reads CAL_API_KEY from the environment" \
   grep -q "CAL_API_KEY" "$KIT/kit/skills/office/cal/cal"
-check "cal tool compiles" python3 -m py_compile "$KIT/kit/skills/office/cal/cal"
+check "cal tool parses (no bytecode written)" \
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$KIT/kit/skills/office/cal/cal"
 check "research and office skills linked" bash -c \
   "for s in perplexity-research agent-browser crawl4ai last30days gws cal; do \
    test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
 check "last30days UPSTREAM pins repo and commit" bash -c \
   "grep -qx 'repo=https://github.com/mvanhorn/last30days-skill' '$KIT/kit/skills/research/last30days/UPSTREAM' && \
    grep -qx 'commit=e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$KIT/kit/skills/research/last30days/UPSTREAM'"
-check "agent-browser config is valid JSON" jq -e .args "$KIT/kit/config/agent-browser.json"
+check "agent-browser config has the exact values" jq -e \
+  '(.args | contains("--no-sandbox")) and .contentBoundaries == true
+   and .maxOutput == 50000 and .idleTimeout == "15m"' "$KIT/kit/config/agent-browser.json"
 check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
 check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
