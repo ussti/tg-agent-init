@@ -53,6 +53,8 @@ echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
 check "agent-keys unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_keys.py'
+check "agent-login unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_login.py'
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.

@@ -338,6 +338,19 @@ export CLAUDE_BIN
 KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_WS" "$CLAUDE_CONFIG_DIR"
 find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} +
 
+# Optional logins (Google needs gws-cli from the kit install above). Interactive only.
+if [ "$NONINTERACTIVE" != "1" ]; then
+  say "logins -- optional, each can be done later"
+  for svc in google github vercel; do
+    read -r -p "Log in to $svc now? [y/N] " yn || yn=n
+    case "$yn" in
+      y|Y) python3 "$KIT_DIR/kit/bin/agent-login" "$svc" \
+             || say "WARN: $svc login not finished; later: $AGENT_WS/kit/bin/agent-login $svc" ;;
+      *) say "later: $AGENT_WS/kit/bin/agent-login $svc" ;;
+    esac
+  done
+fi
+
 if [ -z "$OAUTH" ] && [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
   echo
   echo "Claude Code is not logged in for this agent. In another terminal run:"
@@ -427,4 +440,5 @@ echo "  watch it:   tmux attach -t $AGENT_NAME-agent   (detach: Ctrl-b d)"
 echo "  services:   systemctl status $UNIT_AGENT $UNIT_WATCH"
 echo "  add keys:   SECRETS_DIR='$SECRETS_DIR' AGENT_NAME='$AGENT_NAME' \\"
 echo "              '$AGENT_WS/kit/bin/agent-keys' add <service>   (list | setup; then restart the agent)"
+echo "  logins:     '$AGENT_WS/kit/bin/agent-login' google | github | vercel | status"
 echo "  next:       write /onboard to the bot -- it asks about you and fills the profile"
