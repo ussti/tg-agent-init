@@ -2,7 +2,7 @@
 # quick-reminders — local reminder list. No key, no network.
 set -euo pipefail
 
-STORE="${REMINDERS_FILE:-${CLAUDE_PROJECT_DIR:-.}/.claude/core/reminders.md}"
+STORE="${REMINDERS_FILE:-${AGENT_WS:-${CLAUDE_PROJECT_DIR:-.}/.claude}/core/reminders.md}"
 mkdir -p "$(dirname "$STORE")"
 [ -f "$STORE" ] || printf '# Reminders\n\n' > "$STORE"
 

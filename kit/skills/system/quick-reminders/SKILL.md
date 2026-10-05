@@ -16,7 +16,8 @@ bash scripts/reminders.sh list
 bash scripts/reminders.sh done 3      # complete the reminder on line 3
 ```
 
-Storage: `${CLAUDE_PROJECT_DIR}/.claude/core/reminders.md` (override with `REMINDERS_FILE`).
+Storage: `${REMINDERS_FILE:-$AGENT_WS/core/reminders.md}` (`AGENT_WS` comes from agent.conf; without it the
+file falls back to `${CLAUDE_PROJECT_DIR}/.claude/core/reminders.md`).
 
 ## Notes
 
