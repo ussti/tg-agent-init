@@ -9,18 +9,19 @@ description: >
 
 ## Wiring
 
-Движок установлен в папку агента: `$CLAUDE_PROJECT_DIR/.claude/scripts/learnings-engine.mjs`.
-Он сам находит рабочую папку `.claude/`: эпизоды пишутся в `core/learnings/episodes.jsonl`,
-отчёт в `core/LEARNINGS.md`. Если `CLAUDE_PROJECT_DIR` в Bash не задана, скрипт ищется
-от текущей папки; убедись, что файл существует, прежде чем запускать.
+Движок лежит в `$AGENT_WS/scripts/learnings-engine.mjs`. Переменная `AGENT_WS` приходит из
+agent.conf, который загружается при старте агента. Движок сам находит `.claude/`: эпизоды
+пишутся в `core/learnings/episodes.jsonl`, отчёт в `core/LEARNINGS.md`.
 Переменные окружения нужны только для нестандартных путей:
 
 ```bash
-ENGINE="node ${CLAUDE_PROJECT_DIR:-$PWD}/.claude/scripts/learnings-engine.mjs"
+ENGINE="$AGENT_WS/scripts/learnings-engine.mjs"
 # optional overrides:
 # export LEARNINGS_EPISODES=/path/to/episodes.jsonl
 # export LEARNINGS_FILE=/path/to/LEARNINGS.md
 ```
+
+Команды ниже запускаются как `node "$ENGINE" <команда>`.
 
 ## Архитектура
 
@@ -33,55 +34,55 @@ Layer 3: Canon       — promoted episodes (status=promoted), GREEN-zone standin
 **Layer 2→3.** `promote <id>` помечает эпизод как `status=promoted`. Такой эпизод
 освобождён от затухания и считается утверждённым каноном. Автоматически в сессию он
 не попадает: в этой установке нет хука, который читает движок при старте. Поэтому
-в начале каждой сессии запускай `$ENGINE promoted` и учитывай выданные правила.
+в начале каждой сессии запускай `node "$ENGINE" promoted` и учитывай выданные правила.
 `promote` не правит файлы rules.md и CLAUDE.md. Каждое повышение утверждает владелец:
 еженедельный `lint` показывает кандидатов на PROMOTE, агент спрашивает, и только после
-«да» запускает `$ENGINE promote <id>`. Правила уровня идентичности, которые должны
+«да» запускает `node "$ENGINE" promote <id>`. Правила уровня идентичности, которые должны
 жить в rules.md или CLAUDE.md, остаются ручным решением владельца.
 
-Тесты движка: `node --test .claude/scripts/learnings-engine.test.mjs` (из корня агента).
+Тесты движка: `node --test "$AGENT_WS/scripts/learnings-engine.test.mjs"`.
 
 ## CLI
 
-Engine: `$CLAUDE_PROJECT_DIR/.claude/scripts/learnings-engine.mjs`
+Engine: `$AGENT_WS/scripts/learnings-engine.mjs`
 
 ```bash
-ENGINE="node ${CLAUDE_PROJECT_DIR:-$PWD}/.claude/scripts/learnings-engine.mjs"
+ENGINE="$AGENT_WS/scripts/learnings-engine.mjs"
 
 # Record new episode. AUTO-MERGE: if the rule is >=0.6 similar to an existing
 # active episode, this bumps that episode's freq and refreshes its ts (a repeat)
 # instead of appending a duplicate — that is how freq>=2 (and promotion) is
 # reached without a manual `bump`. Force a distinct episode with "merge": false.
-echo '{"context":"...","error":"...","rule":"...","impact":"high","tags":["workflow"]}' | $ENGINE capture
+echo '{"context":"...","error":"...","rule":"...","impact":"high","tags":["workflow"]}' | node "$ENGINE" capture
 
 # View scored learnings
-$ENGINE score
+node "$ENGINE" score
 
 # Lint: find HOT (freq 3+), STALE (score < 0.15), PROMOTE (score > 0.8)
-$ENGINE lint
+node "$ENGINE" lint
 
 # Drafts (optional): episodes whose rule is still a placeholder.
-$ENGINE drafts
+node "$ENGINE" drafts
 
 # Resolve a draft: pipe the real rule in, it replaces the placeholder and drops
 # the draft tags. (A fresh `capture` would NOT merge onto a draft — the placeholder
 # rule isn't similar to the real one — so use resolve, not capture, to close drafts.)
-echo 'always quote shell variables in scripts' | $ENGINE resolve EP-20260709-001
+echo 'always quote shell variables in scripts' | node "$ENGINE" resolve EP-20260709-001
 
 # Promote learning to standing canon (decay-exempt; read it with `promoted`)
-$ENGINE promote EP-20260411-007
+node "$ENGINE" promote EP-20260411-007
 
 # List the promoted canon (run at the start of every session)
-$ENGINE promoted
+node "$ENGINE" promoted
 
 # Archive stale learning
-$ENGINE archive EP-20260411-009
+node "$ENGINE" archive EP-20260411-009
 
 # Bump frequency (repeat violation)
-$ENGINE bump EP-20260411-001
+node "$ENGINE" bump EP-20260411-001
 
 # Generate markdown report
-$ENGINE report
+node "$ENGINE" report
 ```
 
 ## Scoring
@@ -104,11 +105,11 @@ Composite score: `Recency (40%) + Frequency (30%) + Impact (30%)`
 
 Раз в неделю, при самоаудите или по просьбе владельца:
 
-1. `$ENGINE lint` — корзина STALE: предложить архивацию; HOT: правило не работает,
+1. `node "$ENGINE" lint` — корзина STALE: предложить архивацию; HOT: правило не работает,
    нужна системная правка (хук или CLAUDE.md), а не ещё один эпизод;
-   PROMOTE: предложить владельцу, после «да» выполнить `$ENGINE promote <id>`.
-2. `$ENGINE report --write` — обновить `core/LEARNINGS.md`.
-3. Необязательно: `$ENGINE drafts` показывает эпизоды с правилом-заглушкой, если такие
+   PROMOTE: предложить владельцу, после «да» выполнить `node "$ENGINE" promote <id>`.
+2. `node "$ENGINE" report --write` — обновить `core/LEARNINGS.md`.
+3. Необязательно: `node "$ENGINE" drafts` показывает эпизоды с правилом-заглушкой, если такие
    появились при ручном создании. Для каждого — `resolve <id>` с настоящим правилом
    или `archive <id>`.
 
@@ -170,4 +171,4 @@ Do NOT record:
 
 Установка содержит только движок. Хуков автозахвата и вставки канона при старте сессии
 нет; хук `correction-detector` лишь напоминает записать урок. Записывай эпизоды сам
-по правилам «When to record», а `$ENGINE promoted` запускай в начале сессии.
+по правилам «When to record», а `node "$ENGINE" promoted` запускай в начале сессии.

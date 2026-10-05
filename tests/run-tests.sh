@@ -176,9 +176,12 @@ check "kit skills carry no fleet paths" bash -c \
 check "system and dev skills linked" bash -c \
   "for s in skill-finder agent-introspection learnings senior-brainstorm; do \
    test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
-check "learnings skill names the engine path that the install provides" bash -c \
-  "test -f '$WS/scripts/learnings-engine.mjs' && \
-   grep -q '.claude/scripts/learnings-engine.mjs' '$WS/skills/learnings/SKILL.md'"
+check "learnings ENGINE resolves to the installed engine and its tests" bash -c \
+  "AGENT_WS='$WS' bash -c \"\$(grep -m1 '^ENGINE=' '$WS/skills/learnings/SKILL.md'); \
+   test -f \\\"\\\$ENGINE\\\" && test -f \\\"\\\${ENGINE%.mjs}.test.mjs\\\"\""
+check "agent.conf defines AGENT_WS and run-agent exports it" bash -c \
+  "grep -q '^AGENT_WS=' '$KIT/server/templates/agent.conf.template' && \
+   grep -qE 'set -a; \. .\\\$TG_AGENT_CONF' '$KIT/server/bin/run-agent.sh'"
 check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
 check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
