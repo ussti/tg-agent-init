@@ -49,11 +49,19 @@ echo "== 2. syntax"
 while IFS= read -r f; do
   check "bash -n ${f#"$KIT"/}" bash -n "$f"
 done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts" "$KIT/core/cron" \
-           "$KIT/install-server.sh" "$KIT/install-fleet.sh" -name '*.sh' -type f | sort)
+           "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/prepare-server.sh" \
+           -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
   "$KIT/tests/fake-brain-mcp.py"
 find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || true
+
+check "prepare-server --help prints usage" bash -c \
+  "bash '$KIT/prepare-server.sh' --help | grep -q 'Usage: prepare-server.sh'"
+if [ "$(id -u)" != "0" ]; then
+  check "prepare-server refuses to run as a normal user" bash -c \
+    "! out=\$(bash '$KIT/prepare-server.sh' 2>&1) && echo \"\$out\" | grep -q 'run as root'"
+fi
 
 echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
