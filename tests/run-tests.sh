@@ -305,9 +305,10 @@ check "browser setup steps run after install" bash -c \
 check "agent-browser safety config installed" \
   jq -e '.contentBoundaries == true and .maxOutput == 50000' "$FAKE_HOME/.agent-browser/config.json"
 check "kit plugins installed into the agent's config dir" bash -c \
-  "for p in superpowers@claude-plugins-official document-skills@anthropic-agent-skills \
+  "for p in superpowers@claude-plugins-official \
    vercel@claude-plugins-official; do grep -q \"plugin install \$p\" '$FAKE_CLAUDE_LOG' || exit 1; done; \
-   grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
+   ! grep -q 'document-skills' '$FAKE_CLAUDE_LOG' && \
+   ! grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
 check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
   n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
   && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
