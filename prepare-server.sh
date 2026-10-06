@@ -2,6 +2,7 @@
 # prepare-server.sh -- get a fresh Ubuntu/Debian server ready for install-server.sh.
 #
 # Run as root on a new server, from a clone of this repo:
+#   apt-get update && apt-get install -y git
 #   git clone https://github.com/ussti/tg-agent-init.git && cd tg-agent-init && ./prepare-server.sh
 #
 # It installs what install-server.sh needs (system packages, Node.js, bun, Claude Code),

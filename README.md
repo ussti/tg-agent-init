@@ -18,9 +18,14 @@
 
 ## Установка
 
-На только что купленном сервере зайдите под root и подготовьте его:
+С вашего компьютера нужен только терминал и вход на сервер по ssh, ставить на него ничего
+не надо. Пошаговая памятка для Mac: [docs/mac-setup.md](docs/mac-setup.md).
+
+На только что купленном сервере зайдите под root и подготовьте его. Первая команда ставит
+git, его нет на некоторых минимальных образах:
 
 ```bash
+apt-get update && apt-get install -y git
 git clone https://github.com/ussti/tg-agent-init.git && cd tg-agent-init && ./prepare-server.sh
 ```
 
