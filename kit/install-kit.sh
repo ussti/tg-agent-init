@@ -76,11 +76,10 @@ readonly AGENT_BROWSER_VERSION="0.38.2"
 readonly CRAWL4AI_VERSION="0.9.4"
 readonly GWS_CLI_VERSION="1.5.0"
 readonly LOCAL_PREFIX="$HOME/.local"
-readonly -a MARKETPLACES=("anthropics/claude-plugins-official" "anthropics/skills")
+readonly -a MARKETPLACES=("anthropics/claude-plugins-official")
 readonly -a KIT_PLUGINS=(
   "superpowers@claude-plugins-official"
   "vercel@claude-plugins-official"
-  "document-skills@anthropic-agent-skills"
 )
 
 readonly NET_TIMEOUT=600  # seconds; a hung download must not hang the whole install

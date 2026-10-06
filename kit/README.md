@@ -43,7 +43,6 @@ optional, Enter skips, add it later with the command shown.
 | research | last30days | optional `BRAVE_API_KEY`, `SCRAPECREATORS_API_KEY` | `agent-keys add brave` / `scrapecreators` |
 | office | gws | Google login (own OAuth client) | `agent-login google` |
 | office | cal | `CAL_API_KEY` | `agent-keys add cal` |
-| office | docx, pdf, pptx, xlsx (plugin) | none | |
 | media | groq-voice | `GROQ_API_KEY` (free) | `agent-keys add groq` |
 | media | youtube-transcript | optional `TRANSCRIPT_API_KEY` (paid) | `agent-keys add transcriptapi` |
 | dev | senior-brainstorm | none | |
@@ -62,7 +61,6 @@ Third-party programs come only from their official source, at the pinned version
 | crawl4ai | pipx `crawl4ai==0.9.4` | Apache-2.0 |
 | last30days | git `mvanhorn/last30days-skill` at the commit pinned in `skills/research/last30days/UPSTREAM` | MIT |
 | gws | pipx `gws-cli==1.5.0` | MIT |
-| docx, pdf, pptx, xlsx | plugin `document-skills@anthropic-agent-skills` (marketplace `anthropics/skills`) | see upstream |
 | Vercel | plugin `vercel@claude-plugins-official`, CLI `vercel@62.2.0` | see upstream |
 | GitHub | `gh`, install per https://github.com/cli/cli#installation | see upstream |
 | senior-brainstorm | our skill, `skills/dev/senior-brainstorm/LICENSE` | MIT |
