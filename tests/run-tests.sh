@@ -180,6 +180,8 @@ else
 fi
 check "install-server ends with the doctor step" \
   grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
+check "install-server: doctor hint is non-fatal" bash -c \
+  "tail -1 '$KIT/install-server.sh' | grep -q 'doctor-hint.sh.*|| true'"
 check "prepare-server final text names install-doctor.sh" \
   grep -q 'install-doctor.sh' "$KIT/prepare-server.sh"
 

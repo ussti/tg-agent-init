@@ -486,4 +486,4 @@ echo "  add keys:   SECRETS_DIR='$SECRETS_DIR' AGENT_NAME='$AGENT_NAME' \\"
 echo "              '$AGENT_WS/kit/bin/agent-keys' add <service>   (list | setup; then restart the agent)"
 echo "  logins:     '$AGENT_WS/kit/bin/agent-login' google | github | vercel | status"
 echo "  next:       write /onboard to the bot -- it asks about you and fills the profile"
-bash "$KIT_DIR/server/doctor/doctor-hint.sh" "$KIT_DIR"
+bash "$KIT_DIR/server/doctor/doctor-hint.sh" "$KIT_DIR" || true
