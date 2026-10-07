@@ -136,7 +136,8 @@ run_doctor() {  # run_doctor <root> <log> [VAR=value...]
   local r="$1" log="$2"
   shift 2
   env PATH="$FAKES:$PATH" TG_DOCTOR_ROOT="$r" TG_DOCTOR_DRY_RUN=1 \
-    TG_DOCTOR_NONINTERACTIVE=1 TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 "$@" \
+    TG_DOCTOR_NONINTERACTIVE=1 TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 \
+    TG_DOCTOR_OWNER_ID="$OWNER" "$@" \
     bash "$KIT/install-doctor.sh" < /dev/null > "$log" 2>&1
 }
 refused() {  # refused <root> <log> <expected text> [VAR=value...]
@@ -218,8 +219,12 @@ check "doctor: malformed token -> stop" \
 M="$(new_root owners)"
 make_agent "$M" alice main 111 111111111
 make_agent "$M" bob helper 222 333333333
-check "doctor: two owners without TG_DOCTOR_OWNER_ID -> stop" \
-  refused "$M" "$DOC/m.log" "TG_DOCTOR_OWNER_ID" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN"
+check "doctor: no TG_DOCTOR_OWNER_ID -> stop, agent.conf is not trusted" \
+  refused "$M" "$DOC/m.log" "TG_DOCTOR_OWNER_ID" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+  TG_DOCTOR_OWNER_ID=
+check "doctor: single agent owner is not a fallback either" \
+  refused "$E" "$DOC/m1.log" "TG_DOCTOR_OWNER_ID" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+  TG_DOCTOR_OWNER_ID=
 two_owners_ok() {
   run_doctor "$M" "$DOC/m2.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" TG_DOCTOR_OWNER_ID=222 \
     && grep -qx 'ALLOWED_USERS=222' "$M/etc/agent-doctor/env"
@@ -243,6 +248,46 @@ greet_warns() {
     && grep -q 'press Start' "$DOC/w.log" && test ! -e "$W/opt/agent-doctor/.greeted"
 }
 check "doctor: greeting failure is only a warning" greet_warns
+# fix round 1: start job failure, ERR trap, bad username, env without username
+S="$(new_root startfail)"
+make_agent "$S" alice main "$OWNER" 111111111
+touch "$S/.fake/fail-start" "$S/.fake/inactive"
+start_fail_reports() {
+  refused "$S" "$DOC/s.log" "fake journal line" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && grep -q 'sudo bash .*install-doctor.sh' "$DOC/s.log"
+}
+check "doctor: failed start job -> journal and retry command" start_fail_reports
+X="$(new_root unexpected)"
+make_agent "$X" alice main "$OWNER" 111111111
+touch "$X/.fake/useradd-fail"
+unexpected_reports() {
+  refused "$X" "$DOC/x.log" "ERROR: step failed at line" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && grep -q 'sudo bash .*install-doctor.sh' "$DOC/x.log"
+}
+check "doctor: unexpected failure -> ERROR line and retry command" unexpected_reports
+B="$(new_root badname)"
+make_agent "$B" alice main "$OWNER" 111111111
+touch "$B/.fake/bad-username"
+check "doctor: bad bot username -> token treated as invalid" \
+  refused "$B" "$DOC/b.log" "did not accept" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN"
+V="$(new_root nousername)"
+make_agent "$V" alice main "$OWNER" 111111111
+run_doctor "$V" "$DOC/v0.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" || true
+grep -v '^TELEGRAM_BOT_USERNAME=' "$V/etc/agent-doctor/env" > "$DOC/v.env"
+cp "$DOC/v.env" "$V/etc/agent-doctor/env"
+check "doctor: env without bot username is not kept -> asks for a token" \
+  refused "$V" "$DOC/v.log" "TG_DOCTOR_BOT_TOKEN"
+check "doctor: sudoers temp file is gone" test ! -e "$E/etc/sudoers.d/.agent-doctor.tmp"
+IO="$(new_root interactive)"
+make_agent "$IO" alice main "$OWNER" 111111111
+interactive_owner_refused() {  # token, Start, then three bad owner answers (empty, 999, 999)
+  ! printf '%s\n' "$DOCTOR_TOKEN" '' '' 999 999 \
+    | env PATH="$FAKES:$PATH" TG_DOCTOR_ROOT="$IO" TG_DOCTOR_DRY_RUN=1 \
+      TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 bash "$KIT/install-doctor.sh" \
+      > "$DOC/io.log" 2>&1 \
+    && grep -q 'type again' "$DOC/io.log" && grep -q 'no valid owner ID' "$DOC/io.log"
+}
+check "doctor: interactive owner: empty and wrong answers are refused" interactive_owner_refused
 O="$(new_root os)"
 make_agent "$O" alice main "$OWNER" 111111111
 printf 'ID=fedora\n' > "$O/etc/os-release"

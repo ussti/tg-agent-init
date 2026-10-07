@@ -7,7 +7,7 @@
 # Usage: sudo bash install-doctor.sh
 # Tests: TG_DOCTOR_ROOT=<fake root> TG_DOCTOR_DRY_RUN=1 (skip the root check),
 #        TG_DOCTOR_NONINTERACTIVE=1 with TG_DOCTOR_BOT_TOKEN / TG_DOCTOR_OWNER_ID.
-set -euo pipefail
+set -Eeuo pipefail
 
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 R="${TG_DOCTOR_ROOT:-}"          # prefix for paths on disk; paths inside files stay real
@@ -17,12 +17,14 @@ readonly OPT_DIR="/opt/agent-doctor"
 readonly ENV_DIR="/etc/agent-doctor"
 readonly ENV_FILE="$ENV_DIR/env"
 readonly SUDOERS_FILE="/etc/sudoers.d/agent-doctor"
+readonly SUDOERS_TMP="/etc/sudoers.d/.agent-doctor.tmp"
 readonly UNIT_NAME="agent-doctor.service"
 readonly UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
 readonly CLAUDE_BIN="$DOCTOR_HOME/.local/bin/claude"
 readonly PYTHON_VERSION="3.12"
 readonly MAX_COST_USD=5
 readonly TOKEN_TRIES=3
+readonly OWNER_TRIES=3
 readonly LOGIN_TRIES=3
 readonly JOURNAL_LINES=30
 readonly LOGIN_CHECK_TIMEOUT_S=120
@@ -51,6 +53,8 @@ die() {
   echo "[doctor] fix it, then run again: sudo bash $KIT/install-doctor.sh" >&2
   exit 1
 }
+# Any command that fails outside an if/||/&& condition stops the run with the retry hint.
+trap 'die "step failed at line $LINENO"' ERR
 fetch() { curl -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1"; }
 # Value of KEY="value" (quotes and CR optional); conf files are never sourced as root.
 conf_get() { sed -n "s/^$2=\"\{0,1\}\([^\"]*\)\"\{0,1\}\r\{0,1\}$/\1/p" "$1" | head -1; }
@@ -89,8 +93,13 @@ getent passwd "$DOCTOR_USER" > /dev/null || {
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$DOCTOR_USER" > "$WORK/sudoers"
 visudo -cf "$WORK/sudoers" > /dev/null || die "sudoers line failed visudo -cf; nothing installed"
 mkdir -p "$R/etc/sudoers.d"
-if place "$WORK/sudoers" "$R$SUDOERS_FILE" 440; then
-  chown root:root "$R$SUDOERS_FILE"
+if [ -f "$R$SUDOERS_FILE" ] && cmp -s "$WORK/sudoers" "$R$SUDOERS_FILE"; then
+  chmod 440 "$R$SUDOERS_FILE"
+else
+  # a dotted name is skipped by sudo, so a half-written file is never read
+  install -m 440 "$WORK/sudoers" "$R$SUDOERS_TMP"
+  chown root:root "$R$SUDOERS_TMP"
+  mv -f "$R$SUDOERS_TMP" "$R$SUDOERS_FILE"
   say "sudo granted to $DOCTOR_USER"
 fi
 
@@ -147,17 +156,21 @@ token_is_agents() {  # token_is_agents <token>: the bot id belongs to an agent
   return 1
 }
 get_me() {  # get_me <token>: prints the bot username when Telegram accepts the token
-  local resp
+  local resp name
   resp="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$1" \
     | curl -sS -m "$HTTP_TIMEOUT_S" -K - 2> /dev/null)" || return 1
   [ "$(jq -r '.ok' <<< "$resp")" = true ] || return 1
   [ "$(jq -r '.result.id' <<< "$resp")" = "${1%%:*}" ] || return 1
-  jq -r '.result.username' <<< "$resp"
+  name="$(jq -r '.result.username' <<< "$resp")"
+  [[ "$name" =~ ^[A-Za-z0-9_]{5,}$ ]] || return 1
+  echo "$name"
 }
 choose_token() {
-  local existing="" ans token username tries=0
-  [ -r "$R$ENV_FILE" ] && existing="$(conf_get "$R$ENV_FILE" TELEGRAM_BOT_TOKEN)"
-  if [ -n "$existing" ]; then
+  local existing="" existing_name="" ans token username tries=0
+  if [ -r "$R$ENV_FILE" ]; then existing="$(conf_get "$R$ENV_FILE" TELEGRAM_BOT_TOKEN)"; fi
+  existing_name="$(conf_get "$R$ENV_FILE" TELEGRAM_BOT_USERNAME 2> /dev/null || true)"
+  # an env file without a bot username is not trusted: ask for a token again
+  if [ -n "$existing" ] && [ -n "$existing_name" ]; then
     if [ "$NONINTERACTIVE" = 1 ]; then
       [ -z "${TG_DOCTOR_BOT_TOKEN:-}" ] && KEEP_BOT=1
     else
@@ -167,7 +180,7 @@ choose_token() {
   fi
   if [ "$KEEP_BOT" = 1 ]; then
     BOT_TOKEN="$existing"
-    BOT_USERNAME="$(conf_get "$R$ENV_FILE" TELEGRAM_BOT_USERNAME)"
+    BOT_USERNAME="$existing_name"
     return 0
   fi
   [ "$NONINTERACTIVE" = 1 ] \
@@ -203,32 +216,34 @@ if [ "$KEEP_BOT" = 0 ] && [ "$NONINTERACTIVE" != 1 ]; then
   read -r _
 fi
 
-# --- 9. owner
+# --- 9. owner (agent.conf is writable by the agent, so it is never trusted on its own)
 choose_owner() {
-  local owners count ans conf
+  local owners ans tries=0 conf
   if [ "$KEEP_BOT" = 1 ]; then
     OWNER_ID="$(conf_get "$R$ENV_FILE" ALLOWED_USERS)"
     [[ "$OWNER_ID" =~ ^[0-9]+$ ]] && return 0
   fi
-  owners="$(for conf in "${CONFS[@]}"; do conf_get "$conf" OWNER_CHAT_ID; done \
-    | grep -E '^[0-9]+$' | sort -u || true)"
-  count="$(grep -c . <<< "$owners" || true)"
   if [ "$NONINTERACTIVE" = 1 ]; then
-    if [ -n "${TG_DOCTOR_OWNER_ID:-}" ]; then
-      OWNER_ID="$TG_DOCTOR_OWNER_ID"
-    elif [ "$count" = 1 ]; then
-      OWNER_ID="$owners"
-    else
-      die "agents have $count different owners; set TG_DOCTOR_OWNER_ID"
-    fi
-  elif [ "$count" = 1 ]; then
-    read -r -p "[doctor] owner Telegram ID [$owners]: " ans
-    OWNER_ID="${ans:-$owners}"
+    [ -n "${TG_DOCTOR_OWNER_ID:-}" ] || die "set TG_DOCTOR_OWNER_ID (the owner's Telegram ID)"
+    OWNER_ID="$TG_DOCTOR_OWNER_ID"
   else
-    say "owner IDs in the agents: $(tr '\n' ' ' <<< "$owners")"
-    read -r -p "[doctor] owner Telegram ID: " OWNER_ID
+    owners="$(for conf in "${CONFS[@]}"; do conf_get "$conf" OWNER_CHAT_ID; done \
+      | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ' || true)"
+    say "owner IDs found in the agents: ${owners:-none}"
+    while [ "$tries" -lt "$OWNER_TRIES" ]; do
+      tries=$((tries + 1))
+      read -r -p "[doctor] type the owner Telegram ID: " ans
+      if ! [[ "$ans" =~ ^[0-9]+$ ]]; then
+        say "the owner ID must be digits"
+      elif [ -n "$owners" ] && [[ " $owners" != *" $ans "* ]]; then
+        say "this ID matches no agent's owner; check it and type again"
+      else
+        OWNER_ID="$ans"
+        break
+      fi
+    done
   fi
-  [[ "$OWNER_ID" =~ ^[0-9]+$ ]] || die "the owner ID must be digits"
+  [[ "$OWNER_ID" =~ ^[0-9]+$ ]] || die "no valid owner ID"
 }
 choose_owner
 
@@ -268,7 +283,8 @@ systemctl is-enabled --quiet "$UNIT_NAME" 2> /dev/null || systemctl enable --qui
 
 # --- 13. Claude login of the doctor user
 claude_ok() {
-  as_doctor timeout "$LOGIN_CHECK_TIMEOUT_S" "$R$CLAUDE_BIN" -p ping < /dev/null > /dev/null 2>&1
+  as_doctor bash -c 'cd "$HOME" && timeout "$1" "$2" -p ping' _ \
+    "$LOGIN_CHECK_TIMEOUT_S" "$R$CLAUDE_BIN" < /dev/null > /dev/null 2>&1
 }
 if ! claude_ok; then
   [ "$NONINTERACTIVE" = 1 ] \
@@ -286,9 +302,9 @@ fi
 # --- 14. start; restart only when something changed (a restart from the doctor's own
 # session would cut it off)
 if [ "$CHANGED" = 1 ]; then
-  systemctl restart "$UNIT_NAME"
+  systemctl restart "$UNIT_NAME" || true   # wait_stable below reports and dumps the journal
 else
-  systemctl start "$UNIT_NAME"
+  systemctl start "$UNIT_NAME" || true
 fi
 wait_stable() {
   local stable=0 waited=0

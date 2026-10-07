@@ -23,7 +23,9 @@ case "$url" in
     if [ -e "$F/getme-fail" ]; then echo '{"ok":false}' | emit; exit 0; fi
     tok="${url#https://api.telegram.org/bot}"
     tok="${tok%/getMe}"
-    printf '{"ok":true,"result":{"id":%s,"username":"doctor_test_bot"}}\n' "${tok%%:*}" | emit ;;
+    uname=doctor_test_bot
+    [ -e "$F/bad-username" ] && uname="bad name!"
+    printf '{"ok":true,"result":{"id":%s,"username":"%s"}}\n' "${tok%%:*}" "$uname" | emit ;;
   https://api.telegram.org/bot*/sendMessage)
     if [ -e "$F/send-fail" ]; then exit 22; fi
     printf '%s\n' "$text" >> "$F/sent.txt"
