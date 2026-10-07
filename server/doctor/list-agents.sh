@@ -3,7 +3,14 @@
 # Read-only. Agents are found at run time (every agent.conf under /home), never from a
 # list written at install, so an agent added later is seen too.
 # Usage: list-agents.sh [--conf-paths]   (--conf-paths: only the agent.conf paths)
+# Run it with sudo: other users' homes are not readable otherwise.
 set -euo pipefail
+
+usage() { echo "usage: list-agents.sh [--conf-paths]" >&2; }
+case "${1:-}" in
+  "" | --conf-paths) ;;
+  *) usage; exit 2 ;;
+esac
 
 R="${TG_DOCTOR_ROOT:-}"          # test root prefix; empty on a server
 readonly MAX_DEPTH=6             # /home/<user>/agents/<name>/.claude/agent.conf is 5
@@ -22,16 +29,30 @@ find_confs() {
     -not -path '*.bak_*' -not -path '*/backups/*' 2> /dev/null | sort
 }
 
+# Without root a home that is not readable hides its agents: say so on stderr.
+note_unreadable() {
+  local h
+  [ "$(id -u)" -ne 0 ] && [ -d "$R/home" ] || return 0
+  for h in "$R"/home/*/; do
+    [ -d "$h" ] || continue
+    if ! [ -r "$h" ] || ! [ -x "$h" ]; then
+      echo "note: cannot read ${h%/}; run with sudo to see all agents" >&2
+    fi
+  done
+}
+
+note_unreadable
 mapfile -t confs < <(find_confs)
 
 if [ "${1:-}" = "--conf-paths" ]; then
-  [ "${#confs[@]}" -eq 0 ] || printf '%s\n' "${confs[@]}"
+  [ "${#confs[@]}" -eq 0 ] || printf '%s\n' ${confs[@]+"${confs[@]}"}
   exit 0
 fi
 
 rows=()
 seen=" "
-for c in "${confs[@]}"; do
+# ${a[@]+"${a[@]}"}: an empty array is "unbound" under set -u in bash before 4.4
+for c in ${confs[@]+"${confs[@]}"}; do
   rel="${c#"$R"/home/}"
   user="${rel%%/*}"
   name="$(conf_get "$c" AGENT_NAME)"
@@ -55,4 +76,4 @@ if [ "${#rows[@]}" -eq 0 ]; then
   exit 0
 fi
 printf '%-16s %-12s %-10s %-10s %s\n' NAME USER AGENT RATEWATCH WORKSPACE
-printf '%s\n' "${rows[@]}"
+printf '%s\n' ${rows[@]+"${rows[@]}"}

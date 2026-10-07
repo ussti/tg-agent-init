@@ -28,6 +28,7 @@ readonly ENV_DIR="/etc/agent-doctor"
 readonly ENV_FILE="$ENV_DIR/env"
 readonly SUDOERS_FILE="/etc/sudoers.d/agent-doctor"
 readonly SUDOERS_TMP="/etc/sudoers.d/.agent-doctor.tmp"
+readonly USER_MARKER="/opt/agent-doctor/.doctor-user"   # the installer made or adopted it
 readonly UNIT_NAME="agent-doctor.service"
 readonly UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
 readonly CLAUDE_BIN="$DOCTOR_HOME/.local/bin/claude"
@@ -119,7 +120,7 @@ if bad_path="$(untrusted_path)"; then
 fi
 grep -Eqs '^(ID|ID_LIKE)=.*(ubuntu|debian)' "$R/etc/os-release" \
   || die "the doctor installs on Ubuntu or Debian only"
-for tool in curl jq python3 visudo; do
+for tool in curl jq python3 visudo git; do
   command -v "$tool" > /dev/null || die "$tool is missing (apt install $tool)"
 done
 mapfile -t CONFS < <(bash "$KIT/server/doctor/list-agents.sh" --conf-paths)
@@ -127,11 +128,30 @@ mapfile -t CONFS < <(bash "$KIT/server/doctor/list-agents.sh" --conf-paths)
   || die "no agent on this server yet; install one first: ./install-server.sh"
 say "agents found: ${#CONFS[@]}"
 
-# --- 2. user
-getent passwd "$DOCTOR_USER" > /dev/null || {
+# --- 2. user (an existing one the installer did not make gets root only after a yes)
+adopt_user() {
+  local ans
+  say "WARN: user $DOCTOR_USER exists and was not created by this installer;"
+  say "it gets passwordless root (sudo) and runs the doctor bot"
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    [ "${TG_DOCTOR_ADOPT_USER:-0}" = 1 ] \
+      || die "user $DOCTOR_USER already exists; to use it anyway set TG_DOCTOR_ADOPT_USER=1"
+    return 0
+  fi
+  read -r -p "[doctor] use the existing user $DOCTOR_USER for the doctor? [y/N] " ans
+  case "$ans" in
+    y | Y | yes | Yes) ;;
+    *) die "user $DOCTOR_USER kept as is; remove or rename it, or answer y" ;;
+  esac
+}
+if ! getent passwd "$DOCTOR_USER" > /dev/null; then
   say "creating user $DOCTOR_USER"
   useradd -m -s /bin/bash "$DOCTOR_USER"
-}
+elif [ ! -e "$R$USER_MARKER" ]; then
+  adopt_user
+fi
+mkdir -p "$R$OPT_DIR"
+[ -e "$R$USER_MARKER" ] || echo "$DOCTOR_USER" > "$R$USER_MARKER"
 
 # --- 3. sudo (validated before it is moved into place)
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$DOCTOR_USER" > "$WORK/sudoers"
@@ -141,9 +161,24 @@ if [ -f "$R$SUDOERS_FILE" ] && cmp -s "$WORK/sudoers" "$R$SUDOERS_FILE"; then
   chmod 440 "$R$SUDOERS_FILE"
 else
   # a dotted name is skipped by sudo, so a half-written file is never read
+  had_sudoers=0
+  if [ -f "$R$SUDOERS_FILE" ]; then
+    cp -p "$R$SUDOERS_FILE" "$WORK/sudoers.prev"
+    had_sudoers=1
+  fi
   install -m 440 "$WORK/sudoers" "$R$SUDOERS_TMP"
   chown root:root "$R$SUDOERS_TMP"
   mv -f "$R$SUDOERS_TMP" "$R$SUDOERS_FILE"
+  # the whole sudo config must still parse; otherwise put the previous state back
+  if ! visudo -c > /dev/null; then
+    if [ "$had_sudoers" = 1 ]; then
+      install -m 440 "$WORK/sudoers.prev" "$R$SUDOERS_TMP"
+      mv -f "$R$SUDOERS_TMP" "$R$SUDOERS_FILE"
+    else
+      rm -f -- "$R$SUDOERS_FILE"
+    fi
+    die "sudo config failed visudo -c after adding $SUDOERS_FILE; previous state restored"
+  fi
   say "sudo granted to $DOCTOR_USER"
 fi
 
@@ -190,12 +225,20 @@ fi
 
 # --- 8. bot token
 token_is_agents() {  # token_is_agents <token>: the bot id belongs to an agent
-  local conf sec agent
+  local conf sec agent name
   for conf in "${CONFS[@]}"; do
+    name="$(conf_get "$conf" AGENT_NAME)"
     sec="$(conf_get "$conf" SECRETS_DIR)"
-    [ -n "$sec" ] && [ -r "$R$sec/channel.conf" ] || continue
-    agent="$(conf_get "$R$sec/channel.conf" TELEGRAM_BOT_TOKEN)"
-    [ -n "$agent" ] && [ "${agent%%:*}" = "${1%%:*}" ] && return 0
+    agent=""
+    if [ -n "$sec" ] && [ -r "$R$sec/channel.conf" ]; then
+      agent="$(conf_get "$R$sec/channel.conf" TELEGRAM_BOT_TOKEN)"
+    fi
+    if [ -z "$agent" ]; then
+      say "WARN: could not read the bot token of agent ${name:-?} ($conf);" \
+        "make sure the doctor's bot is not that agent's bot"
+      continue
+    fi
+    [ "${agent%%:*}" = "${1%%:*}" ] && return 0
   done
   return 1
 }
@@ -223,9 +266,13 @@ choose_token() {
     fi
   fi
   if [ "$KEEP_BOT" = 1 ]; then
-    BOT_TOKEN="$existing"
-    BOT_USERNAME="$existing_name"
-    return 0
+    if username="$(get_me "$existing")"; then
+      BOT_TOKEN="$existing"
+      BOT_USERNAME="$username"
+      return 0
+    fi
+    say "Telegram no longer accepts the current doctor bot token; a new token is needed"
+    KEEP_BOT=0
   fi
   [ "$NONINTERACTIVE" = 1 ] \
     || say "create a NEW bot in @BotFather for the doctor (not an agent's bot)"
@@ -262,7 +309,7 @@ fi
 
 # --- 9. owner (agent.conf is writable by the agent, so it is never trusted on its own)
 choose_owner() {
-  local owners ans tries=0 conf
+  local owners ans again tries=0 conf
   if [ "$KEEP_BOT" = 1 ]; then
     OWNER_ID="$(conf_get "$R$ENV_FILE" ALLOWED_USERS)"
     [[ "$OWNER_ID" =~ ^[0-9]+$ ]] && return 0
@@ -279,12 +326,17 @@ choose_owner() {
       read -r -p "[doctor] type the owner Telegram ID: " ans
       if ! [[ "$ans" =~ ^[0-9]+$ ]]; then
         say "the owner ID must be digits"
-      elif [ -n "$owners" ] && [[ " $owners" != *" $ans "* ]]; then
-        say "this ID matches no agent's owner; check it and type again"
-      else
-        OWNER_ID="$ans"
-        break
+        continue
       fi
+      read -r -p "[doctor] type it once more: " again
+      if [ "$again" != "$ans" ]; then
+        say "the two IDs differ; type again"
+        continue
+      fi
+      [[ " $owners" == *" $ans "* ]] \
+        || say "WARN: ID $ans matches no agent's owner; using it as typed"
+      OWNER_ID="$ans"
+      break
     done
   fi
   [[ "$OWNER_ID" =~ ^[0-9]+$ ]] || die "no valid owner ID"
@@ -292,14 +344,25 @@ choose_owner() {
 choose_owner
 
 # --- 10. env file (values through the environment, never argv)
+keep_cap() {  # keep_cap <KEY> <default>: the env file's value when it is a positive number
+  local v=""
+  [ -r "$R$ENV_FILE" ] && v="$(conf_get "$R$ENV_FILE" "$1")"
+  if [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "$v" =~ [1-9] ]]; then
+    echo "$v"
+  else
+    echo "$2"
+  fi
+}
+COST_REQUEST="$(keep_cap CLAUDE_MAX_COST_PER_REQUEST "$MAX_COST_USD")"
+COST_USER="$(keep_cap CLAUDE_MAX_COST_PER_USER "$MAX_COST_USER_USD")"
 mkdir -p "$R$ENV_DIR"
 chmod 750 "$R$ENV_DIR"
 chown "root:$DOCTOR_USER" "$R$ENV_DIR"
 (
   umask 077
   DOCTOR_BOT_TOKEN="$BOT_TOKEN" DOCTOR_BOT_USERNAME="$BOT_USERNAME" \
-    DOCTOR_OWNER_ID="$OWNER_ID" DOCTOR_MAX_COST="$MAX_COST_USD" \
-    DOCTOR_MAX_COST_USER="$MAX_COST_USER_USD" \
+    DOCTOR_OWNER_ID="$OWNER_ID" DOCTOR_MAX_COST="$COST_REQUEST" \
+    DOCTOR_MAX_COST_USER="$COST_USER" \
     python3 "$KIT/scripts/render-template.py" "$KIT/server/doctor/env.template" "$WORK/env"
 ) || die "env file render failed"
 if place "$WORK/env" "$R$ENV_FILE" 640; then
@@ -324,7 +387,6 @@ if place "$KIT/server/doctor/agent-doctor.service.template" "$R$UNIT_FILE" 644; 
   CHANGED=1
   systemctl daemon-reload
 fi
-systemctl is-enabled --quiet "$UNIT_NAME" 2> /dev/null || systemctl enable --quiet "$UNIT_NAME"
 
 # --- 13. Claude login of the doctor user
 claude_ok() {
@@ -371,6 +433,8 @@ if ! wait_stable; then
     | sed -E 's#bot[0-9]+:[A-Za-z0-9_-]+#bot<hidden>#g' >&2 || true
   die "$UNIT_NAME did not stay up for ${STABLE_S}s"
 fi
+# enabled only now: until the install really finished, doctor-hint keeps reminding
+systemctl is-enabled --quiet "$UNIT_NAME" 2> /dev/null || systemctl enable --quiet "$UNIT_NAME"
 
 # --- 15. greeting, once per bot
 BOT_ID="${BOT_TOKEN%%:*}"

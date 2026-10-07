@@ -180,6 +180,25 @@ check "list-agents: unit without agent.conf is shown" bash -c \
 touch "$L2/.fake/inactive"
 check "list-agents: stopped unit shows its state" bash -c \
   "TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' | grep -Eq '^main +alice +failed'"
+# m8: an unknown argument is a usage error
+la_bad_arg() {
+  local rc=0
+  la "$L2" --bogus > "$DOC/la-bad.out" 2>&1 || rc=$?
+  [ "$rc" = 2 ] && grep -q '^usage: ' "$DOC/la-bad.out"
+}
+check "list-agents: unknown argument -> usage, exit 2" la_bad_arg
+# m3: without root an unreadable home hides agents; say so instead of a silent "none"
+if [ "$(id -u)" -ne 0 ]; then
+  L3="$(new_root la3)"
+  make_agent "$L3" carol main "$OWNER" 111111111
+  chmod 000 "$L3/home/carol"
+  la_note() {
+    la "$L3" > "$DOC/la3.out" 2>&1 \
+      && grep -q 'cannot read .*/home/carol.*run with sudo to see all agents' "$DOC/la3.out"
+  }
+  check "list-agents: unreadable home without root -> run-with-sudo note" la_note
+  chmod 755 "$L3/home/carol"
+fi
 
 # --- install-doctor end to end (fake root, fake system tools, real visudo)
 run_doctor() {  # run_doctor <root> <log> [VAR=value...]
@@ -257,6 +276,22 @@ new_tag() {
     && [ "$(grep -c 'systemctl restart' "$E/.fake/log")" = 2 ]
 }
 check "doctor: changed tag reinstalls and restarts" new_tag
+# I5: caps the owner edited survive a re-run; an invalid cap falls back to the default
+sed -i -e 's/^CLAUDE_MAX_COST_PER_REQUEST=.*/CLAUDE_MAX_COST_PER_REQUEST=7.5/' \
+  -e 's/^CLAUDE_MAX_COST_PER_USER=.*/CLAUDE_MAX_COST_PER_USER=80/' "$E/etc/agent-doctor/env"
+caps_kept() {
+  run_doctor "$E" "$DOC/e4.log" \
+    && grep -qx 'CLAUDE_MAX_COST_PER_REQUEST=7.5' "$E/etc/agent-doctor/env" \
+    && grep -qx 'CLAUDE_MAX_COST_PER_USER=80' "$E/etc/agent-doctor/env" \
+    && [ "$(grep -c 'systemctl restart' "$E/.fake/log")" = 2 ]
+}
+check "doctor: edited caps kept on re-run, no restart" caps_kept
+sed -i -e 's/^CLAUDE_MAX_COST_PER_REQUEST=.*/CLAUDE_MAX_COST_PER_REQUEST=0/' \
+  -e 's/^CLAUDE_MAX_COST_PER_USER=.*/CLAUDE_MAX_COST_PER_USER=lots/' "$E/etc/agent-doctor/env"
+caps_reset() {
+  run_doctor "$E" "$DOC/e5.log" && env_hardened "$E/etc/agent-doctor/env"
+}
+check "doctor: invalid caps reset to the defaults" caps_reset
 
 Z="$(new_root none)"
 check "doctor: no agents -> stop, points at install-server" \
@@ -292,6 +327,9 @@ make_agent "$N" alice main "$OWNER" 111111111
 touch "$N/.fake/login-fail"
 check "doctor: claude not logged in -> stop with the login command" \
   refused "$N" "$DOC/n.log" "su - doctor -c claude" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN"
+# the unit is enabled only when the install finished, so doctor-hint keeps reminding
+check "doctor: login not done -> unit not enabled" \
+  test ! -e "$N/.fake/enabled-agent-doctor.service"
 U="$(new_root unit)"
 make_agent "$U" alice main "$OWNER" 111111111
 touch "$U/.fake/inactive"
@@ -341,16 +379,94 @@ cp "$DOC/v.env" "$V/etc/agent-doctor/env"
 check "doctor: env without bot username is not kept -> asks for a token" \
   refused "$V" "$DOC/v.log" "TG_DOCTOR_BOT_TOKEN"
 check "doctor: sudoers temp file is gone" test ! -e "$E/etc/sudoers.d/.agent-doctor.tmp"
+run_io() {  # run_io <root> <log> <stdin line>...: interactive install, answers on stdin
+  local r="$1" log="$2"
+  shift 2
+  printf '%s\n' "$@" \
+    | env PATH="$FAKES:$PATH" TG_DOCTOR_ROOT="$r" TG_DOCTOR_DRY_RUN=1 \
+      TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 bash "$DK/install-doctor.sh" \
+      > "$log" 2>&1
+}
+# R5: the owner ID is typed twice; the two must match
 IO="$(new_root interactive)"
 make_agent "$IO" alice main "$OWNER" 111111111
-interactive_owner_refused() {  # token, Start, then three bad owner answers (empty, 999, 999)
-  ! printf '%s\n' "$DOCTOR_TOKEN" '' '' 999 999 \
-    | env PATH="$FAKES:$PATH" TG_DOCTOR_ROOT="$IO" TG_DOCTOR_DRY_RUN=1 \
-      TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 bash "$DK/install-doctor.sh" \
-      > "$DOC/io.log" 2>&1 \
-    && grep -q 'type again' "$DOC/io.log" && grep -q 'no valid owner ID' "$DOC/io.log"
+interactive_owner_refused() {  # token, Start, then: empty, two mismatched pairs
+  ! run_io "$IO" "$DOC/io.log" "$DOCTOR_TOKEN" '' '' 111 222 333 444 \
+    && grep -q 'must be digits' "$DOC/io.log" && grep -q 'differ' "$DOC/io.log" \
+    && grep -q 'no valid owner ID' "$DOC/io.log" && test ! -e "$IO/etc/agent-doctor/env"
 }
-check "doctor: interactive owner: empty and wrong answers are refused" interactive_owner_refused
+check "doctor: interactive owner: empty and mismatched answers are refused" \
+  interactive_owner_refused
+IU="$(new_root unknown-owner)"
+make_agent "$IU" alice main "$OWNER" 111111111
+unknown_owner_accepted() {  # an ID no agent knows: a warning, then accepted
+  run_io "$IU" "$DOC/iu.log" "$DOCTOR_TOKEN" '' 999 999 \
+    && grep -q 'WARN: .*999.*matches no agent' "$DOC/iu.log" \
+    && grep -qx 'ALLOWED_USERS=999' "$IU/etc/agent-doctor/env"
+}
+check "doctor: interactive owner: unknown ID warns and is accepted" unknown_owner_accepted
+# KEEP_BOT: the kept token is checked again with getMe
+KB="$(new_root keepbot)"
+make_agent "$KB" alice main "$OWNER" 111111111
+run_doctor "$KB" "$DOC/kb0.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" || true
+touch "$KB/.fake/getme-fail"
+check "doctor: kept token Telegram rejects -> asks for a new token" \
+  refused "$KB" "$DOC/kb.log" "no longer" TG_DOCTOR_BOT_TOKEN=
+check "doctor: git is a required tool" \
+  grep -Eq '^for tool in .*\bgit\b.*; do' "$DK/install-doctor.sh"
+# a doctor user the installer did not create is used only after an explicit yes
+AU="$(new_root adopt)"
+make_agent "$AU" alice main "$OWNER" 111111111
+touch "$AU/.fake/user-doctor"
+mkdir -p "$AU/home/doctor"
+adopt_refused() {
+  refused "$AU" "$DOC/au.log" "TG_DOCTOR_ADOPT_USER=1" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && test ! -e "$AU/etc/sudoers.d/agent-doctor"
+}
+check "doctor: foreign doctor user, non-interactive -> stop without sudo" adopt_refused
+adopt_ok() {
+  run_doctor "$AU" "$DOC/au2.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" TG_DOCTOR_ADOPT_USER=1 \
+    && test -e "$AU/opt/agent-doctor/.doctor-user" && ! grep -q useradd "$AU/.fake/log"
+}
+check "doctor: foreign doctor user adopted with TG_DOCTOR_ADOPT_USER=1" adopt_ok
+check "doctor: adopted user needs no flag next time" \
+  run_doctor "$AU" "$DOC/au3.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN"
+check "doctor: user created by the installer is marked" test -e "$E/opt/agent-doctor/.doctor-user"
+AI="$(new_root adopt-io)"
+make_agent "$AI" alice main "$OWNER" 111111111
+touch "$AI/.fake/user-doctor"
+adopt_io_no() {
+  ! run_io "$AI" "$DOC/ai.log" n && grep -q 'not created by this installer' "$DOC/ai.log" \
+    && test ! -e "$AI/etc/sudoers.d/agent-doctor"
+}
+check "doctor: foreign doctor user, interactive no -> stop" adopt_io_no
+# full visudo -c after the move; a failure puts the previous state back
+VC="$(new_root visudo-c)"
+make_agent "$VC" alice main "$OWNER" 111111111
+touch "$VC/.fake/visudo-c-fail"
+visudo_c_new() {
+  refused "$VC" "$DOC/vc.log" "visudo -c" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && test ! -e "$VC/etc/sudoers.d/agent-doctor"
+}
+check "doctor: visudo -c fails, no previous file -> new file removed" visudo_c_new
+mkdir -p "$VC/etc/sudoers.d"
+rm -f -- "$VC/etc/sudoers.d/agent-doctor"
+printf '# previous\n' > "$VC/etc/sudoers.d/agent-doctor"
+visudo_c_restored() {
+  refused "$VC" "$DOC/vc2.log" "visudo -c" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && [ "$(cat "$VC/etc/sudoers.d/agent-doctor")" = '# previous' ]
+}
+check "doctor: visudo -c fails -> previous sudoers restored" visudo_c_restored
+# m9: an agent whose token cannot be read is named, not skipped silently
+T9="$(new_root token-unchecked)"
+make_agent "$T9" alice main "$OWNER" 111111111
+make_agent "$T9" bob helper "$OWNER" 333333333
+rm -f -- "$T9/home/bob/.config/tg-agent/helper/channel.conf"
+token_unchecked_warns() {
+  run_doctor "$T9" "$DOC/t9.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && grep -q "WARN: .*agent helper" "$DOC/t9.log"
+}
+check "doctor: agent token not checkable -> warning names the agent" token_unchecked_warns
 O="$(new_root os)"
 make_agent "$O" alice main "$OWNER" 111111111
 printf 'ID=fedora\n' > "$O/etc/os-release"
