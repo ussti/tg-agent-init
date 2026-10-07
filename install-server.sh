@@ -19,6 +19,7 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIT_DIR
 readonly LIVE_TEST_TIMEOUT_S=240
 readonly PORT_WAIT_S=90
+readonly NODE_MAJOR_MIN=24  # agent-browser engines
 
 DO_SYSTEMD=1
 DO_CRON=1
@@ -57,10 +58,16 @@ check_plain() {
 # ---------------------------------------------------------------- preflight
 say "preflight"
 missing=()
-for cmd in bun tmux jq claude patch python3 ss curl node git crontab openssl; do
+for cmd in bun tmux jq claude patch python3 ss curl node npm git crontab openssl; do
   command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
-[ "${#missing[@]}" -eq 0 ] || die "missing commands: ${missing[*]} (see README: server prerequisites)"
+[ "${#missing[@]}" -eq 0 ] \
+  || die "missing commands: ${missing[*]} (as root: ./prepare-server.sh $(id -un), see README)"
+# agent-browser needs Node.js 24+; Ubuntu's own nodejs package is older.
+node_ver="$(node --version 2>/dev/null || true)"
+node_major="${node_ver#v}"; node_major="${node_major%%.*}"
+[[ "$node_major" =~ ^[0-9]+$ ]] && [ "$node_major" -ge "$NODE_MAJOR_MIN" ] \
+  || die "Node.js $NODE_MAJOR_MIN+ required, found ${node_ver:-none} (as root: ./prepare-server.sh $(id -un))"
 [ "$(uname -s)" = "Linux" ] || die "Linux only (systemd + ss)"
 
 # ---------------------------------------------------------------- answers

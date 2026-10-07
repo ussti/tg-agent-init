@@ -590,5 +590,33 @@ class StatusTest(unittest.TestCase):
         self.assertIn("vercel  logged in", out.getvalue())
 
 
+class ReadPinsTest(unittest.TestCase):
+    """versions.env is parsed as data, never executed."""
+
+    def test_parses_values_comments_and_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "versions.env"
+            path.write_bytes(b"# header\r\n\r\nVERCEL_CLI_VERSION=1.2.3\r\nX = y \n")
+            self.assertEqual(al.read_pins(path), {"VERCEL_CLI_VERSION": "1.2.3", "X": "y"})
+
+    def test_missing_file_gives_empty_dict(self) -> None:
+        self.assertEqual(al.read_pins(Path("/nonexistent/versions.env")), {})
+
+    def test_shell_syntax_is_not_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "versions.env"
+            path.write_text("A=$(touch pwned)\n")
+            self.assertEqual(al.read_pins(path), {"A": "$(touch pwned)"})
+            self.assertFalse((Path.cwd() / "pwned").exists())
+
+    def test_real_file_has_pins(self) -> None:
+        pins = al.read_pins(al.VERSIONS_FILE)
+        for key in ("AGENT_BROWSER_VERSION", "VERCEL_CLI_VERSION", "GWS_CLI_VERSION",
+                    "CRAWL4AI_VERSION", "LAST30DAYS_REPO", "LAST30DAYS_COMMIT"):
+            self.assertTrue(pins.get(key), key)
+        self.assertEqual(al.VERCEL_CLI_VERSION, pins["VERCEL_CLI_VERSION"])
+        self.assertRegex(pins["LAST30DAYS_COMMIT"], r"^[0-9a-f]{40}$")
+
+
 if __name__ == "__main__":
     unittest.main()

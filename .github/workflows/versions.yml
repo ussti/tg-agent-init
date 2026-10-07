@@ -1,0 +1,130 @@
+name: versions
+
+on:
+  schedule:
+    - cron: '0 1 * * 1'  # Monday 09:00 Asia/Makassar
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'kit/versions.env'
+      - 'kit/install-kit.sh'
+      - 'scripts/bump-versions.py'
+      - 'scripts/smoke-kit.sh'
+      - '.github/workflows/versions.yml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: versions-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DRY_RUN: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner context is not available in job-level env, so REPORT is set here.
+      - name: Paths
+        run: echo "REPORT=$RUNNER_TEMP/report.md" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # install-server.sh refuses to run without bun, so the installer tests need it
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          command -v pipx || { sudo apt-get update && sudo apt-get install -y pipx; }
+          command -v jq
+          python3 --version
+
+      - name: Check versions
+        id: check
+        run: |
+          set -euo pipefail
+          args=(--report "$REPORT")
+          [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
+          python3 scripts/bump-versions.py "${args[@]}" | tee "$RUNNER_TEMP/check.out"
+          tail -n 2 "$RUNNER_TEMP/check.out" >> "$GITHUB_OUTPUT"  # errors=N, changed=...
+
+      - name: Tests
+        id: tests
+        if: steps.check.outputs.changed == 'true' || env.DRY_RUN == '1'
+        continue-on-error: true
+        run: bash tests/run-tests.sh
+
+      - name: Real install and smoke
+        id: smoke
+        if: steps.check.outputs.changed == 'true' || env.DRY_RUN == '1'
+        continue-on-error: true
+        run: bash scripts/smoke-kit.sh "$REPORT"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Versions"; cat "$REPORT" 2>/dev/null || echo "no report"
+            echo; echo "tests: ${{ steps.tests.outcome }}, smoke: ${{ steps.smoke.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open PR
+        if: env.DRY_RUN == '0' && steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          ok=1
+          [ "${{ steps.tests.outcome }}" = success ] || ok=0
+          [ "${{ steps.smoke.outcome }}" = success ] || ok=0
+          branch="bot/versions-$(date -u +%F)-${{ github.run_id }}"
+          title="Обновление закреплённых версий $(date -u +%F)"
+          [ "$ok" = 1 ] || title="[checks failed] $title"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add kit/versions.env
+          git commit -m "$title"
+          git push origin "$branch"
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Автоматическая проверка новых версий набора."
+            echo
+            cat "$REPORT"
+            echo
+            echo "Тесты: ${{ steps.tests.outcome }}. Установка и запуск: ${{ steps.smoke.outcome }}."
+            echo "Лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "Раннер проверяет установку и запуск, не качество. Перед мержем проверить"
+            echo "на реальном сервере, особенно пробный поиск last30days."
+          } > "$body"
+          gh label create versions-bot --color BFD4F2 --force >/dev/null
+          draft=(); [ "$ok" = 1 ] || draft=(--draft)
+          url="$(gh pr create --base main --head "$branch" --title "$title" \
+            --body-file "$body" --label versions-bot "${draft[@]}")"
+          echo "opened $url"
+          # a failed draft must not replace last week's good PR
+          [ "$ok" = 1 ] || { echo "checks failed, PR opened as draft"; exit 1; }
+          gh pr list --label versions-bot --state open --json number,url \
+            --jq ".[] | select(.url != \"$url\") | .number" \
+          | while read -r n; do
+              gh pr close "$n" --comment "Заменён более свежей проверкой: $url"
+            done
+
+      # A dead registry or a moved repo shows as an error row and changed=false: make it red
+      - name: Fail on version check errors
+        if: always() && steps.check.outputs.errors != '0'
+        run: |
+          echo "version check errors: ${{ steps.check.outputs.errors }} (see the summary table)"
+          exit 1
+
+      - name: Fail dry run on failed checks
+        if: env.DRY_RUN == '1' && (steps.tests.outcome == 'failure' || steps.smoke.outcome == 'failure')
+        run: exit 1

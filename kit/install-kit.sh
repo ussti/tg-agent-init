@@ -43,6 +43,22 @@ say "linking skills"
 mkdir -p "$AGENT_WS/skills"
 link_skills
 
+# Skills dropped from the kit: an older install left them in skills/, where Claude still
+# tries to load them. Moved aside like replaced folders, never deleted.
+readonly -a RETIRED_SKILLS=(deep-research)
+retire_skills() {
+  local skill dest backup
+  for skill in "${RETIRED_SKILLS[@]}"; do
+    dest="$AGENT_WS/skills/$skill"
+    [ -e "$dest" ] || [ -L "$dest" ] || continue
+    backup="$AGENT_WS/skills-replaced/$skill.$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$AGENT_WS/skills-replaced"
+    say "moving retired skill $dest to $backup"
+    mv "$dest" "$backup"
+  done
+}
+retire_skills
+
 # Web-tool routing rule: appended once, the heading is the idempotency guard.
 append_web_rule() {
   local rules="$AGENT_WS/core/rules.md"
@@ -72,9 +88,23 @@ append_tools_map() {
 }
 append_tools_map
 
-readonly AGENT_BROWSER_VERSION="0.38.2"
-readonly CRAWL4AI_VERSION="0.9.4"
-readonly GWS_CLI_VERSION="1.5.0"
+# Pinned versions live in kit/versions.env; read as data, never sourced.
+pin() {  # pure bash: works with a bare PATH
+  local line
+  [ -r "$KIT/versions.env" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    if [ "${line%%=*}" = "$1" ] && [ "$line" != "$1" ]; then
+      printf '%s\n' "${line#*=}"
+      return 0
+    fi
+  done < "$KIT/versions.env"
+}
+AGENT_BROWSER_VERSION="$(pin AGENT_BROWSER_VERSION)"
+CRAWL4AI_VERSION="$(pin CRAWL4AI_VERSION)"
+GWS_CLI_VERSION="$(pin GWS_CLI_VERSION)"
+readonly AGENT_BROWSER_VERSION CRAWL4AI_VERSION GWS_CLI_VERSION
+[ -r "$KIT/versions.env" ] || warn "no $KIT/versions.env: pinned tools will be skipped"
 readonly LOCAL_PREFIX="$HOME/.local"
 readonly -a MARKETPLACES=("anthropics/claude-plugins-official")
 readonly -a KIT_PLUGINS=(
@@ -85,24 +115,35 @@ readonly -a KIT_PLUGINS=(
 readonly NET_TIMEOUT=600  # seconds; a hung download must not hang the whole install
 
 # Run a command silently with a time limit; stdin closed so nothing can wait for input.
+# setsid drops the controlling terminal as well, so a nested sudo fails at once instead of
+# asking for a password (playwright's --with-deps calls sudo for apt).
 try() {
-  if command -v timeout > /dev/null; then
-    timeout "$NET_TIMEOUT" "$@" < /dev/null > /dev/null 2>&1
-  else
-    "$@" < /dev/null > /dev/null 2>&1
-  fi
+  local pre=()
+  command -v setsid > /dev/null && pre+=(setsid -w)
+  command -v timeout > /dev/null && pre+=(timeout "$NET_TIMEOUT")
+  "${pre[@]}" "$@" < /dev/null > /dev/null 2>&1
+}
+
+# Shared libraries headless Chrome needs and minimal server images lack. Root installs
+# them once (prepare-server.sh); the kit only checks, it never calls sudo.
+readonly BROWSER_LIBS=(libnss3.so libatk-bridge-2.0.so.0 libgbm.so.1 libxkbcommon.so.0 libasound.so.2)
+LDCONFIG="${KIT_LDCONFIG:-$(command -v ldconfig || echo /sbin/ldconfig)}"
+
+# Print the browser libraries missing from the linker cache; empty when all are there
+# or when there is no way to tell.
+browser_libs_missing() {
+  local cache lib missing=()
+  cache="$("$LDCONFIG" -p 2> /dev/null)" || return 0
+  for lib in "${BROWSER_LIBS[@]}"; do
+    grep -qF "$lib (" <<< "$cache" || missing+=("$lib")
+  done
+  echo "${missing[*]}"
 }
 
 # Read the pinned repo/commit of the last30days skill into LAST30_REPO / LAST30_COMMIT.
 read_last30_pin() {
-  local file="$KIT/skills/research/last30days/UPSTREAM"
-  LAST30_REPO="" LAST30_COMMIT=""
-  if [ -r "$file" ]; then
-    LAST30_REPO="$(sed -n 's/^repo=//p' "$file" || true)"
-    LAST30_COMMIT="$(sed -n 's/^commit=//p' "$file" || true)"
-  else
-    warn "last30days: $file missing; the skill stays a stub"
-  fi
+  LAST30_REPO="$(pin LAST30DAYS_REPO)"
+  LAST30_COMMIT="$(pin LAST30DAYS_COMMIT)"
 }
 
 # True when dir is a checkout whose HEAD is exactly the pinned commit.
@@ -125,30 +166,55 @@ relink_last30days  # link_skills just reset it to the stub; a downloaded copy wi
 install_deps() {
   mkdir -p "$LOCAL_PREFIX/bin"
   export PATH="$LOCAL_PREFIX/bin:$PATH"  # tools installed below must be found right away
-  if command -v npm > /dev/null; then
+  if [ -z "$AGENT_BROWSER_VERSION" ]; then
+    warn "agent-browser: no pinned version in versions.env; skipped"
+  elif [ "$(agent-browser --version 2> /dev/null < /dev/null | awk '{print $NF}')" = "$AGENT_BROWSER_VERSION" ]; then
+    :  # already there, possibly as the standalone binary npm would refuse to overwrite
+  elif command -v npm > /dev/null; then
     try npm install -g --prefix "$LOCAL_PREFIX" "agent-browser@$AGENT_BROWSER_VERSION" \
       || warn "agent-browser not installed; later: npm install -g --prefix ~/.local agent-browser@$AGENT_BROWSER_VERSION"
   else
-    warn "npm not found: agent-browser skipped (install Node.js, then rerun kit/install-kit.sh)"
+    warn "npm not found: agent-browser skipped (as root: ./prepare-server.sh $(id -un), then rerun kit/install-kit.sh)"
   fi
   mkdir -p "$HOME/.agent-browser"
   [ -f "$HOME/.agent-browser/config.json" ] \
     || cp "$KIT/config/agent-browser.json" "$HOME/.agent-browser/config.json"
 
   if command -v pipx > /dev/null; then
-    local pkg
-    for pkg in "gws-cli==$GWS_CLI_VERSION" "crawl4ai==$CRAWL4AI_VERSION" yt-dlp; do
+    local pkg pkgs=()
+    if [ -n "$GWS_CLI_VERSION" ]; then pkgs+=("gws-cli==$GWS_CLI_VERSION")
+    else warn "gws-cli: no pinned version in versions.env; skipped"; fi
+    if [ -n "$CRAWL4AI_VERSION" ]; then pkgs+=("crawl4ai==$CRAWL4AI_VERSION")
+    else warn "crawl4ai: no pinned version in versions.env; skipped"; fi
+    pkgs+=(yt-dlp)
+    for pkg in "${pkgs[@]}"; do
       try pipx install --force "$pkg" || warn "$pkg not installed; later: pipx install --force '$pkg'"
     done
   else
-    warn "pipx not found: gws-cli, crawl4ai, yt-dlp skipped (sudo apt install pipx, then rerun)"
+    warn "pipx not found: gws-cli, crawl4ai, yt-dlp skipped (as root: ./prepare-server.sh $(id -un), then rerun)"
   fi
 
+  # Browsers download into the user's cache, never with --with-deps: system libraries are
+  # root's job (prepare-server.sh), and a sudo prompt would stall the install.
+  local browsers=0 c4py libs
   if command -v agent-browser > /dev/null; then
-    try agent-browser install || warn "agent-browser: Chrome download failed; later: agent-browser install (if Chrome lacks system libraries: sudo $LOCAL_PREFIX/bin/agent-browser install --with-deps)"
+    browsers=1
+    try agent-browser install || warn "agent-browser: Chrome download failed; later: agent-browser install"
   fi
   if command -v crawl4ai-setup > /dev/null; then
-    try crawl4ai-setup || warn "crawl4ai: browser setup failed; later: crawl4ai-setup"
+    browsers=1
+    try crawl4ai-setup || warn "crawl4ai: setup failed; later: crawl4ai-setup"
+    # crawl4ai-setup asks for Chrome with system deps, which fails without root; the
+    # bundled Chromium is what crawl4ai launches by default.
+    c4py="$(dirname "$(readlink -f "$(command -v crawl4ai-setup)")")/python"
+    if [ -x "$c4py" ]; then
+      try "$c4py" -m playwright install chromium \
+        || warn "crawl4ai: Chromium download failed; later: $c4py -m playwright install chromium"
+    fi
+  fi
+  if [ "$browsers" = 1 ]; then
+    libs="$(browser_libs_missing)"
+    [ -z "$libs" ] || warn "browsers will not start, system libraries missing: $libs. As root: ./prepare-server.sh $(id -un) (or just: npx -y playwright install-deps chromium)"
   fi
 
   local dest tmp
@@ -156,7 +222,7 @@ install_deps() {
   dest="$KIT/vendor/last30days"
   mkdir -p "$KIT/vendor"
   if [ -z "$LAST30_REPO" ] || [ -z "$LAST30_COMMIT" ]; then
-    warn "last30days: no pinned repo/commit in UPSTREAM; skipped"
+    warn "last30days: no pinned repo/commit in versions.env; the skill stays a stub"
   elif [ -d "$dest/.git" ]; then  # rerun: update the existing checkout instead of cloning
     try git -C "$dest" fetch || warn "last30days: fetch failed (offline?); keeping the current checkout"
     try git -C "$dest" checkout "$LAST30_COMMIT" \
