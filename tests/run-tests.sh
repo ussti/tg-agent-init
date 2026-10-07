@@ -345,6 +345,11 @@ check "agent-browser config has the exact values" jq -e \
 check "onboard still a plain folder from core" test -f "$WS/skills/onboard/SKILL.md"
 check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
+check "a deep-research folder left by an older install is moved out of skills/" bash -c "
+  mkdir -p '$WS/skills/deep-research/research-deep' && touch '$WS/skills/deep-research/research-deep/SKILL.md' \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && [ ! -e '$WS/skills/deep-research' ] \
+  && ls -d '$WS'/skills-replaced/deep-research.* >/dev/null 2>&1"
 check "re-running install-kit replaces a plain skill dir by a link and keeps the old one" bash -c "
   rm '$WS/skills/quick-reminders' && mkdir '$WS/skills/quick-reminders' \
   && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \

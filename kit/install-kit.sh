@@ -43,6 +43,22 @@ say "linking skills"
 mkdir -p "$AGENT_WS/skills"
 link_skills
 
+# Skills dropped from the kit: an older install left them in skills/, where Claude still
+# tries to load them. Moved aside like replaced folders, never deleted.
+readonly -a RETIRED_SKILLS=(deep-research)
+retire_skills() {
+  local skill dest backup
+  for skill in "${RETIRED_SKILLS[@]}"; do
+    dest="$AGENT_WS/skills/$skill"
+    [ -e "$dest" ] || [ -L "$dest" ] || continue
+    backup="$AGENT_WS/skills-replaced/$skill.$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$AGENT_WS/skills-replaced"
+    say "moving retired skill $dest to $backup"
+    mv "$dest" "$backup"
+  done
+}
+retire_skills
+
 # Web-tool routing rule: appended once, the heading is the idempotency guard.
 append_web_rule() {
   local rules="$AGENT_WS/core/rules.md"
