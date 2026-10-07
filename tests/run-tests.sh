@@ -52,7 +52,7 @@ done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts"
            "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/update.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
-  "$KIT/tests/fake-brain-mcp.py"
+  "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
 find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || true
 
 echo "== 3. ratewatch"
@@ -63,6 +63,8 @@ check "agent-login unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_login.py'
 check "kit skills unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_kit_skills.py'
+check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/scripts/tests"
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.
