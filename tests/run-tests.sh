@@ -10,6 +10,7 @@
 #      when GBRAIN_TEST_PYTHON points at a python with the brain's deps)
 #   6. install-fleet end-to-end: two agents, fake brain (token issuer + stateful
 #      MCP servers), fake systemctl
+#   6b. doctor: templates, list-agents, install-doctor end to end on fakes, doctor-hint
 #   7. with --with-plugin: build the patched plugin, bun install, typecheck, bun test
 set -euo pipefail
 
@@ -930,6 +931,10 @@ check "half-present brain refused" refused "$FL/run12.log" "exists but"
 mv "$FL/python.moved" "$GB/.venv/bin/python"
 sed -i 's/^    body = {$/    body = {\n        "agentId": to_agent,/' "$GB/services/swarm_mcp/worker.py"
 check "unpatched brain refused" refused "$FL/run6.log" "lacks patch 0001"
+
+echo "== 6b. doctor"
+# shellcheck source=tests/doctor.test.sh
+source "$KIT/tests/doctor.test.sh"
 
 if [ "$WITH_PLUGIN" = "1" ]; then
   echo "== 7. plugin build + tests"

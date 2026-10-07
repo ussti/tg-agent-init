@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent doctor (Telegram, root through sudo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=doctor
+WorkingDirectory=/home/doctor
+EnvironmentFile=/etc/agent-doctor/env
+Environment=HOME=/home/doctor
+Environment=PATH=/home/doctor/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/agent-doctor/venv/bin/claude-telegram-bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
