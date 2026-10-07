@@ -13,6 +13,7 @@ pin() { sed -n "s/^$1=//p" "$V" | tr -d '\r' | head -n 1; }
 
 SMOKE_HOME="${SMOKE_HOME:-$(mktemp -d)}"
 export HOME="$SMOKE_HOME"
+unset PIPX_HOME PIPX_BIN_DIR  # GitHub runners point pipx at /opt; keep it under this HOME
 export PATH="$HOME/.local/bin:$PATH"
 WS="$HOME/ws"
 mkdir -p "$WS"
@@ -30,8 +31,9 @@ gate() {  # gate <name> <detail-on-success> <cmd...>
   fi
 }
 has_version() {  # has_version <expected> <cmd...>: command output contains the version
-  local want="$1"; shift
-  "$@" 2>&1 | grep -qF "$want"
+  local want="$1" out; shift
+  out="$("$@" 2>&1)" || return 1  # no pipe: an early grep -q exit must not SIGPIPE the tool
+  [[ $out == *"$want"* ]]
 }
 pipx_version() {  # pipx_version <package> -> installed version
   pipx list --json | python3 -c \

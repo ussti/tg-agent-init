@@ -38,6 +38,9 @@ jobs:
         with:
           node-version: '22'
 
+      # install-server.sh refuses to run without bun, so the installer tests need it
+      - uses: oven-sh/setup-bun@v2
+
       - name: Tools
         run: |
           set -euo pipefail
@@ -52,7 +55,7 @@ jobs:
           args=(--report "$REPORT")
           [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
           python3 scripts/bump-versions.py "${args[@]}" | tee "$RUNNER_TEMP/check.out"
-          tail -n 1 "$RUNNER_TEMP/check.out" >> "$GITHUB_OUTPUT"
+          tail -n 2 "$RUNNER_TEMP/check.out" >> "$GITHUB_OUTPUT"  # errors=N, changed=...
 
       - name: Tests
         id: tests
@@ -107,12 +110,20 @@ jobs:
           url="$(gh pr create --base main --head "$branch" --title "$title" \
             --body-file "$body" --label versions-bot "${draft[@]}")"
           echo "opened $url"
+          # a failed draft must not replace last week's good PR
+          [ "$ok" = 1 ] || { echo "checks failed, PR opened as draft"; exit 1; }
           gh pr list --label versions-bot --state open --json number,url \
             --jq ".[] | select(.url != \"$url\") | .number" \
           | while read -r n; do
               gh pr close "$n" --comment "Заменён более свежей проверкой: $url"
             done
-          [ "$ok" = 1 ] || { echo "checks failed, PR opened as draft"; exit 1; }
+
+      # A dead registry or a moved repo shows as an error row and changed=false: make it red
+      - name: Fail on version check errors
+        if: always() && steps.check.outputs.errors != '0'
+        run: |
+          echo "version check errors: ${{ steps.check.outputs.errors }} (see the summary table)"
+          exit 1
 
       - name: Fail dry run on failed checks
         if: env.DRY_RUN == '1' && (steps.tests.outcome == 'failure' || steps.smoke.outcome == 'failure')

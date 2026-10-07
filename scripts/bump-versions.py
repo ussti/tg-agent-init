@@ -3,7 +3,8 @@
 
 Reads kit/versions.env (KEY=VALUE data), asks npm, PyPI and git for the latest
 stable versions, rewrites newer pins in place (unless --dry-run) and writes a
-Markdown report. The last stdout line is `changed=true|false` for GITHUB_OUTPUT.
+Markdown report. The last two stdout lines, `errors=N` and `changed=true|false`, go to
+GITHUB_OUTPUT.
 """
 
 from __future__ import annotations
@@ -195,6 +196,9 @@ def check_registry(src: Source, pins: dict[str, str], fetch: FetchJson) -> Row:
     if not src.key:
         return Row(src.item, "", pinned, latest, "report only", src.changelog)
     new_key, old_key = version_key(latest), version_key(pinned)
+    if old_key is None:  # write_pins only replaces existing lines: never "bump" a bad pin
+        return Row(src.item, src.key, pinned or "none", latest,
+                   f"error: no valid {src.key} pin", src.changelog)
     if new_key is None:
         return Row(src.item, src.key, pinned, latest, "skipped: not a stable version",
                    src.changelog)
@@ -311,6 +315,7 @@ def run_cli(argv: list[str], fetch: FetchJson, git: Git) -> tuple[int, str]:
         if args.report:
             args.report.write_text(report, encoding="utf-8")
         print(report, end="")
+        print(f"errors={sum(r.status.startswith('error') for r in rows)}")
         print(f"changed={'true' if changed else 'false'}")
     return 0, buffer.getvalue()
 

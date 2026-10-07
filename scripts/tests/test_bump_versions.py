@@ -164,6 +164,21 @@ class BumpTest(unittest.TestCase):
         self.assertEqual(out.strip().splitlines()[-1], "changed=false")
         self.assertIn("| Item |", report.read_text())
 
+    def test_missing_pin_is_an_error_not_a_bump(self) -> None:
+        self.path.write_text(PINS_TEXT.replace("CRAWL4AI_VERSION=0.9.4\n", ""))
+        rows, changed = self.run_check(registry(c4="0.10.1"), FakeGit({"v3.9.4": OLD}))
+        self.assertFalse(changed)
+        row = next(r for r in rows if r.key == "CRAWL4AI_VERSION")
+        self.assertTrue(row.status.startswith("error"))
+
+    def test_cli_counts_error_rows_before_the_changed_line(self) -> None:
+        answers = registry()
+        answers["https://registry.npmjs.org/vercel/latest"] = OSError("HTTP 503")
+        code, out = bv.run_cli(["--versions", str(self.path), "--dry-run"],
+                               fake_fetch(answers), FakeGit({"v3.9.4": OLD}))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip().splitlines()[-2:], ["errors=1", "changed=false"])
+
     def test_cli_missing_versions_file_exits_2(self) -> None:
         code, _ = bv.run_cli(["--versions", "/nonexistent"], fake_fetch({}), FakeGit({}))
         self.assertEqual(code, 2)
