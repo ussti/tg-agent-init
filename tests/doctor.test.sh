@@ -19,6 +19,7 @@ DOC="$WORK/doctor"
 FAKES="$KIT/tests/fakes/doctor"
 SD="$KIT/server/doctor"
 mkdir -p "$DOC"
+for f in "$FAKES"/*; do check "doctor: syntax $(basename "$f")" bash -n "$f"; done
 # Bot-token shaped test values, built at run time (no literal token in the repo).
 DUMMY_TAIL="$(printf 'x%.0s' $(seq 1 35))"
 DOCTOR_TOKEN="222222222:$DUMMY_TAIL"
@@ -63,6 +64,64 @@ if command -v visudo > /dev/null; then
 fi
 check "doctor: CLAUDE.md works through sudo -u" grep -q 'sudo -u <user> -H' "$SD/CLAUDE.md"
 check "doctor: CLAUDE.md forbids self-install" grep -q 'Never run install-doctor.sh' "$SD/CLAUDE.md"
+
+# --- fixtures
+new_root() {  # new_root <name>: fresh fake server root, prints its path
+  local r="$DOC/$1"
+  rm -rf -- "$r"
+  mkdir -p "$r/etc" "$r/.fake"
+  printf 'ID=ubuntu\nID_LIKE=debian\n' > "$r/etc/os-release"
+  echo "$r"
+}
+make_agent() {  # make_agent <root> <user> <name> <owner> <bot_id>
+  local r="$1" u="$2" n="$3" own="$4" id="$5"
+  local ws="/home/$u/agents/$n/.claude" sec="/home/$u/.config/tg-agent/$n"
+  mkdir -p "$r$ws" "$r$sec"
+  cat > "$r$ws/agent.conf" <<EOF
+AGENT_NAME="$n"
+AGENT_HOME="/home/$u/agents/$n"
+AGENT_WS="$ws"
+SECRETS_DIR="$sec"
+OWNER_CHAT_ID="$own"
+LOG_DIR="$ws/logs"
+EOF
+  printf 'TELEGRAM_BOT_TOKEN="%s:%s"\n' "$id" "$DUMMY_TAIL" > "$r$sec/channel.conf"
+}
+la() {  # la <root> [args]: list-agents.sh against a fake root, fake systemctl first
+  TG_DOCTOR_ROOT="$1" PATH="$FAKES:$PATH" bash "$SD/list-agents.sh" "${@:2}"
+}
+
+# --- list-agents
+L0="$(new_root la0)"
+check "list-agents: none -> message, exit 0" bash -c \
+  "[ \"\$(TG_DOCTOR_ROOT='$L0' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh')\" = 'no agents found' ]"
+check "list-agents: none -> no conf paths" bash -c \
+  "[ -z \"\$(TG_DOCTOR_ROOT='$L0' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' --conf-paths)\" ]"
+L1="$(new_root la1)"
+make_agent "$L1" alice main "$OWNER" 111111111
+la1_ok() {
+  local out
+  out="$(la "$L1")"
+  grep -Eq '^main +alice +active +active +/home/alice/agents/main/.claude$' <<< "$out"
+}
+check "list-agents: one agent with user, units, workspace" la1_ok
+L2="$(new_root la2)"
+make_agent "$L2" alice main "$OWNER" 111111111
+make_agent "$L2" bob helper 555 333333333
+cp -a "$L2/home/bob/agents/helper/.claude" "$L2/home/bob/agents/helper/.claude.bak_20260101"
+la2_ok() {
+  [ "$(la "$L2" --conf-paths | wc -l)" = 2 ] \
+    && la "$L2" --conf-paths | grep -qx "$L2/home/bob/agents/helper/.claude/agent.conf" \
+    && la "$L2" | grep -Eq '^helper +bob '
+}
+check "list-agents: two users, backup copy ignored" la2_ok
+printf 'ghost-agent.service loaded active running Ghost\n' > "$L2/.fake/units"
+check "list-agents: unit without agent.conf is shown" bash -c \
+  "TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' \
+   | grep -Eq '^ghost +\\? +'"
+touch "$L2/.fake/inactive"
+check "list-agents: stopped unit shows its state" bash -c \
+  "TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' | grep -Eq '^main +alice +failed'"
 
 if [ "${DOCTOR_STANDALONE:-0}" = 1 ]; then
   echo
