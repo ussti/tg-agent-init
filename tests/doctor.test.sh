@@ -11,7 +11,11 @@ if ! declare -F check > /dev/null; then
   fail=0
   ok() { pass=$((pass + 1)); echo "  ok   $*"; }
   bad() { fail=$((fail + 1)); echo "  FAIL $*"; }
-  check() { local desc="$1"; shift; if "$@" > /dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi; }
+  check() {
+    local desc="$1"
+    shift
+    if "$@" > /dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi
+  }
   DOCTOR_STANDALONE=1
 fi
 
@@ -66,9 +70,16 @@ env_rendered() {
     && grep -qx 'AGENTIC_MODE=true' "$DOC/env"
 }
 check "doctor: env template renders every key" env_rendered
-check "doctor: env template refuses a missing key" bash -c \
-  "! DOCTOR_BOT_USERNAME=x DOCTOR_OWNER_ID=1 DOCTOR_MAX_COST=5 \
-   python3 '$KIT/scripts/render-template.py' '$SD/env.template' '$DOC/env-missing'"
+missing_key_refused() {  # every key but the token set; env -u: an exported one cannot leak in
+  local out
+  rm -f -- "$DOC/env-missing"
+  ! out="$(env -u DOCTOR_BOT_TOKEN DOCTOR_BOT_USERNAME=x DOCTOR_OWNER_ID=1 \
+    DOCTOR_MAX_COST=5 DOCTOR_MAX_COST_USER=50 \
+    python3 "$KIT/scripts/render-template.py" "$SD/env.template" "$DOC/env-missing" 2>&1)" \
+    && grep -q 'unset DOCTOR_BOT_TOKEN' <<< "$out" && test ! -e "$DOC/env-missing"
+}
+check "doctor: env template refuses a missing key, names it, writes nothing" \
+  missing_key_refused
 unit_ok() {
   grep -qx 'User=doctor' "$SD/agent-doctor.service.template" \
     && grep -qx 'Restart=always' "$SD/agent-doctor.service.template" \
@@ -80,7 +91,8 @@ if command -v systemd-analyze > /dev/null; then
   # the real ExecStart does not exist here; verify a copy that points at /bin/true
   sed 's#^ExecStart=.*#ExecStart=/bin/true#' "$SD/agent-doctor.service.template" \
     > "$DOC/agent-doctor.service"
-  check "doctor: unit passes systemd-analyze verify" systemd-analyze verify "$DOC/agent-doctor.service"
+  check "doctor: unit passes systemd-analyze verify" \
+    systemd-analyze verify "$DOC/agent-doctor.service"
 fi
 if command -v visudo > /dev/null; then
   printf 'doctor ALL=(ALL) NOPASSWD:ALL\n' > "$DOC/sudoers"
@@ -142,11 +154,13 @@ la() {  # la <root> [args]: list-agents.sh against a fake root, fake systemctl f
 }
 
 # --- list-agents
+la_has() {  # la_has <ERE> <root> [args]: some output line of list-agents matches
+  local out
+  out="$(la "${@:2}")" && grep -Eq -- "$1" <<< "$out"
+}
 L0="$(new_root la0)"
-check "list-agents: none -> message, exit 0" bash -c \
-  "[ \"\$(TG_DOCTOR_ROOT='$L0' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh')\" = 'no agents found' ]"
-check "list-agents: none -> no conf paths" bash -c \
-  "[ -z \"\$(TG_DOCTOR_ROOT='$L0' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' --conf-paths)\" ]"
+check "list-agents: none -> message, exit 0" bash -c '[ "$1" = "no agents found" ]' _ "$(la "$L0")"
+check "list-agents: none -> no conf paths" bash -c '[ -z "$1" ]' _ "$(la "$L0" --conf-paths)"
 L1="$(new_root la1)"
 make_agent "$L1" alice main "$OWNER" 111111111
 la1_ok() {
@@ -165,21 +179,17 @@ la2_ok() {
 }
 check "list-agents: two users" la2_ok
 # Backup copies that the include pattern */.claude/agent.conf WOULD match; each must be skipped.
+HELPER_CONF="$L2/home/bob/agents/helper/.claude/agent.conf"
 mkdir -p "$L2/home/bob/agents/helper.bak_20260101/.claude" "$L2/home/bob/backups/x/.claude"
-cp "$L2/home/bob/agents/helper/.claude/agent.conf" "$L2/home/bob/agents/helper.bak_20260101/.claude/"
-cp "$L2/home/bob/agents/helper/.claude/agent.conf" "$L2/home/bob/backups/x/.claude/"
-check "list-agents: .bak_ copy ignored" bash -c \
-  "! TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' --conf-paths | grep -q 'bak_'"
-check "list-agents: backups/ copy ignored" bash -c \
-  "! TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' --conf-paths | grep -q '/backups/'"
+cp "$HELPER_CONF" "$L2/home/bob/agents/helper.bak_20260101/.claude/"
+cp "$HELPER_CONF" "$L2/home/bob/backups/x/.claude/"
+check "list-agents: .bak_ copy ignored" eval '! la_has bak_ "$L2" --conf-paths'
+check "list-agents: backups/ copy ignored" eval '! la_has /backups/ "$L2" --conf-paths'
 check "list-agents: backup copies leave two agents" la2_ok
 printf 'ghost-agent.service loaded active running Ghost\n' > "$L2/.fake/units"
-check "list-agents: unit without agent.conf is shown" bash -c \
-  "TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' \
-   | grep -Eq '^ghost +\\? +'"
+check "list-agents: unit without agent.conf is shown" la_has '^ghost +\? +' "$L2"
 touch "$L2/.fake/inactive"
-check "list-agents: stopped unit shows its state" bash -c \
-  "TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' | grep -Eq '^main +alice +failed'"
+check "list-agents: stopped unit shows its state" la_has '^main +alice +failed' "$L2"
 # m8: an unknown argument is a usage error
 la_bad_arg() {
   local rc=0
@@ -378,7 +388,23 @@ grep -v '^TELEGRAM_BOT_USERNAME=' "$V/etc/agent-doctor/env" > "$DOC/v.env"
 cp "$DOC/v.env" "$V/etc/agent-doctor/env"
 check "doctor: env without bot username is not kept -> asks for a token" \
   refused "$V" "$DOC/v.log" "TG_DOCTOR_BOT_TOKEN"
-check "doctor: sudoers temp file is gone" test ! -e "$E/etc/sudoers.d/.agent-doctor.tmp"
+sudoers_moved() {  # m13: written to the dotted temp name, then moved; never written in place
+  test ! -e "$E/etc/sudoers.d/.agent-doctor.tmp" \
+    && grep -qxF "mv -f $E/etc/sudoers.d/.agent-doctor.tmp $E/etc/sudoers.d/agent-doctor" \
+      "$E/.fake/log"
+}
+check "doctor: sudoers moved into place from the temp file, temp file gone" sudoers_moved
+# m12: a sudoers line visudo -cf rejects stops the install before anything is installed
+VF="$(new_root visudo-cf)"
+make_agent "$VF" alice main "$OWNER" 111111111
+touch "$VF/.fake/visudo-cf-fail"
+visudo_cf_stops() {
+  refused "$VF" "$DOC/vf.log" "visudo -cf" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && test ! -e "$VF/etc/sudoers.d/agent-doctor" \
+    && test ! -e "$VF/etc/sudoers.d/.agent-doctor.tmp" \
+    && test ! -e "$VF/etc/agent-doctor/env"
+}
+check "doctor: visudo -cf fails -> sudoers not installed, install stops" visudo_cf_stops
 run_io() {  # run_io <root> <log> <stdin line>...: interactive install, answers on stdin
   local r="$1" log="$2"
   shift 2
@@ -412,6 +438,16 @@ run_doctor "$KB" "$DOC/kb0.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" || true
 touch "$KB/.fake/getme-fail"
 check "doctor: kept token Telegram rejects -> asks for a new token" \
   refused "$KB" "$DOC/kb.log" "no longer" TG_DOCTOR_BOT_TOKEN=
+# m12: interactive "n" to keeping the bot -> a new token, Start, owner typed twice
+KN="$(new_root keep-no)"
+make_agent "$KN" alice main "$OWNER" 111111111
+run_doctor "$KN" "$DOC/kn0.log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" || true
+keep_no_replaces() {
+  run_io "$KN" "$DOC/kn.log" n "444444444:$DUMMY_TAIL" '' "$OWNER" "$OWNER" \
+    && grep -q '^TELEGRAM_BOT_TOKEN=444444444:' "$KN/etc/agent-doctor/env" \
+    && grep -qx "ALLOWED_USERS=$OWNER" "$KN/etc/agent-doctor/env"
+}
+check "doctor: interactive keep=n -> new token and owner written" keep_no_replaces
 check "doctor: git is a required tool" \
   grep -Eq '^for tool in .*\bgit\b.*; do' "$DK/install-doctor.sh"
 # a doctor user the installer did not create is used only after an explicit yes

@@ -182,11 +182,30 @@ check "install-server ends with the doctor step" \
   grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
 check "install-server: doctor hint is non-fatal" bash -c \
   "tail -1 '$KIT/install-server.sh' | grep -q 'doctor-hint.sh.*|| true'"
-check "prepare-server final text clones the doctor kit as root" \
-  grep -qF 'sudo git clone https://github.com/ussti/tg-agent-init /opt/agent-doctor/kit' \
-  "$KIT/prepare-server.sh"
-check "prepare-server final text runs the root-owned doctor kit" \
-  grep -qF 'sudo bash /opt/agent-doctor/kit/install-doctor.sh' "$KIT/prepare-server.sh"
+# The text prepare-server.sh prints at the end: its last cat <<EOF body, expanded with
+# sample values the way the script expands it, so a command elsewhere in the file (a
+# comment, a dead branch) cannot satisfy the checks below.
+prep_final_text() {
+  local body
+  body="$(awk '/^cat <<EOF$/ { buf = ""; on = 1; next }
+    on && /^EOF$/ { last = buf; on = 0; next }
+    on { buf = buf $0 "\n" }
+    END { printf "%s", last }' "$KIT/prepare-server.sh")"
+  [ -n "$body" ] || return 1
+  AGENT_USER=agent DEST=/home/agent/tg-agent-init bash -c "cat <<EOF
+$body
+EOF"
+}
+prep_final_ok() {
+  local text
+  text="$(prep_final_text)" \
+    && grep -qxF '  su - agent' <<< "$text" \
+    && grep -qxF '  sudo git clone https://github.com/ussti/tg-agent-init /opt/agent-doctor/kit' \
+      <<< "$text" \
+    && grep -qxF '  sudo bash /opt/agent-doctor/kit/install-doctor.sh' <<< "$text" \
+    && ! grep -q 'tg-agent-init/install-doctor' <<< "$text"
+}
+check "prepare-server final text: clone and run the root-owned doctor kit" prep_final_ok
 
 check "installer stops on Node.js older than 24 and names prepare-server" bash -c "
   ! out=\$(HOME='$WORK/oldnode' FAKE_NODE_VERSION=v22.1.0 TG_AGENT_NONINTERACTIVE=1 \
