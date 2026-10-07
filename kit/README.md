@@ -57,16 +57,20 @@ Third-party programs come only from their official source, at the pinned version
 |---|---|---|
 | superpowers | plugin `superpowers@claude-plugins-official` | MIT |
 | skill-creator | bundled copy, anthropics/skills | Apache-2.0 (`skills/system/skill-creator/LICENSE.txt`) |
-| agent-browser | npm `agent-browser@0.38.2` (Vercel Labs) | Apache-2.0 |
-| crawl4ai | pipx `crawl4ai==0.9.4` | Apache-2.0 |
-| last30days | git `mvanhorn/last30days-skill` at the commit pinned in `skills/research/last30days/UPSTREAM` | MIT |
-| gws | pipx `gws-cli==1.5.0` | MIT |
-| Vercel | plugin `vercel@claude-plugins-official`, CLI `vercel@62.2.0` | see upstream |
+| agent-browser | npm `agent-browser` (Vercel Labs), version in `versions.env` | Apache-2.0 |
+| crawl4ai | pipx `crawl4ai`, version in `versions.env` | Apache-2.0 |
+| last30days | git `mvanhorn/last30days-skill` at the commit pinned in `versions.env` | MIT |
+| gws | pipx `gws-cli`, version in `versions.env` | MIT |
+| Vercel | plugin `vercel@claude-plugins-official`, CLI `vercel`, version in `versions.env` | see upstream |
 | GitHub | `gh`, install per https://github.com/cli/cli#installation | see upstream |
 | senior-brainstorm | our skill, `skills/dev/senior-brainstorm/LICENSE` | MIT |
 | skill-finder, agent-introspection, learnings, quick-reminders, onboard, perplexity-research, markdown-new, groq-voice, youtube-transcript, cal | our skills (some with an upstream base; no separate license file) | see upstream |
 
 yt-dlp (for youtube-transcript) is installed with pipx from the official package.
+
+All pins live in `kit/versions.env`. A weekly GitHub Actions job
+(`.github/workflows/versions.yml`) checks for newer releases and opens a PR with the
+bump and the results of a clean install; merge it only after checking on a real server.
 
 ## Add a skill
 
