@@ -3,6 +3,8 @@
 # bot entry point next to P and records SPEC in .fake/uv-installs.
 set -euo pipefail
 F="${TG_DOCTOR_ROOT:?}/.fake"
+# Record where uv ran and whether project config was off (root must not read cwd config)
+echo "$PWD|${UV_NO_CONFIG:-}" >> "$F/uv-calls"
 case "$1" in
   venv)
     dir="${*: -1}"

@@ -259,6 +259,10 @@ check "doctor: CLAUDE.md and list-agents in place" bash -c \
    && [ \"\$(stat -c %a '$E/home/doctor/bin/list-agents.sh')\" = 755 ]"
 check "doctor: pinned package installed" grep -qx \
   "git+https://github.com/RichardAtCT/claude-code-telegram@$TAG" "$E/.fake/uv-installs"
+uv_isolated() {
+  [ -s "$E/.fake/uv-calls" ] && ! grep -qvx '/|1' "$E/.fake/uv-calls"
+}
+check "doctor: uv runs from / with project config off" uv_isolated
 check "doctor: opt tree readable by others" bash -c \
   "[ -z \"\$(find '$E/opt/agent-doctor' ! -perm -o+r)\" ]"
 check "doctor: claude installed for doctor" test -x "$E/home/doctor/.local/bin/claude"

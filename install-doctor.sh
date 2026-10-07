@@ -118,6 +118,9 @@ if bad_path="$(untrusted_path)"; then
   } >&2
   exit 1
 fi
+# Never pick up config from the caller's directory (an agent could plant uv.toml there)
+cd /
+export UV_NO_CONFIG=1
 grep -Eqs '^(ID|ID_LIKE)=.*(ubuntu|debian)' "$R/etc/os-release" \
   || die "the doctor installs on Ubuntu or Debian only"
 for tool in curl jq python3 visudo git; do
