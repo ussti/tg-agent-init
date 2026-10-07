@@ -113,6 +113,7 @@ for tool in npm pipx agent-browser crawl4ai-setup; do
 #!/usr/bin/env bash
 echo "$tool \$*" >> "\${FAKE_TOOLS_LOG:-/dev/null}"
 [ "\${FAKE_TOOLS_FAIL:-0}" = 1 ] && exit 1
+[ "$tool \$*" = "agent-browser --version" ] && echo "agent-browser \${FAKE_AB_VERSION:-0.0.0}"
 exit 0
 EOF
   chmod +x "$WORK/bin/$tool"
@@ -257,7 +258,7 @@ check "web-tool routing table in rules.md" bash -c \
   "grep -q '## Which internet tool' '$WS/core/rules.md' && \
    test \$(grep -cE '^\\| .* \\| (WebSearch|WebFetch|crawl4ai|agent-browser|perplexity-research|last30days)' '$WS/core/rules.md') -ge 6"
 check "web-tool rule not duplicated on re-run" bash -c \
-  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  "HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
    && test \$(grep -c '## Which internet tool' '$WS/core/rules.md') = 1"
 check "TOOLS.md kit table has a row for every kit skill" bash -c \
   "grep -v '^#' '$WS/kit/manifest.tsv' | grep -v '^\$' | cut -f2 | \
@@ -269,7 +270,7 @@ check "TOOLS.md has no deep-research row, kit supersedes the base table" bash -c
 check "TOOLS.md has the later commands" bash -c \
   "grep -q 'agent-keys add' '$WS/tools/TOOLS.md' && grep -q 'agent-login' '$WS/tools/TOOLS.md'"
 check "kit table not duplicated in TOOLS.md on re-run" bash -c \
-  "bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  "HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
    && test \$(grep -c '^## Default kit' '$WS/tools/TOOLS.md') = 1 \
    && ! grep -q '^| deep-research |' '$WS/tools/TOOLS.md'"
 check "default writing rules in rules.md" bash -c "grep -qx -- '- No emoji' '$WS/core/rules.md' && \
@@ -346,20 +347,24 @@ check "deep-research and the old gws wrapper are gone" bash -c \
   "[ ! -e '$WS/skills/deep-research' ] && ! grep -q GOOGLE_ACCESS_TOKEN -R '$WS/skills/' '$WS/kit/' 2>/dev/null"
 check "re-running install-kit replaces a plain skill dir by a link and keeps the old one" bash -c "
   rm '$WS/skills/quick-reminders' && mkdir '$WS/skills/quick-reminders' \
-  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
   && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
 check "agent-browser from npm, pinned, no root" \
   grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@$(vpin AGENT_BROWSER_VERSION)" \
   "$FAKE_TOOLS_LOG"
+check "agent-browser at the pinned version already there: npm not called" bash -c "
+  : > '$WORK/ab.log' && FAKE_TOOLS_LOG='$WORK/ab.log' FAKE_AB_VERSION=$(vpin AGENT_BROWSER_VERSION) \
+    HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && grep -q '^agent-browser --version' '$WORK/ab.log' && ! grep -q 'agent-browser@' '$WORK/ab.log'"
 check "browsers download per user, never with system deps" bash -c \
   "grep -q '^agent-browser install\$' '$FAKE_TOOLS_LOG' && ! grep -q 'with-deps' '$FAKE_TOOLS_LOG'"
 check "missing browser libraries: a warning naming prepare-server, install goes on" bash -c "
-  out=\$(FAKE_LDCONFIG_EMPTY=1 bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' 2>&1 >/dev/null) \
+  out=\$(FAKE_LDCONFIG_EMPTY=1 HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' 2>&1 >/dev/null) \
   && grep -q 'system libraries missing: libnss3.so' <<< \"\$out\" \
   && grep -q 'prepare-server.sh' <<< \"\$out\""
 check "browser libraries present: no warning" bash -c "
-  ! bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' 2>&1 >/dev/null \
+  ! HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' 2>&1 >/dev/null \
   | grep -q 'system libraries missing'"
 check "python tools from pipx, pinned" bash -c \
   "grep -q 'pipx install --force gws-cli==$(vpin GWS_CLI_VERSION)' '$FAKE_TOOLS_LOG' && \
@@ -395,13 +400,13 @@ check "kit plugins installed into the agent's config dir" bash -c \
    ! grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
 check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
   n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
-  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && [ \"\$(grep -c 'git clone' '$FAKE_TOOLS_LOG')\" = \"\$n\" ] \
   && grep -q ' fetch' '$FAKE_TOOLS_LOG' \
   && grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
 check "existing agent-browser config is preserved on rerun" bash -c "
   echo '{\"marker\":1}' > '$FAKE_HOME/.agent-browser/config.json' \
-  && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
+  && HOME='$FAKE_HOME' bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
   && jq -e '.marker == 1 and (has(\"maxOutput\") | not)' '$FAKE_HOME/.agent-browser/config.json'"
 check "unpinned last30days is never linked; a failed attempt does not block the rerun" bash -c "
   W='$WORK/pin'; mkdir -p \"\$W/ws\" \

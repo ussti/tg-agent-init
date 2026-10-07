@@ -152,6 +152,8 @@ install_deps() {
   export PATH="$LOCAL_PREFIX/bin:$PATH"  # tools installed below must be found right away
   if [ -z "$AGENT_BROWSER_VERSION" ]; then
     warn "agent-browser: no pinned version in versions.env; skipped"
+  elif [ "$(agent-browser --version 2> /dev/null < /dev/null | awk '{print $NF}')" = "$AGENT_BROWSER_VERSION" ]; then
+    :  # already there, possibly as the standalone binary npm would refuse to overwrite
   elif command -v npm > /dev/null; then
     try npm install -g --prefix "$LOCAL_PREFIX" "agent-browser@$AGENT_BROWSER_VERSION" \
       || warn "agent-browser not installed; later: npm install -g --prefix ~/.local agent-browser@$AGENT_BROWSER_VERSION"
