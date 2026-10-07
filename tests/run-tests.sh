@@ -5,7 +5,7 @@
 #   2. syntax of every script
 #   3. ratewatch unit tests
 #   4. installer end-to-end into a throwaway HOME (getMe and bun install skipped)
-#      and checks on what it produced
+#      and checks on what it produced, then update.sh over that install
 #   5. brain build: upstream public-gbrain-agentos + kit patches (worker tests run
 #      when GBRAIN_TEST_PYTHON points at a python with the brain's deps)
 #   6. install-fleet end-to-end: two agents, fake brain (token issuer + stateful
@@ -49,12 +49,28 @@ echo "== 2. syntax"
 while IFS= read -r f; do
   check "bash -n ${f#"$KIT"/}" bash -n "$f"
 done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts" "$KIT/core/cron" \
-           "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/prepare-server.sh" \
-           -name '*.sh' -type f | sort)
+           "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/update.sh" \
+           "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
-  "$KIT/tests/fake-brain-mcp.py"
+  "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
 find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || true
+if python3 -c 'import yaml' 2>/dev/null; then
+  check "versions workflow parses and has the agreed shape" python3 - \
+    "$KIT/.github/workflows/versions.yml" <<'PY'
+import sys, yaml
+w = yaml.safe_load(open(sys.argv[1]))
+on = w.get("on") or w.get(True)
+assert on["schedule"][0]["cron"] == "0 1 * * 1"
+assert "workflow_dispatch" in on and "pull_request" in on
+assert w["permissions"] == {"contents": "write", "pull-requests": "write"}
+text = open(sys.argv[1]).read()
+assert "--force" not in text.replace("gh label create versions-bot --color BFD4F2 --force", "")
+assert "--delete-branch" not in text
+PY
+else
+  echo "  skip workflow shape (no PyYAML)"
+fi
 
 check "prepare-server --help prints usage" bash -c \
   "bash '$KIT/prepare-server.sh' --help | grep -q 'Usage: prepare-server.sh'"
@@ -71,6 +87,8 @@ check "agent-login unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_login.py'
 check "kit skills unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_kit_skills.py'
+check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/scripts/tests"
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.
@@ -121,7 +139,26 @@ esac
 exit 0
 EOF
 chmod +x "$WORK/bin/git"
+# Fake node: reports FAKE_NODE_VERSION (default a supported one) to the installer's version
+# check, everything else goes to the real node.
+REAL_NODE="$(command -v node || echo node)"
+cat > "$WORK/bin/node" <<EOF
+#!/usr/bin/env bash
+[ "\$*" = --version ] && { echo "\${FAKE_NODE_VERSION:-v24.0.0}"; exit 0; }
+exec "$REAL_NODE" "\$@"
+EOF
+chmod +x "$WORK/bin/node"
+# Fake ldconfig for the browser-libraries check: FAKE_LDCONFIG_EMPTY=1 reports none.
+cat > "$WORK/bin/ldconfig" <<'EOF'
+#!/usr/bin/env bash
+[ "${FAKE_LDCONFIG_EMPTY:-0}" = 1 ] && exit 0
+for l in libnss3.so libatk-bridge-2.0.so.0 libgbm.so.1 libxkbcommon.so.0 libasound.so.2; do
+  printf '\t%s (libc6,x86-64) => /usr/lib/%s\n' "$l" "$l"
+done
+EOF
+chmod +x "$WORK/bin/ldconfig"
 export PATH="$WORK/bin:$PATH"
+export KIT_LDCONFIG="$WORK/bin/ldconfig"
 export FAKE_TOOLS_LOG="$WORK/tools.log"
 : > "$FAKE_TOOLS_LOG"
 FAKE_HOME="$WORK/home"
@@ -139,6 +176,12 @@ else
   bad "installer exits 0 (log below)"
   tail -20 "$WORK/install.log"
 fi
+
+check "installer stops on Node.js older than 24 and names prepare-server" bash -c "
+  ! out=\$(HOME='$WORK/oldnode' FAKE_NODE_VERSION=v22.1.0 TG_AGENT_NONINTERACTIVE=1 \
+      bash '$KIT/install-server.sh' --no-systemd --no-cron --no-live-test 2>&1) \
+  && grep -q 'Node.js 24+ required, found v22.1.0' <<< \"\$out\" \
+  && grep -q 'prepare-server.sh' <<< \"\$out\" && [ ! -e '$WORK/oldnode/agents' ]"
 
 WS="$FAKE_HOME/agents/testbot/.claude"
 SEC="$FAKE_HOME/.config/tg-agent/testbot"
@@ -286,9 +329,15 @@ check "cal tool parses (no bytecode written)" \
 check "research and office skills linked" bash -c \
   "for s in perplexity-research agent-browser crawl4ai last30days gws cal; do \
    test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
-check "last30days UPSTREAM pins repo and commit" bash -c \
-  "grep -qx 'repo=https://github.com/mvanhorn/last30days-skill' '$KIT/kit/skills/research/last30days/UPSTREAM' && \
-   grep -qx 'commit=e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$KIT/kit/skills/research/last30days/UPSTREAM'"
+V="$KIT/kit/versions.env"
+vpin() { sed -n "s/^$1=//p" "$V" | tr -d '\r'; }
+check "versions.env pins every third-party item" bash -c \
+  "for k in AGENT_BROWSER_VERSION VERCEL_CLI_VERSION GWS_CLI_VERSION CRAWL4AI_VERSION \
+   LAST30DAYS_REPO LAST30DAYS_COMMIT; do grep -Eq \"^\$k=.+\" '$V' || exit 1; done"
+check "no stray UPSTREAM pin file" test ! -e "$KIT/kit/skills/research/last30days/UPSTREAM"
+check "no version literals outside versions.env" bash -c \
+  "! grep -rnE '(agent-browser@|gws-cli==|crawl4ai==|vercel@)[0-9]' \
+   '$KIT/kit/install-kit.sh' '$KIT/kit/bin' '$KIT/kit/README.md'"
 check "agent-browser config has the exact values" jq -e \
   '(.args | contains("--no-sandbox")) and .contentBoundaries == true
    and .maxOutput == 50000 and .idleTimeout == "15m"' "$KIT/kit/config/agent-browser.json"
@@ -301,21 +350,49 @@ check "re-running install-kit replaces a plain skill dir by a link and keeps the
   && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
   && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
 check "agent-browser from npm, pinned, no root" \
-  grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@0.38.2" "$FAKE_TOOLS_LOG"
-check "python tools from pipx, pinned" bash -c "grep -q 'pipx install --force gws-cli==1.5.0' '$FAKE_TOOLS_LOG' && \
-  grep -q 'pipx install --force crawl4ai==0.9.4' '$FAKE_TOOLS_LOG' && grep -q 'pipx install --force yt-dlp' '$FAKE_TOOLS_LOG'"
+  grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@$(vpin AGENT_BROWSER_VERSION)" \
+  "$FAKE_TOOLS_LOG"
+check "browsers download per user, never with system deps" bash -c \
+  "grep -q '^agent-browser install\$' '$FAKE_TOOLS_LOG' && ! grep -q 'with-deps' '$FAKE_TOOLS_LOG'"
+check "missing browser libraries: a warning naming prepare-server, install goes on" bash -c "
+  out=\$(FAKE_LDCONFIG_EMPTY=1 bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' 2>&1 >/dev/null) \
+  && grep -q 'system libraries missing: libnss3.so' <<< \"\$out\" \
+  && grep -q 'prepare-server.sh' <<< \"\$out\""
+check "browser libraries present: no warning" bash -c "
+  ! bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' 2>&1 >/dev/null \
+  | grep -q 'system libraries missing'"
+check "python tools from pipx, pinned" bash -c \
+  "grep -q 'pipx install --force gws-cli==$(vpin GWS_CLI_VERSION)' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install --force crawl4ai==$(vpin CRAWL4AI_VERSION)' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install --force yt-dlp' '$FAKE_TOOLS_LOG'"
 check "last30days cloned at the pinned commit and linked" bash -c \
-  "grep -q 'git clone https://github.com/mvanhorn/last30days-skill' '$FAKE_TOOLS_LOG' && \
-   grep -q 'checkout e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$FAKE_TOOLS_LOG' && \
+  "grep -q 'git clone $(vpin LAST30DAYS_REPO)' '$FAKE_TOOLS_LOG' && \
+   grep -q 'checkout $(vpin LAST30DAYS_COMMIT)' '$FAKE_TOOLS_LOG' && \
    grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+# Fakes on PATH ($WORK/bin) do not answer --version with the pin, so gates may FAIL here:
+# only the report and the HOME confinement are checked (exit code ignored by design).
+check "smoke-kit writes a report and stays inside its HOME" bash -c "
+  R=\$(mktemp '$WORK/smoke.XXXX.md') && SH=\$(mktemp -d '$WORK/smokehome.XXXX') \
+  && { SMOKE_HOME=\"\$SH\" SMOKE_SKIP_SEARCH=1 FAKE_TOOLS_LOG=\"\$SH/tools.log\" \
+       bash '$KIT/scripts/smoke-kit.sh' \"\$R\" >/dev/null 2>&1 || true; } \
+  && grep -q '| Check | Result | Detail |' \"\$R\" && grep -q '| kit install | ok |' \"\$R\" \
+  && [ -d \"\$SH/ws/kit\" ]"
+check "missing pin skips the item instead of installing it unpinned" bash -c "
+  W=\$(mktemp -d '$WORK/nopin.XXXX') && mkdir -p \"\$W/ws\" \"\$W/kit\" \"\$W/home\" \
+  && cp -R '$KIT/kit/.' \"\$W/kit/\" && sed -i '/^CRAWL4AI_VERSION=/d' \"\$W/kit/versions.env\" \
+  && HOME=\"\$W/home\" FAKE_TOOLS_LOG=\"\$W/tools.log\" \
+     bash \"\$W/kit/install-kit.sh\" \"\$W/ws\" \"\$W/cfg\" > \"\$W/log\" 2>&1 \
+  && ! grep -q 'crawl4ai==' \"\$W/tools.log\" && grep -q 'pipx install --force yt-dlp' \"\$W/tools.log\" \
+  && grep -q 'crawl4ai: no pinned version' \"\$W/log\""
 check "browser setup steps run after install" bash -c \
   "grep -qx 'agent-browser install' '$FAKE_TOOLS_LOG' && grep -qx 'crawl4ai-setup ' '$FAKE_TOOLS_LOG'"
 check "agent-browser safety config installed" \
   jq -e '.contentBoundaries == true and .maxOutput == 50000' "$FAKE_HOME/.agent-browser/config.json"
 check "kit plugins installed into the agent's config dir" bash -c \
-  "for p in superpowers@claude-plugins-official document-skills@anthropic-agent-skills \
+  "for p in superpowers@claude-plugins-official \
    vercel@claude-plugins-official; do grep -q \"plugin install \$p\" '$FAKE_CLAUDE_LOG' || exit 1; done; \
-   grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
+   ! grep -q 'document-skills' '$FAKE_CLAUDE_LOG' && \
+   ! grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
 check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
   n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
   && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
@@ -538,6 +615,66 @@ check "run-agent LAUNCH_CMD works without keys.env" bash -c \
   "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch3' 0 | grep -qx 'AGENT_X=from_conf'"
 check "installer puts ~/.local/bin on PATH before the login step" bash -c \
   "awk '/export PATH=\"\\\$HOME\\/.local\\/bin:\\\$PATH\"/{p=NR} /Log in to \\\$svc now/{l=NR} END{exit !(p && l && p<l)}' '$KIT/install-server.sh'"
+
+echo "== 4d. update.sh"
+# Owner data that an update must never touch, and a stale plugin file it must replace.
+echo "UPDATE-MARKER-USER" >> "$WS/core/USER.md"
+echo "UPDATE_MARKER_KEY=keep" >> "$SEC/keys.env"
+echo "stale" > "$PLUGIN/STALE-FILE"
+echo "local" > "$PLUGIN/.env"
+user_sum="$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)"
+run_update() {  # run_update LOG ARGS...
+  local log="$1"; shift
+  HOME="$FAKE_HOME" TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 bash "$KIT/update.sh" "$@" > "$log" 2>&1
+}
+if run_update "$WORK/update1.log" --no-pull --no-restart --ws "$WS"; then
+  ok "update.sh runs"
+else
+  bad "update.sh runs (log below)"; tail -5 "$WORK/update1.log"
+fi
+check "update: plugin rebuilt" test ! -e "$PLUGIN/STALE-FILE"
+check "update: local plugin env file carried over" grep -qx local "$PLUGIN/.env"
+check "update: skills symlink in the new plugin" \
+  bash -c "[ \"\$(readlink '$PLUGIN/.claude/skills')\" = ../../../skills ]"
+check "update: plugin settings rendered, no placeholders" bash -c \
+  "python3 -m json.tool '$PLUGIN/.claude/settings.json' >/dev/null && ! grep -q '{{' '$PLUGIN/.claude/settings.json'"
+check "update: USER.md untouched" test "$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)" = "$user_sum"
+check "update: keys file untouched" grep -qx UPDATE_MARKER_KEY=keep "$SEC/keys.env"
+check "update: previous plugin kept in backups" bash -c \
+  "ls -d '$WS'/backups/update_*/plugin-old/plugin/STALE-FILE"
+check "update: run-agent.sh executable" test -x "$WS/bin/run-agent.sh"
+check "update: kit version recorded" test -s "$WS/state/kit-version"
+check "update: finds the only agent without --ws" run_update "$WORK/update2.log" --no-pull --no-restart
+mkdir -p "$WORK/rootbin"
+printf '#!/usr/bin/env bash\necho 0\n' > "$WORK/rootbin/id"
+chmod +x "$WORK/rootbin/id"
+check "update: refuses root" bash -c \
+  "! PATH='$WORK/rootbin':\"\$PATH\" HOME='$FAKE_HOME' bash '$KIT/update.sh' --no-pull --no-restart \
+     > '$WORK/update-root.log' 2>&1 && grep -q 'not root' '$WORK/update-root.log'"
+check "update: unknown flag refused" bash -c \
+  "HOME='$FAKE_HOME' bash '$KIT/update.sh' --bogus 2>&1 | grep -q 'unknown flag'"
+# A broken build leaves the live plugin as it was.
+touch "$PLUGIN/LIVE-MARK"
+broken_build() {
+  local kit="$WORK/kit-broken"
+  rm -rf "$kit"; mkdir -p "$kit"
+  cp -a "$KIT/update.sh" "$KIT/scripts" "$KIT/server" "$KIT/core" "$KIT/kit" "$kit/"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$kit/scripts/build-plugin.sh"
+  ! HOME="$FAKE_HOME" TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
+    bash "$kit/update.sh" --no-pull --no-restart --ws "$WS" > "$WORK/update3.log" 2>&1 \
+    && grep -q 'keeps running the old version' "$WORK/update3.log" && test -e "$PLUGIN/LIVE-MARK"
+}
+check "update: failed build changes nothing" broken_build
+rm -rf "$WORK/kit-broken"
+keeps_three() {
+  local i
+  for i in 1 2 3; do
+    run_update "$WORK/update-n$i.log" --no-pull --no-restart --ws "$WS" || return 1
+    sleep 1
+  done
+  [ "$(find "$WS/backups" -maxdepth 1 -name 'update_*' -type d | wc -l)" -le 3 ]
+}
+check "update: keeps at most 3 backups" keeps_three
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"

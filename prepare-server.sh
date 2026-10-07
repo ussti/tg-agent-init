@@ -5,10 +5,10 @@
 #   apt-get update && apt-get install -y git
 #   git clone https://github.com/ussti/tg-agent-init.git && cd tg-agent-init && ./prepare-server.sh
 #
-# It installs what install-server.sh needs (system packages, Node.js, bun, Claude Code),
-# creates a separate Unix user for the agent (Claude Code does not run without
-# confirmations as root) and copies this repo into that user's home. Safe to re-run:
-# anything already in place is kept.
+# It installs what install-server.sh needs (system packages, Node.js, browser libraries,
+# bun, Claude Code), creates a separate Unix user for the agent (Claude Code does not run
+# without confirmations as root) and copies this repo into that user's home. Safe to
+# re-run: anything already in place is kept.
 #
 # Usage: prepare-server.sh [user]     (default user: agent)
 set -euo pipefail
@@ -60,6 +60,12 @@ if [ "$(node_major)" -lt "$NODE_MAJOR_MIN" ]; then
 fi
 [ "$(node_major)" -ge "$NODE_MAJOR_MIN" ] || die "Node.js $NODE_MAJOR_MIN+ not installed"
 say "node $(node --version)"
+
+# Shared libraries for headless Chrome/Chromium (agent-browser, crawl4ai). The kit installs
+# the browsers per user without root, so the system part happens here, once.
+say "browser system libraries"
+npx -y playwright install-deps chromium > /dev/null 2>&1 \
+  || die "browser libraries not installed; retry: npx -y playwright install-deps chromium"
 
 if [ ! -x /usr/local/bin/bun ]; then
   say "bun"
