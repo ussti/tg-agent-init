@@ -5,7 +5,7 @@
 #   2. syntax of every script
 #   3. ratewatch unit tests
 #   4. installer end-to-end into a throwaway HOME (getMe and bun install skipped)
-#      and checks on what it produced
+#      and checks on what it produced, then update.sh over that install
 #   5. brain build: upstream public-gbrain-agentos + kit patches (worker tests run
 #      when GBRAIN_TEST_PYTHON points at a python with the brain's deps)
 #   6. install-fleet end-to-end: two agents, fake brain (token issuer + stateful
@@ -49,7 +49,7 @@ echo "== 2. syntax"
 while IFS= read -r f; do
   check "bash -n ${f#"$KIT"/}" bash -n "$f"
 done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts" "$KIT/core/cron" \
-           "$KIT/install-server.sh" "$KIT/install-fleet.sh" -name '*.sh' -type f | sort)
+           "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/update.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
   "$KIT/tests/fake-brain-mcp.py"
@@ -305,9 +305,10 @@ check "browser setup steps run after install" bash -c \
 check "agent-browser safety config installed" \
   jq -e '.contentBoundaries == true and .maxOutput == 50000' "$FAKE_HOME/.agent-browser/config.json"
 check "kit plugins installed into the agent's config dir" bash -c \
-  "for p in superpowers@claude-plugins-official document-skills@anthropic-agent-skills \
+  "for p in superpowers@claude-plugins-official \
    vercel@claude-plugins-official; do grep -q \"plugin install \$p\" '$FAKE_CLAUDE_LOG' || exit 1; done; \
-   grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
+   ! grep -q 'document-skills' '$FAKE_CLAUDE_LOG' && \
+   ! grep -q 'marketplace add anthropics/skills' '$FAKE_CLAUDE_LOG'"
 check "rerun on the same workspace keeps last30days upstream, no second clone" bash -c "
   n=\$(grep -c 'git clone' '$FAKE_TOOLS_LOG') \
   && bash '$WS/kit/install-kit.sh' '$WS' '$FAKE_HOME/.claude-agent-testbot' >/dev/null 2>&1 \
@@ -530,6 +531,66 @@ check "run-agent LAUNCH_CMD works without keys.env" bash -c \
   "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch3' 0 | grep -qx 'AGENT_X=from_conf'"
 check "installer puts ~/.local/bin on PATH before the login step" bash -c \
   "awk '/export PATH=\"\\\$HOME\\/.local\\/bin:\\\$PATH\"/{p=NR} /Log in to \\\$svc now/{l=NR} END{exit !(p && l && p<l)}' '$KIT/install-server.sh'"
+
+echo "== 4d. update.sh"
+# Owner data that an update must never touch, and a stale plugin file it must replace.
+echo "UPDATE-MARKER-USER" >> "$WS/core/USER.md"
+echo "UPDATE_MARKER_KEY=keep" >> "$SEC/keys.env"
+echo "stale" > "$PLUGIN/STALE-FILE"
+echo "local" > "$PLUGIN/.env"
+user_sum="$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)"
+run_update() {  # run_update LOG ARGS...
+  local log="$1"; shift
+  HOME="$FAKE_HOME" TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 bash "$KIT/update.sh" "$@" > "$log" 2>&1
+}
+if run_update "$WORK/update1.log" --no-pull --no-restart --ws "$WS"; then
+  ok "update.sh runs"
+else
+  bad "update.sh runs (log below)"; tail -5 "$WORK/update1.log"
+fi
+check "update: plugin rebuilt" test ! -e "$PLUGIN/STALE-FILE"
+check "update: local plugin env file carried over" grep -qx local "$PLUGIN/.env"
+check "update: skills symlink in the new plugin" \
+  bash -c "[ \"\$(readlink '$PLUGIN/.claude/skills')\" = ../../../skills ]"
+check "update: plugin settings rendered, no placeholders" bash -c \
+  "python3 -m json.tool '$PLUGIN/.claude/settings.json' >/dev/null && ! grep -q '{{' '$PLUGIN/.claude/settings.json'"
+check "update: USER.md untouched" test "$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)" = "$user_sum"
+check "update: keys file untouched" grep -qx UPDATE_MARKER_KEY=keep "$SEC/keys.env"
+check "update: previous plugin kept in backups" bash -c \
+  "ls -d '$WS'/backups/update_*/plugin-old/plugin/STALE-FILE"
+check "update: run-agent.sh executable" test -x "$WS/bin/run-agent.sh"
+check "update: kit version recorded" test -s "$WS/state/kit-version"
+check "update: finds the only agent without --ws" run_update "$WORK/update2.log" --no-pull --no-restart
+mkdir -p "$WORK/rootbin"
+printf '#!/usr/bin/env bash\necho 0\n' > "$WORK/rootbin/id"
+chmod +x "$WORK/rootbin/id"
+check "update: refuses root" bash -c \
+  "! PATH='$WORK/rootbin':\"\$PATH\" HOME='$FAKE_HOME' bash '$KIT/update.sh' --no-pull --no-restart \
+     > '$WORK/update-root.log' 2>&1 && grep -q 'not root' '$WORK/update-root.log'"
+check "update: unknown flag refused" bash -c \
+  "HOME='$FAKE_HOME' bash '$KIT/update.sh' --bogus 2>&1 | grep -q 'unknown flag'"
+# A broken build leaves the live plugin as it was.
+touch "$PLUGIN/LIVE-MARK"
+broken_build() {
+  local kit="$WORK/kit-broken"
+  rm -rf "$kit"; mkdir -p "$kit"
+  cp -a "$KIT/update.sh" "$KIT/scripts" "$KIT/server" "$KIT/core" "$KIT/kit" "$kit/"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$kit/scripts/build-plugin.sh"
+  ! HOME="$FAKE_HOME" TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
+    bash "$kit/update.sh" --no-pull --no-restart --ws "$WS" > "$WORK/update3.log" 2>&1 \
+    && grep -q 'keeps running the old version' "$WORK/update3.log" && test -e "$PLUGIN/LIVE-MARK"
+}
+check "update: failed build changes nothing" broken_build
+rm -rf "$WORK/kit-broken"
+keeps_three() {
+  local i
+  for i in 1 2 3; do
+    run_update "$WORK/update-n$i.log" --no-pull --no-restart --ws "$WS" || return 1
+    sleep 1
+  done
+  [ "$(find "$WS/backups" -maxdepth 1 -name 'update_*' -type d | wc -l)" -le 3 ]
+}
+check "update: keeps at most 3 backups" keeps_three
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
