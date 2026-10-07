@@ -182,8 +182,11 @@ check "install-server ends with the doctor step" \
   grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
 check "install-server: doctor hint is non-fatal" bash -c \
   "tail -1 '$KIT/install-server.sh' | grep -q 'doctor-hint.sh.*|| true'"
-check "prepare-server final text names install-doctor.sh" \
-  grep -q 'install-doctor.sh' "$KIT/prepare-server.sh"
+check "prepare-server final text clones the doctor kit as root" \
+  grep -qF 'sudo git clone https://github.com/ussti/tg-agent-init /opt/agent-doctor/kit' \
+  "$KIT/prepare-server.sh"
+check "prepare-server final text runs the root-owned doctor kit" \
+  grep -qF 'sudo bash /opt/agent-doctor/kit/install-doctor.sh' "$KIT/prepare-server.sh"
 
 check "installer stops on Node.js older than 24 and names prepare-server" bash -c "
   ! out=\$(HOME='$WORK/oldnode' FAKE_NODE_VERSION=v22.1.0 TG_AGENT_NONINTERACTIVE=1 \

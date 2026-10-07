@@ -25,6 +25,23 @@ DUMMY_TAIL="$(printf 'x%.0s' $(seq 1 35))"
 DOCTOR_TOKEN="222222222:$DUMMY_TAIL"
 OWNER=123456789
 export PATH="$PATH:/usr/sbin:/sbin"   # visudo, useradd live here; not on a user's PATH
+KIT_HOME=/opt/agent-doctor/kit
+CLONE_CMD="sudo git clone https://github.com/ussti/tg-agent-init $KIT_HOME"
+RUN_CMD="sudo bash $KIT_HOME/install-doctor.sh"
+PULL_CMD="sudo git -C $KIT_HOME pull"
+# install-doctor.sh refuses a kit that is not owned by the user running it or that is
+# group/other-writable, so the end-to-end runs use a go-w copy, never the checkout.
+copy_kit() {  # copy_kit <dst>: the files install-doctor.sh reads, without group/other write
+  mkdir -p "$1/server" "$1/scripts" "$1/kit"
+  cp "$KIT/install-doctor.sh" "$1/"
+  cp -R "$SD" "$1/server/"
+  cp "$KIT/scripts/render-template.py" "$1/scripts/"
+  cp "$KIT/kit/versions.env" "$1/kit/"
+  chmod -R go-w "$1"
+}
+chmod 755 "$DOC"
+DK="$DOC/kit"
+copy_kit "$DK"
 
 # --- templates
 render_env() {  # render_env <out>: env.template with every key set
@@ -64,6 +81,15 @@ if command -v visudo > /dev/null; then
 fi
 check "doctor: CLAUDE.md works through sudo -u" grep -q 'sudo -u <user> -H' "$SD/CLAUDE.md"
 check "doctor: CLAUDE.md forbids self-install" grep -q 'Never run install-doctor.sh' "$SD/CLAUDE.md"
+# Every documented root command runs the root-owned clone, never an agent's checkout.
+root_cmds_ok() {  # root_cmds_ok <file>: names the clone and run commands, no agent kit path
+  grep -qF "$CLONE_CMD" "$1" && grep -qF "$RUN_CMD" "$1" \
+    && ! grep -Eq 'sudo bash [^ ]*(~|\$DEST|\$KIT|tg-agent-init/)[^ ]*install-doctor' "$1"
+}
+check "doctor: CLAUDE.md gives the root-owned kit commands" root_cmds_ok "$SD/CLAUDE.md"
+check "doctor: CLAUDE.md gives the kit update command" grep -qF "$PULL_CMD" "$SD/CLAUDE.md"
+check "doctor: README gives the root-owned kit commands" root_cmds_ok "$KIT/README.md"
+check "doctor: README gives the kit update command" grep -qF "$PULL_CMD" "$KIT/README.md"
 
 # --- fixtures
 new_root() {  # new_root <name>: fresh fake server root, prints its path
@@ -138,12 +164,18 @@ run_doctor() {  # run_doctor <root> <log> [VAR=value...]
   env PATH="$FAKES:$PATH" TG_DOCTOR_ROOT="$r" TG_DOCTOR_DRY_RUN=1 \
     TG_DOCTOR_NONINTERACTIVE=1 TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 \
     TG_DOCTOR_OWNER_ID="$OWNER" "$@" \
-    bash "$KIT/install-doctor.sh" < /dev/null > "$log" 2>&1
+    bash "${RUN_KIT:-$DK}/install-doctor.sh" < /dev/null > "$log" 2>&1
 }
 refused() {  # refused <root> <log> <expected text> [VAR=value...]
   local r="$1" log="$2" want="$3"
   shift 3
   ! run_doctor "$r" "$log" "$@" && grep -q -- "$want" "$log"
+}
+kit_refused() {  # kit_refused <kit> <root> <log>: refused before anything is touched
+  local kit="$1" r="$2" log="$3"
+  ! RUN_KIT="$kit" run_doctor "$r" "$log" TG_DOCTOR_BOT_TOKEN="$DOCTOR_TOKEN" \
+    && grep -q 'writable' "$log" && grep -qF "$CLONE_CMD" "$log" && grep -qF "$RUN_CMD" "$log" \
+    && test ! -e "$r/etc/sudoers.d/agent-doctor" && test ! -e "$r/.fake/log"
 }
 tree_hash() {  # content and modes of a fake root, without the fakes' own state
   (cd "$1" && {
@@ -283,7 +315,7 @@ make_agent "$IO" alice main "$OWNER" 111111111
 interactive_owner_refused() {  # token, Start, then three bad owner answers (empty, 999, 999)
   ! printf '%s\n' "$DOCTOR_TOKEN" '' '' 999 999 \
     | env PATH="$FAKES:$PATH" TG_DOCTOR_ROOT="$IO" TG_DOCTOR_DRY_RUN=1 \
-      TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 bash "$KIT/install-doctor.sh" \
+      TG_DOCTOR_STABLE_S=1 TG_DOCTOR_START_TIMEOUT_S=3 bash "$DK/install-doctor.sh" \
       > "$DOC/io.log" 2>&1 \
     && grep -q 'type again' "$DOC/io.log" && grep -q 'no valid owner ID' "$DOC/io.log"
 }
@@ -296,20 +328,39 @@ check "doctor: not Ubuntu/Debian -> stop" \
 if [ "$(id -u)" -ne 0 ]; then
   check "doctor: not root -> stop" refused "$O" "$DOC/root.log" "run as root" TG_DOCTOR_DRY_RUN=0
 fi
+# C1: root never runs a kit someone else can write (owner = the user running it)
+KG="$(new_root kitgw)"
+make_agent "$KG" alice main "$OWNER" 111111111
+copy_kit "$DOC/kit-gw"
+chmod g+w "$DOC/kit-gw/server/doctor/list-agents.sh"
+check "doctor: group-writable file in the kit -> refused, clone command shown" \
+  kit_refused "$DOC/kit-gw" "$KG" "$DOC/kgw.log"
+copy_kit "$DOC/kit-ow"
+chmod o+w "$DOC/kit-ow/scripts"
+check "doctor: other-writable dir in the kit -> refused" \
+  kit_refused "$DOC/kit-ow" "$KG" "$DOC/kow.log"
+mkdir -p "$DOC/anc"
+copy_kit "$DOC/anc/kit"
+chmod 775 "$DOC/anc"
+check "doctor: group-writable parent of the kit -> refused" \
+  kit_refused "$DOC/anc/kit" "$KG" "$DOC/kanc.log"
 
 # --- doctor-hint (end of install-server.sh)
 HN="$(new_root hint)"
-hint() { TG_DOCTOR_ROOT="$HN" PATH="$FAKES:$PATH" bash "$SD/doctor-hint.sh" /srv/kit; }
-hint_shown() {
-  local out
-  out="$(hint)"
-  grep -qx '== Agent is up. One step left: the doctor' <<< "$out" \
-    && grep -qx '  sudo bash /srv/kit/install-doctor.sh' <<< "$out"
+hint() {  # hint [args]: doctor-hint.sh output against the fake systemctl
+  TG_DOCTOR_ROOT="$HN" PATH="$FAKES:$PATH" bash "$SD/doctor-hint.sh" "$@"
 }
-check "doctor-hint: no doctor -> the install command" hint_shown
+hint_has() {  # hint_has <exact line> [args]: the hint prints this line
+  grep -qxF -- "$1" <<< "$(hint "${@:2}")"
+}
+hint_shown() {
+  hint_has '== Agent is up. One step left: the doctor' \
+    && hint_has "  $CLONE_CMD" && hint_has "  $RUN_CMD" \
+    && ! grep -q '/srv/kit' <<< "$(hint /srv/kit)"
+}
+check "doctor-hint: no doctor -> clone and install from the root-owned kit" hint_shown
 touch "$HN/.fake/enabled-agent-doctor.service"
-check "doctor-hint: doctor enabled -> silent" bash -c \
-  "[ -z \"\$(TG_DOCTOR_ROOT='$HN' PATH='$FAKES:$PATH' bash '$SD/doctor-hint.sh' /srv/kit)\" ]"
+check "doctor-hint: doctor enabled -> silent" bash -c '[ -z "$1" ]' _ "$(hint)"
 
 if [ "${DOCTOR_STANDALONE:-0}" = 1 ]; then
   echo

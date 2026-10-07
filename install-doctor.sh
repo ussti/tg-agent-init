@@ -4,12 +4,22 @@
 # fixes the agents. Run as root after the first agent is installed. Safe to re-run:
 # nothing is duplicated, the package is reinstalled only when DOCTOR_BOT_TAG changed,
 # the unit is restarted only when something changed.
-# Usage: sudo bash install-doctor.sh
+# Root runs it only from a root-owned clone (an agent's own checkout is writable by
+# the agent, and root must never run agent-writable code):
+#   sudo git clone https://github.com/ussti/tg-agent-init /opt/agent-doctor/kit
+#   sudo bash /opt/agent-doctor/kit/install-doctor.sh
+# Update and re-run: sudo git -C /opt/agent-doctor/kit pull, then the same bash line.
 # Tests: TG_DOCTOR_ROOT=<fake root> TG_DOCTOR_DRY_RUN=1 (skip the root check),
 #        TG_DOCTOR_NONINTERACTIVE=1 with TG_DOCTOR_BOT_TOKEN / TG_DOCTOR_OWNER_ID.
 set -Eeuo pipefail
 
-KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# physical path: a symlinked component must not hide where the code really lives
+KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly KIT_REPO="https://github.com/ussti/tg-agent-init"
+readonly KIT_HOME="/opt/agent-doctor/kit"
+readonly CLONE_CMD="sudo git clone $KIT_REPO $KIT_HOME"
+readonly PULL_CMD="sudo git -C $KIT_HOME pull"
+readonly RUN_CMD="sudo bash $KIT_HOME/install-doctor.sh"
 R="${TG_DOCTOR_ROOT:-}"          # prefix for paths on disk; paths inside files stay real
 readonly DOCTOR_USER="doctor"
 readonly DOCTOR_HOME="/home/doctor"
@@ -50,7 +60,7 @@ trap 'rm -rf -- "$WORK"' EXIT
 say() { echo "[doctor] $*"; }
 die() {
   echo "[doctor] ERROR: $*" >&2
-  echo "[doctor] fix it, then run again: sudo bash $KIT/install-doctor.sh" >&2
+  echo "[doctor] fix it, then run again: $RUN_CMD" >&2
   exit 1
 }
 # Any command that fails outside an if/||/&& condition stops the run with the retry hint.
@@ -71,7 +81,40 @@ as_doctor() { runuser -u "$DOCTOR_USER" -- env HOME="$R$DOCTOR_HOME" "$@"; }
 
 # --- 1. checks
 if [ "${TG_DOCTOR_DRY_RUN:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
-  die "run as root: sudo bash $KIT/install-doctor.sh"
+  die "run as root: $RUN_CMD"
+fi
+# The kit must be writable by nobody but the user running it (root on a server): every
+# file under it, the kit dir and each parent dir. A root-owned sticky parent (/tmp) is
+# fine, since others cannot move entries they do not own out of it.
+untrusted_path() {  # prints the first path someone else could change; status 0 if one
+  local uid dir owner mode hit
+  uid="$(id -u)"
+  hit="$(find "$KIT" \( ! -user "$uid" -o -perm /022 \) -print -quit 2>&1)" \
+    || { echo "$KIT"; return 0; }
+  [ -z "$hit" ] || { echo "$hit"; return 0; }
+  dir="$KIT"
+  while [ "$dir" != / ]; do
+    dir="$(dirname "$dir")"
+    owner="$(stat -c %u "$dir")"
+    mode="$((8#$(stat -c %a "$dir")))"
+    if [ "$owner" != 0 ] && [ "$owner" != "$uid" ]; then echo "$dir"; return 0; fi
+    if [ $((mode & 8#022)) -ne 0 ] && ! { [ "$owner" = 0 ] && [ $((mode & 8#1000)) -ne 0 ]; }
+    then
+      echo "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+if bad_path="$(untrusted_path)"; then
+  {
+    echo "[doctor] ERROR: the kit is not owned by $(id -un) or is writable by others: $bad_path"
+    echo "[doctor] root runs the doctor kit only from a root-owned clone:"
+    echo "  $CLONE_CMD"
+    echo "  $RUN_CMD"
+    echo "[doctor] already cloned there? update it: $PULL_CMD"
+  } >&2
+  exit 1
 fi
 grep -Eqs '^(ID|ID_LIKE)=.*(ubuntu|debian)' "$R/etc/os-release" \
   || die "the doctor installs on Ubuntu or Debian only"
