@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake journalctl: a recognisable line so tests see the journal was printed.
+echo "journalctl $*" >> "${TG_DOCTOR_ROOT:?}/.fake/log"
+echo "fake journal line"

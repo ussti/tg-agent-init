@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake uv: "venv ... DIR" makes DIR/bin/python; "pip install --python P SPEC" makes the
+# bot entry point next to P and records SPEC in .fake/uv-installs.
+set -euo pipefail
+F="${TG_DOCTOR_ROOT:?}/.fake"
+case "$1" in
+  venv)
+    dir="${*: -1}"
+    mkdir -p "$dir/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$dir/bin/python"
+    chmod 755 "$dir/bin/python" ;;
+  pip)
+    py="$4" spec="$5"
+    printf '#!/bin/sh\nexit 0\n' > "$(dirname "$py")/claude-telegram-bot"
+    chmod 755 "$(dirname "$py")/claude-telegram-bot"
+    echo "$spec" >> "$F/uv-installs" ;;
+  *) echo "fake uv: unexpected $1" >&2; exit 2 ;;
+esac

@@ -51,7 +51,7 @@ while IFS= read -r f; do
   check "bash -n ${f#"$KIT"/}" bash -n "$f"
 done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts" "$KIT/core/cron" \
            "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/update.sh" \
-           "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
+           "$KIT/install-doctor.sh" "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
   "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
