@@ -71,7 +71,8 @@ gate "last30days starts" "--help" python3 "$L30/skills/last30days/scripts/last30
 # Doctor package: the pinned tag installs, has its entry point, and still has every
 # setting install-doctor.sh writes (pydantic-settings ignores unknown keys silently).
 readonly DOCTOR_SETTINGS="telegram_bot_token telegram_bot_username allowed_users \
-approved_directory agentic_mode sandbox_enabled claude_cli_path claude_max_cost_per_request"
+approved_directory agentic_mode sandbox_enabled claude_cli_path claude_max_cost_per_request \
+debug development_mode claude_max_cost_per_user rate_limit_requests"
 doctor_pkg_ok() {
   local venv="$HOME/doctor-venv" tag
   tag="$(pin DOCTOR_BOT_TAG)"
@@ -86,6 +87,28 @@ sys.exit("missing settings: " + " ".join(missing) if missing else 0)
 ' $DOCTOR_SETTINGS
 }
 gate "claude-code-telegram $(pin DOCTOR_BOT_TAG)" "installs, settings in place" doctor_pkg_ok
+# The rendered doctor env, loaded the way the package loads it, keeps our caps and no dev
+# mode: a preset ENVIRONMENT (production) would silently overwrite them.
+doctor_caps_ok() {
+  local venv="$HOME/doctor-venv" dir="$HOME/doctor-env"
+  mkdir -p "$dir/approved"
+  DOCTOR_BOT_TOKEN=placeholder DOCTOR_BOT_USERNAME=smoke_doctor_bot DOCTOR_OWNER_ID=1 \
+    DOCTOR_MAX_COST=5 DOCTOR_MAX_COST_USER=50 \
+    python3 "$REPO/scripts/render-template.py" "$REPO/server/doctor/env.template" "$dir/env" \
+    && (cd "$dir" && APPROVED_DIRECTORY="$dir/approved" "$venv/bin/python" -c '
+import os, sys
+from pathlib import Path
+# obviously fake token of the right shape; set first, so the env file cannot override it
+os.environ["TELEGRAM_BOT_TOKEN"] = "1" * 9 + ":" + "x" * 35
+from src.config import load_config
+s = load_config(config_file=Path(sys.argv[1]))
+got = (s.claude_max_cost_per_request, s.claude_max_cost_per_user, s.rate_limit_requests,
+       s.debug, s.development_mode)
+want = (5.0, 50.0, 100, False, False)
+sys.exit(0 if got == want else f"doctor env loads as {got}, want {want}")
+' "$dir/env")
+}
+gate "doctor env $(pin DOCTOR_BOT_TAG)" "caps 5/50, rate 100, no dev mode" doctor_caps_ok
 
 if [ "${SMOKE_SKIP_SEARCH:-0}" = 1 ]; then
   row "last30days trial search" skipped "SMOKE_SKIP_SEARCH=1"

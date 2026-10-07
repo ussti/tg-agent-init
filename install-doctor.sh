@@ -33,6 +33,7 @@ readonly UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
 readonly CLAUDE_BIN="$DOCTOR_HOME/.local/bin/claude"
 readonly PYTHON_VERSION="3.12"
 readonly MAX_COST_USD=5
+readonly MAX_COST_USER_USD=50
 readonly TOKEN_TRIES=3
 readonly OWNER_TRIES=3
 readonly LOGIN_TRIES=3
@@ -298,6 +299,7 @@ chown "root:$DOCTOR_USER" "$R$ENV_DIR"
   umask 077
   DOCTOR_BOT_TOKEN="$BOT_TOKEN" DOCTOR_BOT_USERNAME="$BOT_USERNAME" \
     DOCTOR_OWNER_ID="$OWNER_ID" DOCTOR_MAX_COST="$MAX_COST_USD" \
+    DOCTOR_MAX_COST_USER="$MAX_COST_USER_USD" \
     python3 "$KIT/scripts/render-template.py" "$KIT/server/doctor/env.template" "$WORK/env"
 ) || die "env file render failed"
 if place "$WORK/env" "$R$ENV_FILE" 640; then
@@ -364,7 +366,9 @@ wait_stable() {
   return 1
 }
 if ! wait_stable; then
-  journalctl -u "$UNIT_NAME" -n "$JOURNAL_LINES" --no-pager >&2 || true
+  # the package logs each Bot API URL at INFO, token included: mask it in the dump
+  journalctl -u "$UNIT_NAME" -n "$JOURNAL_LINES" --no-pager 2>&1 \
+    | sed -E 's#bot[0-9]+:[A-Za-z0-9_-]+#bot<hidden>#g' >&2 || true
   die "$UNIT_NAME did not stay up for ${STABLE_S}s"
 fi
 

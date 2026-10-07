@@ -210,7 +210,9 @@ sudo bash /opt/agent-doctor/kit/install-doctor.sh
 
 - Наладчику пишет только владелец (`ALLOWED_USERS`).
 - Настройки лежат в `/etc/agent-doctor/env` (root:doctor, 640), там же лимит стоимости
-  одного запроса `CLAUDE_MAX_COST_PER_REQUEST` (5 USD). После правки:
+  одного запроса `CLAUDE_MAX_COST_PER_REQUEST` (5 USD) и общий лимит
+  `CLAUDE_MAX_COST_PER_USER` (50 USD). `ENVIRONMENT=doctor` оставьте как есть: при
+  `production` пакет молча заменяет эти лимиты своими. После правки:
   `sudo systemctl restart agent-doctor`.
 - Его инструкция лежит в `/home/doctor/CLAUDE.md`: бэкап перед каждой правкой, память,
   ключи и бэкапы не удаляются, секреты не печатаются, широкие действия только после
