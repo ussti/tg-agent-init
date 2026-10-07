@@ -72,9 +72,23 @@ append_tools_map() {
 }
 append_tools_map
 
-readonly AGENT_BROWSER_VERSION="0.38.2"
-readonly CRAWL4AI_VERSION="0.9.4"
-readonly GWS_CLI_VERSION="1.5.0"
+# Pinned versions live in kit/versions.env; read as data, never sourced.
+pin() {  # pure bash: works with a bare PATH
+  local line
+  [ -r "$KIT/versions.env" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    if [ "${line%%=*}" = "$1" ] && [ "$line" != "$1" ]; then
+      printf '%s\n' "${line#*=}"
+      return 0
+    fi
+  done < "$KIT/versions.env"
+}
+AGENT_BROWSER_VERSION="$(pin AGENT_BROWSER_VERSION)"
+CRAWL4AI_VERSION="$(pin CRAWL4AI_VERSION)"
+GWS_CLI_VERSION="$(pin GWS_CLI_VERSION)"
+readonly AGENT_BROWSER_VERSION CRAWL4AI_VERSION GWS_CLI_VERSION
+[ -r "$KIT/versions.env" ] || warn "no $KIT/versions.env: pinned tools will be skipped"
 readonly LOCAL_PREFIX="$HOME/.local"
 readonly -a MARKETPLACES=("anthropics/claude-plugins-official")
 readonly -a KIT_PLUGINS=(
@@ -95,14 +109,8 @@ try() {
 
 # Read the pinned repo/commit of the last30days skill into LAST30_REPO / LAST30_COMMIT.
 read_last30_pin() {
-  local file="$KIT/skills/research/last30days/UPSTREAM"
-  LAST30_REPO="" LAST30_COMMIT=""
-  if [ -r "$file" ]; then
-    LAST30_REPO="$(sed -n 's/^repo=//p' "$file" || true)"
-    LAST30_COMMIT="$(sed -n 's/^commit=//p' "$file" || true)"
-  else
-    warn "last30days: $file missing; the skill stays a stub"
-  fi
+  LAST30_REPO="$(pin LAST30DAYS_REPO)"
+  LAST30_COMMIT="$(pin LAST30DAYS_COMMIT)"
 }
 
 # True when dir is a checkout whose HEAD is exactly the pinned commit.
@@ -125,7 +133,9 @@ relink_last30days  # link_skills just reset it to the stub; a downloaded copy wi
 install_deps() {
   mkdir -p "$LOCAL_PREFIX/bin"
   export PATH="$LOCAL_PREFIX/bin:$PATH"  # tools installed below must be found right away
-  if command -v npm > /dev/null; then
+  if [ -z "$AGENT_BROWSER_VERSION" ]; then
+    warn "agent-browser: no pinned version in versions.env; skipped"
+  elif command -v npm > /dev/null; then
     try npm install -g --prefix "$LOCAL_PREFIX" "agent-browser@$AGENT_BROWSER_VERSION" \
       || warn "agent-browser not installed; later: npm install -g --prefix ~/.local agent-browser@$AGENT_BROWSER_VERSION"
   else
@@ -136,8 +146,13 @@ install_deps() {
     || cp "$KIT/config/agent-browser.json" "$HOME/.agent-browser/config.json"
 
   if command -v pipx > /dev/null; then
-    local pkg
-    for pkg in "gws-cli==$GWS_CLI_VERSION" "crawl4ai==$CRAWL4AI_VERSION" yt-dlp; do
+    local pkg pkgs=()
+    if [ -n "$GWS_CLI_VERSION" ]; then pkgs+=("gws-cli==$GWS_CLI_VERSION")
+    else warn "gws-cli: no pinned version in versions.env; skipped"; fi
+    if [ -n "$CRAWL4AI_VERSION" ]; then pkgs+=("crawl4ai==$CRAWL4AI_VERSION")
+    else warn "crawl4ai: no pinned version in versions.env; skipped"; fi
+    pkgs+=(yt-dlp)
+    for pkg in "${pkgs[@]}"; do
       try pipx install --force "$pkg" || warn "$pkg not installed; later: pipx install --force '$pkg'"
     done
   else
@@ -156,7 +171,7 @@ install_deps() {
   dest="$KIT/vendor/last30days"
   mkdir -p "$KIT/vendor"
   if [ -z "$LAST30_REPO" ] || [ -z "$LAST30_COMMIT" ]; then
-    warn "last30days: no pinned repo/commit in UPSTREAM; skipped"
+    warn "last30days: no pinned repo/commit in versions.env; the skill stays a stub"
   elif [ -d "$dest/.git" ]; then  # rerun: update the existing checkout instead of cloning
     try git -C "$dest" fetch || warn "last30days: fetch failed (offline?); keeping the current checkout"
     try git -C "$dest" checkout "$LAST30_COMMIT" \

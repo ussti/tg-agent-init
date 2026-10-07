@@ -278,9 +278,15 @@ check "cal tool parses (no bytecode written)" \
 check "research and office skills linked" bash -c \
   "for s in perplexity-research agent-browser crawl4ai last30days gws cal; do \
    test -f '$WS/skills/'\$s/SKILL.md || exit 1; done"
-check "last30days UPSTREAM pins repo and commit" bash -c \
-  "grep -qx 'repo=https://github.com/mvanhorn/last30days-skill' '$KIT/kit/skills/research/last30days/UPSTREAM' && \
-   grep -qx 'commit=e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$KIT/kit/skills/research/last30days/UPSTREAM'"
+V="$KIT/kit/versions.env"
+vpin() { sed -n "s/^$1=//p" "$V" | tr -d '\r'; }
+check "versions.env pins every third-party item" bash -c \
+  "for k in AGENT_BROWSER_VERSION VERCEL_CLI_VERSION GWS_CLI_VERSION CRAWL4AI_VERSION \
+   LAST30DAYS_REPO LAST30DAYS_COMMIT; do grep -Eq \"^\$k=.+\" '$V' || exit 1; done"
+check "no stray UPSTREAM pin file" test ! -e "$KIT/kit/skills/research/last30days/UPSTREAM"
+check "no version literals outside versions.env" bash -c \
+  "! grep -rnE '(agent-browser@|gws-cli==|crawl4ai==|vercel@)[0-9]' \
+   '$KIT/kit/install-kit.sh' '$KIT/kit/bin' '$KIT/kit/README.md'"
 check "agent-browser config has the exact values" jq -e \
   '(.args | contains("--no-sandbox")) and .contentBoundaries == true
    and .maxOutput == 50000 and .idleTimeout == "15m"' "$KIT/kit/config/agent-browser.json"
@@ -293,13 +299,23 @@ check "re-running install-kit replaces a plain skill dir by a link and keeps the
   && [ -L '$WS/skills/quick-reminders' ] && [ -f '$WS/skills/quick-reminders/SKILL.md' ] \
   && [ -n \"\$(ls -d '$WS'/skills-replaced/quick-reminders.* 2>/dev/null)\" ]"
 check "agent-browser from npm, pinned, no root" \
-  grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@0.38.2" "$FAKE_TOOLS_LOG"
-check "python tools from pipx, pinned" bash -c "grep -q 'pipx install --force gws-cli==1.5.0' '$FAKE_TOOLS_LOG' && \
-  grep -q 'pipx install --force crawl4ai==0.9.4' '$FAKE_TOOLS_LOG' && grep -q 'pipx install --force yt-dlp' '$FAKE_TOOLS_LOG'"
+  grep -q "npm install -g --prefix $FAKE_HOME/.local agent-browser@$(vpin AGENT_BROWSER_VERSION)" \
+  "$FAKE_TOOLS_LOG"
+check "python tools from pipx, pinned" bash -c \
+  "grep -q 'pipx install --force gws-cli==$(vpin GWS_CLI_VERSION)' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install --force crawl4ai==$(vpin CRAWL4AI_VERSION)' '$FAKE_TOOLS_LOG' && \
+  grep -q 'pipx install --force yt-dlp' '$FAKE_TOOLS_LOG'"
 check "last30days cloned at the pinned commit and linked" bash -c \
-  "grep -q 'git clone https://github.com/mvanhorn/last30days-skill' '$FAKE_TOOLS_LOG' && \
-   grep -q 'checkout e93c8249d8ba073e8e88c388ed1f0fc403ffd86e' '$FAKE_TOOLS_LOG' && \
+  "grep -q 'git clone $(vpin LAST30DAYS_REPO)' '$FAKE_TOOLS_LOG' && \
+   grep -q 'checkout $(vpin LAST30DAYS_COMMIT)' '$FAKE_TOOLS_LOG' && \
    grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+check "missing pin skips the item instead of installing it unpinned" bash -c "
+  W=\$(mktemp -d '$WORK/nopin.XXXX') && mkdir -p \"\$W/ws\" \"\$W/kit\" \"\$W/home\" \
+  && cp -R '$KIT/kit/.' \"\$W/kit/\" && sed -i '/^CRAWL4AI_VERSION=/d' \"\$W/kit/versions.env\" \
+  && HOME=\"\$W/home\" FAKE_TOOLS_LOG=\"\$W/tools.log\" \
+     bash \"\$W/kit/install-kit.sh\" \"\$W/ws\" \"\$W/cfg\" > \"\$W/log\" 2>&1 \
+  && ! grep -q 'crawl4ai==' \"\$W/tools.log\" && grep -q 'pipx install --force yt-dlp' \"\$W/tools.log\" \
+  && grep -q 'crawl4ai: no pinned version' \"\$W/log\""
 check "browser setup steps run after install" bash -c \
   "grep -qx 'agent-browser install' '$FAKE_TOOLS_LOG' && grep -qx 'crawl4ai-setup ' '$FAKE_TOOLS_LOG'"
 check "agent-browser safety config installed" \

@@ -28,7 +28,35 @@ LOOPBACK_ADDRESS = re.compile(r"https?://(?:localhost|127\.0\.0\.1):(\d+)(?:[/?#
 BAD_URL_CHARS = re.compile(r"[\s\x00-\x1f\x7f]")
 LISTENER_HOST = "127.0.0.1"
 STATUS_WAIT_S: float = 15.0
-VERCEL_CLI_VERSION = "62.2.0"
+VERSIONS_FILE = Path(__file__).resolve().parent.parent / "versions.env"
+
+
+def read_pins(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines of versions.env without executing anything.
+
+    Args:
+        path: The versions file.
+
+    Returns:
+        Key to value; empty when the file is missing or unreadable.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    pins: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        pins[key.strip()] = value.strip()
+    return pins
+
+
+_PINS = read_pins(VERSIONS_FILE)
+VERCEL_CLI_VERSION = _PINS.get("VERCEL_CLI_VERSION", "")
+GWS_CLI_VERSION = _PINS.get("GWS_CLI_VERSION", "")
 GH_INSTALL_URL = "https://github.com/cli/cli#installation"
 CONSENT_URL = re.compile(r"https://accounts\.google\.com/\S+")
 URL_WAIT_S: float = 30.0
@@ -188,7 +216,7 @@ def _on_sigterm(signum: int, frame: object) -> None:
 
 def login_google(client_secret: str | None) -> int:
     """Import the OAuth client, then run gws-cli auth with paste-back."""
-    gws = need("gws-cli", "Install: pipx install gws-cli==1.5.0")
+    gws = need("gws-cli", f"Install: pipx install gws-cli=={GWS_CLI_VERSION or '<version>'}")
     if is_logged_in([gws, "auth", "status"]):
         print("Google: already logged in. Re-login: gws-cli auth --force")
         return 0
@@ -261,7 +289,7 @@ def vercel_command(subcommand: str) -> list[str] | None:
     if vercel:
         return [vercel, subcommand]
     npx = find_tool("npx")
-    if npx:
+    if npx and VERCEL_CLI_VERSION:
         return [npx, "--yes", f"vercel@{VERCEL_CLI_VERSION}", subcommand]
     return None
 
@@ -270,6 +298,9 @@ def login_vercel() -> int:
     """Vercel CLI login (device flow when there is no browser)."""
     cmd = vercel_command("login")
     if not cmd:
+        if not VERCEL_CLI_VERSION:
+            raise SystemExit(f"agent-login: no VERCEL_CLI_VERSION in {VERSIONS_FILE}; "
+                             "reinstall the kit")
         raise SystemExit("agent-login: npx not found. Install Node.js first")
     return subprocess.run(cmd).returncode
 
