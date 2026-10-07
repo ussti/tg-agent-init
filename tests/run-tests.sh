@@ -679,12 +679,19 @@ rm -rf "$WORK/kit-broken"
 keeps_three() {
   local i
   for i in 1 2 3; do
-    run_update "$WORK/update-n$i.log" --no-pull --no-restart --ws "$WS" || return 1
+    run_update "$WORK/update-n$i.log" --no-pull --no-restart --ws "$WS" \
+      || { tail -5 "$WORK/update-n$i.log" > "$WORK/keeps3.diag"; return 1; }
     sleep 1
   done
-  [ "$(find "$WS/backups" -maxdepth 1 -name 'update_*' -type d | wc -l)" -le 3 ]
+  find "$WS/backups" -maxdepth 1 -name 'update_*' -type d > "$WORK/keeps3.diag"
+  [ "$(wc -l < "$WORK/keeps3.diag")" -le 3 ]
 }
-check "update: keeps at most 3 backups" keeps_three
+if keeps_three > /dev/null 2>&1; then
+  ok "update: keeps at most 3 backups"
+else  # show why: CI keeps only this output
+  bad "update: keeps at most 3 backups"
+  sed 's/^/    /' "$WORK/keeps3.diag" 2> /dev/null || true
+fi
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
