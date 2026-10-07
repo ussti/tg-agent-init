@@ -108,13 +108,21 @@ check "list-agents: one agent with user, units, workspace" la1_ok
 L2="$(new_root la2)"
 make_agent "$L2" alice main "$OWNER" 111111111
 make_agent "$L2" bob helper 555 333333333
-cp -a "$L2/home/bob/agents/helper/.claude" "$L2/home/bob/agents/helper/.claude.bak_20260101"
 la2_ok() {
   [ "$(la "$L2" --conf-paths | wc -l)" = 2 ] \
     && la "$L2" --conf-paths | grep -qx "$L2/home/bob/agents/helper/.claude/agent.conf" \
     && la "$L2" | grep -Eq '^helper +bob '
 }
-check "list-agents: two users, backup copy ignored" la2_ok
+check "list-agents: two users" la2_ok
+# Backup copies that the include pattern */.claude/agent.conf WOULD match; each must be skipped.
+mkdir -p "$L2/home/bob/agents/helper.bak_20260101/.claude" "$L2/home/bob/backups/x/.claude"
+cp "$L2/home/bob/agents/helper/.claude/agent.conf" "$L2/home/bob/agents/helper.bak_20260101/.claude/"
+cp "$L2/home/bob/agents/helper/.claude/agent.conf" "$L2/home/bob/backups/x/.claude/"
+check "list-agents: .bak_ copy ignored" bash -c \
+  "! TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' --conf-paths | grep -q 'bak_'"
+check "list-agents: backups/ copy ignored" bash -c \
+  "! TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' --conf-paths | grep -q '/backups/'"
+check "list-agents: backup copies leave two agents" la2_ok
 printf 'ghost-agent.service loaded active running Ghost\n' > "$L2/.fake/units"
 check "list-agents: unit without agent.conf is shown" bash -c \
   "TG_DOCTOR_ROOT='$L2' PATH='$FAKES:$PATH' bash '$SD/list-agents.sh' \
