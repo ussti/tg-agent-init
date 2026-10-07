@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "bump-versions.py"
@@ -26,18 +27,21 @@ PINS_TEXT = (
 )
 
 
-def fake_fetch(answers: dict[str, object]):
+def fake_fetch(answers: dict[str, object]) -> Callable[[str], dict]:
     """Return a fetch_json stub: URL -> dict, or raise when the answer is an Exception."""
+
     def fetch(url: str) -> dict:
         answer = answers[url]
         if isinstance(answer, Exception):
             raise answer
         return answer
+
     return fetch
 
 
 def registry(ab: str = "0.38.2", vc: str = "62.2.0", gws: str = "1.5.0",
              c4: str = "0.9.4", yt: str = "2026.8.19") -> dict[str, object]:
+    """Return registry answers for every fetched URL, with the given latest versions."""
     return {
         "https://registry.npmjs.org/agent-browser/latest": {"version": ab},
         "https://registry.npmjs.org/vercel/latest": {"version": vc},
@@ -74,8 +78,14 @@ class BumpTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def run_check(self, answers, git, dry_run=False):
+    def run_check(self, answers: dict[str, object], git: FakeGit,
+                  dry_run: bool = False) -> tuple[list["bv.Row"], bool]:
+        """Run check_all on the temp versions.env with stubbed fetch and git."""
         return bv.check_all(self.path, fake_fetch(answers), git, dry_run=dry_run)
+
+    def doctor_row(self, rows: list["bv.Row"]) -> "bv.Row":
+        """Return the claude-code-telegram (doctor) row."""
+        return next(r for r in rows if r.key == "DOCTOR_BOT_TAG")
 
     def test_nothing_new(self) -> None:
         rows, changed = self.run_check(registry(), FakeGit({"v3.9.4": OLD}))
@@ -188,10 +198,6 @@ class BumpTest(unittest.TestCase):
         code, _ = bv.run_cli(["--versions", "/nonexistent"], fake_fetch({}), FakeGit({}))
         self.assertEqual(code, 2)
 
-
-    def doctor_row(self, rows):
-        return next(r for r in rows if r.key == "DOCTOR_BOT_TAG")
-
     def test_doctor_bot_newer_tag_is_bumped_and_written(self) -> None:
         git = FakeGit({"v3.9.4": OLD}, doctor_tags={"v1.6.0": OLD, "v1.7.0": NEW})
         rows, changed = self.run_check(registry(), git)
@@ -210,7 +216,34 @@ class BumpTest(unittest.TestCase):
         git = FakeGit({"v3.9.4": OLD}, doctor_tags={"v1.5.2": OLD})
         rows, changed = self.run_check(registry(), git)
         self.assertFalse(changed)
-        self.assertTrue(self.doctor_row(rows).status.startswith("skipped"))
+        self.assertEqual(self.doctor_row(rows).status, "skipped: older than pin")
+        self.assertIn("DOCTOR_BOT_TAG=v1.6.0\n", self.path.read_text())
+
+    def test_doctor_bot_tag_listing_error_is_an_error_row(self) -> None:
+        git = FakeGit({"v3.9.4": OLD})
+        real_latest = git.latest_tag
+
+        def latest_tag(repo: str) -> tuple[str, str] | None:
+            if repo == bv.DOCTOR_BOT_REPO:
+                raise OSError("git ls-remote failed")
+            return real_latest(repo)
+
+        git.latest_tag = latest_tag  # type: ignore[method-assign]
+        rows, changed = self.run_check(registry(), git)
+        self.assertFalse(changed)
+        self.assertEqual(self.doctor_row(rows).status, "error: git ls-remote failed")
+        self.assertIn("DOCTOR_BOT_TAG=v1.6.0\n", self.path.read_text())
+        last30 = next(r for r in rows if r.key == "LAST30DAYS_COMMIT")
+        self.assertEqual(last30.status, "up to date")
+
+    def test_doctor_bot_absent_pin_is_an_error_row(self) -> None:
+        self.path.write_text(PINS_TEXT.replace("DOCTOR_BOT_TAG=v1.6.0\n", ""))
+        rows, changed = self.run_check(registry(), FakeGit({"v3.9.4": OLD}))
+        self.assertFalse(changed)
+        row = self.doctor_row(rows)
+        self.assertTrue(row.status.startswith("error"))
+        self.assertEqual(row.pinned, "?")
+        self.assertNotIn("DOCTOR_BOT_TAG", self.path.read_text())
 
     def test_doctor_bot_bad_pin_is_an_error_row(self) -> None:
         self.path.write_text(PINS_TEXT.replace("DOCTOR_BOT_TAG=v1.6.0", "DOCTOR_BOT_TAG=main"))
@@ -224,7 +257,9 @@ class BumpTest(unittest.TestCase):
         rows, _ = self.run_check(registry(), git)
         self.assertEqual(self.doctor_row(rows).status, "skipped: no vX.Y.Z tags")
 
-    def run_dashi(self, pin_text: str | None, tags: dict[str, str]):
+    def run_dashi(self, pin_text: str | None,
+                  tags: dict[str, str]) -> tuple[list["bv.Row"], bool]:
+        """Run check_all with a Dashi pin file holding pin_text (None: no file)."""
         dashi = Path(self.tmp.name) / "UPSTREAM_COMMIT"
         if pin_text is not None:
             dashi.write_text(pin_text)
@@ -258,6 +293,7 @@ class BumpTest(unittest.TestCase):
     def test_without_dashi_pin_there_is_no_dashi_row(self) -> None:
         rows, _ = self.run_check(registry(), FakeGit({"v3.9.4": OLD}))
         self.assertNotIn("Dashi plugin", {r.item for r in rows})
+
 
 if __name__ == "__main__":
     unittest.main()
