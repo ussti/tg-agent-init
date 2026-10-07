@@ -22,6 +22,7 @@ PINS_TEXT = (
     "CRAWL4AI_VERSION=0.9.4\n"
     "LAST30DAYS_REPO=https://github.com/mvanhorn/last30days-skill\n"
     f"LAST30DAYS_COMMIT={OLD}\n"
+    "DOCTOR_BOT_TAG=v1.6.0\n"
 )
 
 
@@ -49,11 +50,15 @@ def registry(ab: str = "0.38.2", vc: str = "62.2.0", gws: str = "1.5.0",
 class FakeGit:
     """Stub for the git calls: tags listing and ancestry."""
 
-    def __init__(self, tags: dict[str, str], ancestor: bool = True) -> None:
+    def __init__(self, tags: dict[str, str], ancestor: bool = True,
+                 doctor_tags: dict[str, str] | None = None) -> None:
         self.tags = tags
         self.ancestor = ancestor
+        self.doctor_tags = {"v1.6.0": NEW} if doctor_tags is None else doctor_tags
 
     def latest_tag(self, repo: str) -> tuple[str, str] | None:
+        if repo == bv.DOCTOR_BOT_REPO:
+            return bv.pick_latest_tag(self.doctor_tags)
         return bv.pick_latest_tag(self.tags)
 
     def is_ancestor(self, repo: str, old: str, new: str) -> bool:
@@ -184,13 +189,50 @@ class BumpTest(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+    def doctor_row(self, rows):
+        return next(r for r in rows if r.key == "DOCTOR_BOT_TAG")
+
+    def test_doctor_bot_newer_tag_is_bumped_and_written(self) -> None:
+        git = FakeGit({"v3.9.4": OLD}, doctor_tags={"v1.6.0": OLD, "v1.7.0": NEW})
+        rows, changed = self.run_check(registry(), git)
+        self.assertTrue(changed)
+        self.assertIn("DOCTOR_BOT_TAG=v1.7.0\n", self.path.read_text())
+        row = self.doctor_row(rows)
+        self.assertEqual(row.status, "bumped")
+        self.assertIn("compare/v1.6.0...v1.7.0", row.changes)
+
+    def test_doctor_bot_same_tag_is_up_to_date(self) -> None:
+        rows, changed = self.run_check(registry(), FakeGit({"v3.9.4": OLD}))
+        self.assertFalse(changed)
+        self.assertEqual(self.doctor_row(rows).status, "up to date")
+
+    def test_doctor_bot_older_tag_is_skipped(self) -> None:
+        git = FakeGit({"v3.9.4": OLD}, doctor_tags={"v1.5.2": OLD})
+        rows, changed = self.run_check(registry(), git)
+        self.assertFalse(changed)
+        self.assertTrue(self.doctor_row(rows).status.startswith("skipped"))
+
+    def test_doctor_bot_bad_pin_is_an_error_row(self) -> None:
+        self.path.write_text(PINS_TEXT.replace("DOCTOR_BOT_TAG=v1.6.0", "DOCTOR_BOT_TAG=main"))
+        rows, changed = self.run_check(registry(), FakeGit({"v3.9.4": OLD}))
+        self.assertFalse(changed)
+        self.assertTrue(self.doctor_row(rows).status.startswith("error"))
+        self.assertIn("DOCTOR_BOT_TAG=main\n", self.path.read_text())
+
+    def test_doctor_bot_no_tags_is_skipped(self) -> None:
+        git = FakeGit({"v3.9.4": OLD}, doctor_tags={})
+        rows, _ = self.run_check(registry(), git)
+        self.assertEqual(self.doctor_row(rows).status, "skipped: no vX.Y.Z tags")
+
     def run_dashi(self, pin_text: str | None, tags: dict[str, str]):
         dashi = Path(self.tmp.name) / "UPSTREAM_COMMIT"
         if pin_text is not None:
             dashi.write_text(pin_text)
         git = FakeGit({"v3.9.4": OLD})  # last30days stays on its pin
         git.latest_tag = lambda repo: bv.pick_latest_tag(  # type: ignore[method-assign]
-            tags if repo == bv.DASHI_REPO else {"v3.9.4": OLD})
+            tags if repo == bv.DASHI_REPO
+            else {"v1.6.0": NEW} if repo == bv.DOCTOR_BOT_REPO
+            else {"v3.9.4": OLD})
         return bv.check_all(self.path, fake_fetch(registry()), git, dashi_pin=dashi)
 
     def test_dashi_newer_tag_is_report_only_and_changes_nothing(self) -> None:

@@ -68,6 +68,25 @@ gate "last30days ${l30:0:12}" "checkout on pin" test "$(git -C "$L30" rev-parse 
 gate "last30days skill linked" "SKILL.md present" test -f "$WS/skills/last30days/SKILL.md"
 gate "last30days starts" "--help" python3 "$L30/skills/last30days/scripts/last30days.py" --help
 
+# Doctor package: the pinned tag installs, has its entry point, and still has every
+# setting install-doctor.sh writes (pydantic-settings ignores unknown keys silently).
+readonly DOCTOR_SETTINGS="telegram_bot_token telegram_bot_username allowed_users \
+approved_directory agentic_mode sandbox_enabled claude_cli_path claude_max_cost_per_request"
+doctor_pkg_ok() {
+  local venv="$HOME/doctor-venv" tag
+  tag="$(pin DOCTOR_BOT_TAG)"
+  python3 -m venv "$venv" \
+    && "$venv/bin/pip" install -q "git+https://github.com/RichardAtCT/claude-code-telegram@$tag" \
+    && [ -x "$venv/bin/claude-telegram-bot" ] \
+    && "$venv/bin/python" -c '
+import sys
+from src.config.settings import Settings
+missing = [k for k in sys.argv[1:] if k not in Settings.model_fields]
+sys.exit("missing settings: " + " ".join(missing) if missing else 0)
+' $DOCTOR_SETTINGS
+}
+gate "claude-code-telegram $(pin DOCTOR_BOT_TAG)" "installs, settings in place" doctor_pkg_ok
+
 if [ "${SMOKE_SKIP_SEARCH:-0}" = 1 ]; then
   row "last30days trial search" skipped "SMOKE_SKIP_SEARCH=1"
 else

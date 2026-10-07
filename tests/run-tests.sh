@@ -341,7 +341,7 @@ V="$KIT/kit/versions.env"
 vpin() { sed -n "s/^$1=//p" "$V" | tr -d '\r'; }
 check "versions.env pins every third-party item" bash -c \
   "for k in AGENT_BROWSER_VERSION VERCEL_CLI_VERSION GWS_CLI_VERSION CRAWL4AI_VERSION \
-   LAST30DAYS_REPO LAST30DAYS_COMMIT; do grep -Eq \"^\$k=.+\" '$V' || exit 1; done"
+   LAST30DAYS_REPO LAST30DAYS_COMMIT DOCTOR_BOT_TAG; do grep -Eq \"^\$k=.+\" '$V' || exit 1; done"
 check "no stray UPSTREAM pin file" test ! -e "$KIT/kit/skills/research/last30days/UPSTREAM"
 check "no version literals outside versions.env" bash -c \
   "! grep -rnE '(agent-browser@|gws-cli==|crawl4ai==|vercel@)[0-9]' \

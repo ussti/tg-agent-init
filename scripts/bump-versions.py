@@ -27,6 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_VERSIONS = REPO_ROOT / "kit" / "versions.env"
 DEFAULT_DASHI_PIN = REPO_ROOT / "vendor" / "UPSTREAM_COMMIT"
 DASHI_REPO = "https://github.com/qwwiwi/dashi-plugin-claude-code"
+DOCTOR_BOT_REPO = "https://github.com/RichardAtCT/claude-code-telegram"
+DOCTOR_BOT_KEY = "DOCTOR_BOT_TAG"
 HTTP_TIMEOUT_S = 30
 GIT_TIMEOUT_S = 300
 STABLE_VERSION = re.compile(r"^\d+(\.\d+)+$")
@@ -265,6 +267,49 @@ def check_dashi(pin_path: Path, git: Git) -> Row:
     return base
 
 
+def check_doctor_bot(pins: dict[str, str], git: Git) -> Row:
+    """Bump the doctor's claude-code-telegram pin to the newest stable vX.Y.Z tag.
+
+    Args:
+        pins: Current versions.env values.
+        git: Tag lister.
+
+    Returns:
+        The report row; status "bumped" means row.latest is the new tag to write.
+    """
+    pinned = pins.get(DOCTOR_BOT_KEY, "")
+    row = Row(item="claude-code-telegram (doctor)", key=DOCTOR_BOT_KEY,
+              pinned=pinned or "?", latest="?", status="", changes=DOCTOR_BOT_REPO)
+    try:
+        old = STABLE_TAG.match(pinned)
+        if old is None:
+            raise ValueError(f"no vX.Y.Z pin for {DOCTOR_BOT_KEY}")
+        found = git.latest_tag(DOCTOR_BOT_REPO)
+    except Exception as exc:
+        log.warning("doctor bot: %s", exc)
+        row.status = f"error: {exc}"[:120]
+        return row
+    if found is None:
+        row.status = "skipped: no vX.Y.Z tags"
+        return row
+    tag, _sha = found
+    row.latest = tag
+    new = STABLE_TAG.match(tag)
+    if new is None:
+        row.status = "skipped: no vX.Y.Z tags"
+        return row
+    old_key = tuple(int(g) for g in old.groups())
+    new_key = tuple(int(g) for g in new.groups())
+    if new_key > old_key:
+        row.status = "bumped"
+        row.changes = f"{DOCTOR_BOT_REPO}/compare/{pinned}...{tag}"
+    elif new_key == old_key:
+        row.status = "up to date"
+    else:
+        row.status = "skipped: older than pin"
+    return row
+
+
 def check_all(path: Path, fetch: FetchJson, git: Git, dry_run: bool = False,
               dashi_pin: Path | None = None) -> tuple[list[Row], bool]:
     """Check every item, write newer pins unless dry_run, return rows and whether any changed.
@@ -275,6 +320,7 @@ def check_all(path: Path, fetch: FetchJson, git: Git, dry_run: bool = False,
     pins = read_pins(path)
     rows = [check_registry(src, pins, fetch) for src in SOURCES]
     rows.append(check_last30days(pins, git))
+    rows.append(check_doctor_bot(pins, git))
     if dashi_pin is not None:
         rows.append(check_dashi(dashi_pin, git))
     updates: dict[str, str] = {}
