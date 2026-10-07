@@ -178,6 +178,10 @@ else
   bad "installer exits 0 (log below)"
   tail -20 "$WORK/install.log"
 fi
+check "install-server ends with the doctor step" \
+  grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
+check "prepare-server final text names install-doctor.sh" \
+  grep -q 'install-doctor.sh' "$KIT/prepare-server.sh"
 
 check "installer stops on Node.js older than 24 and names prepare-server" bash -c "
   ! out=\$(HOME='$WORK/oldnode' FAKE_NODE_VERSION=v22.1.0 TG_AGENT_NONINTERACTIVE=1 \

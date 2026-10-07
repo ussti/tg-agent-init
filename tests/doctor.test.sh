@@ -297,6 +297,20 @@ if [ "$(id -u)" -ne 0 ]; then
   check "doctor: not root -> stop" refused "$O" "$DOC/root.log" "run as root" TG_DOCTOR_DRY_RUN=0
 fi
 
+# --- doctor-hint (end of install-server.sh)
+HN="$(new_root hint)"
+hint() { TG_DOCTOR_ROOT="$HN" PATH="$FAKES:$PATH" bash "$SD/doctor-hint.sh" /srv/kit; }
+hint_shown() {
+  local out
+  out="$(hint)"
+  grep -qx '== Agent is up. One step left: the doctor' <<< "$out" \
+    && grep -qx '  sudo bash /srv/kit/install-doctor.sh' <<< "$out"
+}
+check "doctor-hint: no doctor -> the install command" hint_shown
+touch "$HN/.fake/enabled-agent-doctor.service"
+check "doctor-hint: doctor enabled -> silent" bash -c \
+  "[ -z \"\$(TG_DOCTOR_ROOT='$HN' PATH='$FAKES:$PATH' bash '$SD/doctor-hint.sh' /srv/kit)\" ]"
+
 if [ "${DOCTOR_STANDALONE:-0}" = 1 ]; then
   echo
   echo "$pass passed, $fail failed"

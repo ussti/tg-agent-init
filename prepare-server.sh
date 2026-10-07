@@ -113,4 +113,7 @@ cat <<EOF
   cd tg-agent-init && ./install-server.sh
 
 At the end the installer prints two commands for root: type exit, then paste them.
+After the first agent, install the doctor (a second bot with root that fixes agents):
+
+  sudo bash $DEST/install-doctor.sh
 EOF
