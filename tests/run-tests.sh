@@ -54,6 +54,22 @@ check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
   "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
 find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || true
+if python3 -c 'import yaml' 2>/dev/null; then
+  check "versions workflow parses and has the agreed shape" python3 - \
+    "$KIT/.github/workflows/versions.yml" <<'PY'
+import sys, yaml
+w = yaml.safe_load(open(sys.argv[1]))
+on = w.get("on") or w.get(True)
+assert on["schedule"][0]["cron"] == "0 1 * * 1"
+assert "workflow_dispatch" in on and "pull_request" in on
+assert w["permissions"] == {"contents": "write", "pull-requests": "write"}
+text = open(sys.argv[1]).read()
+assert "--force" not in text.replace("gh label create versions-bot --color BFD4F2 --force", "")
+assert "--delete-branch" not in text
+PY
+else
+  echo "  skip workflow shape (no PyYAML)"
+fi
 
 echo "== 3. ratewatch"
 check "ratewatch tests" bash "$KIT/server/tests/ratewatch.test.sh"
