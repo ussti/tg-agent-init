@@ -311,6 +311,14 @@ check "last30days cloned at the pinned commit and linked" bash -c \
   "grep -q 'git clone $(vpin LAST30DAYS_REPO)' '$FAKE_TOOLS_LOG' && \
    grep -q 'checkout $(vpin LAST30DAYS_COMMIT)' '$FAKE_TOOLS_LOG' && \
    grep -q 'description: upstream' '$WS/skills/last30days/SKILL.md'"
+# Fakes on PATH ($WORK/bin) do not answer --version with the pin, so gates may FAIL here:
+# only the report and the HOME confinement are checked (exit code ignored by design).
+check "smoke-kit writes a report and stays inside its HOME" bash -c "
+  R=\$(mktemp '$WORK/smoke.XXXX.md') && SH=\$(mktemp -d '$WORK/smokehome.XXXX') \
+  && { SMOKE_HOME=\"\$SH\" SMOKE_SKIP_SEARCH=1 FAKE_TOOLS_LOG=\"\$SH/tools.log\" \
+       bash '$KIT/scripts/smoke-kit.sh' \"\$R\" >/dev/null 2>&1 || true; } \
+  && grep -q '| Check | Result | Detail |' \"\$R\" && grep -q '| kit install | ok |' \"\$R\" \
+  && [ -d \"\$SH/ws/kit\" ]"
 check "missing pin skips the item instead of installing it unpinned" bash -c "
   W=\$(mktemp -d '$WORK/nopin.XXXX') && mkdir -p \"\$W/ws\" \"\$W/kit\" \"\$W/home\" \
   && cp -R '$KIT/kit/.' \"\$W/kit/\" && sed -i '/^CRAWL4AI_VERSION=/d' \"\$W/kit/versions.env\" \
