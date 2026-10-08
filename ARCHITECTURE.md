@@ -105,6 +105,16 @@ agent B ─ MCP ──▶│                                   gbrain-swarm-work
   to a dashi webhook gets 404. install-fleet refuses a brain that lacks it.
 - `core/rules.md` of each agent gets a block between `team-layer:start/end` markers,
   rendered from `server/templates/team-rules.md`; a re-run replaces it in place.
+- Remote shared brain: an agent whose `gbrain-*` URLs in `.mcp.json` point at a
+  non-loopback host stays wired as it is: no `.mcp.json` rewrite, no `GBRAIN_BEARER`,
+  no entry in `fleet.env`; only its rules block is rewritten. When every agent is
+  remote, the local brain, tokens, worker drop-in and backup are skipped entirely.
+  `--replace-remote-brain` restores the old behaviour (rewire to 127.0.0.1, issue tokens).
+- Roster: `~/.config/tg-agent/fleet-roster` (`name: one-line role`, `#` comments;
+  `--roster FILE` for another path) lists teammates across servers. The rules block lists
+  them in file order, then local agents the file omits; a file role beats the CLAUDE.md
+  first line. The coordinator may be any roster name; a remote coordinator with local
+  agents is warned about, because the local worker only knows local webhooks.
 - Team state: `~/.config/tg-agent/fleet.conf` (`FLEET_AGENTS`, `FLEET_COORDINATOR`).
   `/etc/gbrain/tg-agent-fleet.marker` records that the kit installed the brain; a brain
   without it needs `--use-existing-brain`, which also rotates tokens.
@@ -112,7 +122,12 @@ agent B ─ MCP ──▶│                                   gbrain-swarm-work
   tarball into `/var/backups/gbrain`, 14 days kept. Restore steps are in the script header.
 - Smoke: `server/fleet/mcp-smoke.py` does what Claude Code does on each server
   (`initialize`, keep `Mcp-Session-Id`, `notifications/initialized`) and then calls one
-  read-only tool with the agent's token: `slot_list`, `recent`, `stats`. Upstream runs
+  tool with the agent's token. Upstream serves only `GBRAIN_TOOLS=core`, so the calls are
+  memory `supersede_decision` on a missing decision (passes on the expected "Original
+  decision not found", which comes after the token and write-scope checks; nothing is
+  written), recall `recent {"scope":"30-decisions","limit":1}`, swarm `ack` on a
+  nonexistent task id. Remote agents are smoked on their own URLs with the bearer
+  variable their `.mcp.json` names. Upstream runs
   the servers in stateful streamable-http mode, so a bare `tools/list` without a session
   gets 400; and the bearer is checked only inside tool handlers, so `tools/list` would
   pass with any token. Any failure stops the run.
@@ -144,6 +159,9 @@ Then the brain build (worker tests when `GBRAIN_TEST_PYTHON` is set) and an inst
 run over two agents against a fake token issuer, fake `systemctl` and
 `tests/fake-brain-mcp.py` (stateful like upstream: 400 without a session, bad token →
 tool error): tokens, `.mcp.json`, rules block, `fleet.env`, drop-in, cron, smoke with
-live and dead tokens, idempotent re-run, rotation, adoption of an existing brain and
-every refusal, including that refusals issue no tokens.
+live and dead tokens (only core tools called), idempotent re-run, rotation, adoption of
+an existing brain and every refusal, including that refusals issue no tokens. Section 6a
+covers a remote shared brain (wiring and key untouched, smoke on the remote URLs through
+`TG_FLEET_TEST_SMOKE_HOST`), an all-remote server (no local brain), the roster file with
+a remote coordinator, and `--replace-remote-brain`.
 `--with-plugin` adds the plugin build, typecheck and its test suite.

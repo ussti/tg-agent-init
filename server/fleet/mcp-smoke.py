@@ -5,14 +5,17 @@ Does what Claude Code does: ``initialize`` (keeps ``Mcp-Session-Id`` when the
 server is stateful), ``notifications/initialized``, then ``tools/call`` on a
 read-only tool that authenticates the caller. A bare ``tools/list`` would pass
 with any bearer, because the brain checks the token inside tool handlers.
+EXPECT_ERROR is a regex: a tool error matching it counts as success, for a
+write tool probed with arguments it rejects only after authenticating.
 
-Usage: mcp-smoke.py URL TOOL [JSON_ARGS]   (bearer token on stdin)
+Usage: mcp-smoke.py URL TOOL [JSON_ARGS] [EXPECT_ERROR]   (bearer token on stdin)
 Exit 0 on success; otherwise prints one short reason, never the token.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -57,7 +60,7 @@ def _post(url: str, token: str, session: str | None, message: dict) -> tuple[dic
         raise SmokeError(f"unreadable reply to {message.get('method')}") from exc
 
 
-def smoke(url: str, token: str, tool: str, args: dict) -> None:
+def smoke(url: str, token: str, tool: str, args: dict, expect_error: str = "") -> None:
     """Run the handshake and one authenticated tool call; raise SmokeError on failure."""
     init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
@@ -76,22 +79,26 @@ def smoke(url: str, token: str, tool: str, args: dict) -> None:
         raise SmokeError(f"{tool}: no result")
     if result.get("isError"):
         content = result.get("content") or [{}]
-        raise SmokeError(f"{tool}: {content[0].get('text', 'tool error')}")
+        text = str(content[0].get("text", "tool error"))
+        if expect_error and re.search(expect_error, text):
+            return
+        raise SmokeError(f"{tool}: {text}")
 
 
 def main() -> int:
-    """Entry point: argv URL TOOL [JSON_ARGS], token on stdin."""
-    if len(sys.argv) not in (3, 4):
+    """Entry point: argv URL TOOL [JSON_ARGS] [EXPECT_ERROR], token on stdin."""
+    if len(sys.argv) not in (3, 4, 5):
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
     url, tool = sys.argv[1], sys.argv[2]
-    args = json.loads(sys.argv[3]) if len(sys.argv) == 4 else {}
+    args = json.loads(sys.argv[3]) if len(sys.argv) >= 4 else {}
+    expect_error = sys.argv[4] if len(sys.argv) == 5 else ""
     token = sys.stdin.readline().strip()
     if not token:
         print("no token on stdin", file=sys.stderr)
         return 2
     try:
-        smoke(url, token, tool, args)
+        smoke(url, token, tool, args, expect_error)
     except SmokeError as exc:
         print(str(exc).replace(token, "***")[:MAX_REASON_CHARS])
         return 1

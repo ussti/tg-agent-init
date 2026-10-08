@@ -824,7 +824,8 @@ chmod +x "$GB/.venv/bin/python" "$FAKEBIN/systemctl"
 SMOKE_OFFSET=$((20000 + RANDOM % 20000))
 mkfifo "$FL/brain.ready"
 python3 "$KIT/tests/fake-brain-mcp.py" "$FL/valid-tokens" $((8767 + SMOKE_OFFSET)) \
-  $((8768 + SMOKE_OFFSET)) $((8766 + SMOKE_OFFSET)) > "$FL/brain.ready" 2> "$FL/brain.log" &
+  $((8768 + SMOKE_OFFSET)) $((8766 + SMOKE_OFFSET)) "$FL/brain-calls.log" \
+  > "$FL/brain.ready" 2> "$FL/brain.log" &
 FAKE_BRAIN_PID=$!
 read -r -t 10 _ < "$FL/brain.ready" || bad "fake brain started"
 touch "$FL/systemd/testbot-agent.service"
@@ -914,14 +915,35 @@ check "backup script + cron installed" bash -c \
   "[ -x '$FL/lib/gbrain-backup.sh' ] && grep -q '^17 3 \* \* \* root $FL/lib/gbrain-backup.sh' \
    '$FL/cron/tg-agent-gbrain-backup'"
 check "smoke covered 2 agents x 3 servers" test "$(grep -c ' ok$' "$FL/run1.log")" = 6
+# The live brain runs GBRAIN_TOOLS=core: slot_list and swarm stats do not exist there.
+check "smoke calls only core tools" bash -c \
+  "[ \"\$(sort -u '$FL/brain-calls.log' | tr '\n' ,)\" = 'memory supersede_decision,recall recent,swarm ack,' ]"
+non_core_rejected() {
+  local out
+  ! out="$(printf '%s\n' FLEETTESTTOKENtestbotXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
+      | python3 "$KIT/server/fleet/mcp-smoke.py" \
+      "http://127.0.0.1:$((8767 + SMOKE_OFFSET))/mcp" slot_list '{"limit":1}')" \
+    && grep -q "Unknown tool" <<<"$out"
+}
+check "fake brain hides non-core tools like the live one" non_core_rejected
 # smoke_rejects TOKEN: mcp-smoke.py must fail and name the reason, never echo the token.
 smoke_rejects() {
   local out
   ! out="$(printf '%s\n' "$1" | python3 "$KIT/server/fleet/mcp-smoke.py" \
-      "http://127.0.0.1:$((8767 + SMOKE_OFFSET))/mcp" slot_list '{"limit":1}')" \
+      "http://127.0.0.1:$((8768 + SMOKE_OFFSET))/mcp" recent '{"scope":"30-decisions","limit":1}')" \
     && grep -q "unknown bearer token" <<<"$out" && ! grep -q "$1" <<<"$out"
 }
 check "smoke rejects an unknown token" smoke_rejects BOGUSTOKENBOGUSTOKENBOGUSTOKEN0000000
+# An expected tool error proves the token was accepted; any other error still fails.
+expected_error() {
+  printf '%s\n' FLEETTESTTOKENtestbotXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
+    | python3 "$KIT/server/fleet/mcp-smoke.py" "http://127.0.0.1:$((8767 + SMOKE_OFFSET))/mcp" \
+      supersede_decision '{"old_path":"30-decisions/x.md"}' 'Original decision not found' \
+  && ! printf '%s\n' BOGUSTOKENBOGUSTOKENBOGUSTOKEN0000000 \
+    | python3 "$KIT/server/fleet/mcp-smoke.py" "http://127.0.0.1:$((8767 + SMOKE_OFFSET))/mcp" \
+      supersede_decision '{"old_path":"30-decisions/x.md"}' 'Original decision not found'
+}
+check "smoke: expected error passes only with a valid token" expected_error
 # Without the session handshake the fake answers 400, like the live brain.
 no_session_400() {
   python3 - "http://127.0.0.1:$((8766 + SMOKE_OFFSET))/mcp" <<'PY'
@@ -978,6 +1000,139 @@ check "half-present brain refused" refused "$FL/run12.log" "exists but"
 mv "$FL/python.moved" "$GB/.venv/bin/python"
 sed -i 's/^    body = {$/    body = {\n        "agentId": to_agent,/' "$GB/services/swarm_mcp/worker.py"
 check "unpatched brain refused" refused "$FL/run6.log" "lacks patch 0001"
+cp "$GB_BUILD/services/swarm_mcp/worker.py" "$GB/services/swarm_mcp/worker.py"
+
+echo "== 6a. install-fleet: remote shared brain, roster from config"
+# An agent already wired by hand to another server's shared brain (TEST-NET address);
+# the smoke reaches it through TG_FLEET_TEST_SMOKE_HOST, i.e. the fake brain.
+PLUGIN1="$FAKE_HOME/agents/testbot/.claude/dashi-plugin/plugin"
+WS1="$FAKE_HOME/agents/testbot/.claude"
+REMOTE_TOKEN2="REMOTEBRAINTOKENhelper_twoXXXXXXXXXXXXXXXXXXXXXX"
+REMOTE_TOKEN1="REMOTEBRAINTOKENtestbotXXXXXXXXXXXXXXXXXXXXXXXXX"
+# wire_remote PLUGIN_DIR SECRETS_DIR TOKEN: brain entries -> remote host, key in GBRAIN_TOKEN.
+wire_remote() {
+  python3 - "$1/.mcp.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+mcp = json.load(open(path))
+for name, port in {"gbrain-memory": 8767, "gbrain-recall": 8768, "gbrain-swarm": 8766}.items():
+    mcp["mcpServers"][name] = {"type": "http", "url": f"http://203.0.113.10:{port}/mcp",
+                               "headers": {"Authorization": "Bearer ${GBRAIN_TOKEN}"}}
+json.dump(mcp, open(path, "w"), indent=2)
+PY
+  sed -i '/^GBRAIN_BEARER=/d; /^GBRAIN_TOKEN=/d' "$2/channel.conf"
+  printf 'GBRAIN_TOKEN="%s"\n' "$3" >> "$2/channel.conf"
+  echo "$3" >> "$FL/valid-tokens"
+}
+wire_remote "$PLUGIN2" "$SEC2" "$REMOTE_TOKEN2"
+cp "$PLUGIN2/.mcp.json" "$FL/remote-mcp.before"
+ROSTER="$FAKE_HOME/.config/tg-agent/fleet-roster"
+cat > "$ROSTER" <<'EOF'
+# Team members on other servers; one line each: name: role
+lead: Code and infrastructure, main server
+
+scout: Research, main server
+helper-two: Research helper on a remote brain
+EOF
+: > "$FL/brain-calls.log"
+ISSUED_BEFORE="$(issued)"
+remote_run() { FLEET_ENV_EXTRA="TG_FLEET_TEST_SMOKE_HOST=127.0.0.1" run_fleet "$@"; }
+if remote_run "$FL/remote1.log" --coordinator lead; then
+  ok "mixed fleet (one agent on a remote brain) exits 0"
+else
+  bad "mixed fleet exits 0 (log below)"; tail -15 "$FL/remote1.log"
+fi
+check "remote wiring in .mcp.json left untouched" cmp -s "$FL/remote-mcp.before" "$PLUGIN2/.mcp.json"
+check "no local brain token issued for the remote agent" bash -c \
+  "! grep -q '^GBRAIN_BEARER=' '$SEC2/channel.conf' && [ \"\$(wc -l < '$FL/issued.log')\" = '$ISSUED_BEFORE' ]"
+check "log says the agent stays on the remote brain" \
+  grep -q "helper-two: stays on the remote shared brain (203.0.113.10)" "$FL/remote1.log"
+check "local agent still wired to the local brain" jq -e \
+  '.mcpServers["gbrain-memory"].url == "http://127.0.0.1:8767/mcp"
+   and .mcpServers["gbrain-memory"].headers.Authorization == "Bearer ${GBRAIN_BEARER}"' \
+  "$PLUGIN1/.mcp.json"
+# roster_ok RULES: roster file entries in order, then the local agent; remote coordinator.
+roster_ok() {
+  python3 - "$1" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+block = text.split("<!-- team-layer:start", 1)[1].split("<!-- team-layer:end -->", 1)[0]
+lines = [l for l in block.splitlines() if l.startswith("- **")]
+assert lines == [
+    "- **lead** — Code and infrastructure, main server (coordinator)",
+    "- **scout** — Research, main server",
+    "- **helper-two** — Research helper on a remote brain",
+    "- **testbot** — " + lines[3].split(" — ", 1)[1],
+], lines
+assert "(coordinator)" not in lines[3]
+assert "Coordinator: lead." in block
+assert "{{" not in block
+PY
+}
+check "roster from config: remote agents, remote coordinator (remote agent)" roster_ok "$WS2/core/rules.md"
+check "roster from config: same team block for the local agent" roster_ok "$WS1/core/rules.md"
+check "local swarm worker only routes to agents on this brain" bash -c \
+  "set -a; . '$FL/etc/fleet.env'; [ \"\$AGENT_GATEWAYS\" = '{\"testbot\":\"http://127.0.0.1:18089/hooks/agent\"}' ] \
+   && [ \"\$COORDINATOR_AGENT\" = lead ]"
+check "warns that the local brain cannot reach a remote coordinator" \
+  grep -q "coordinator 'lead' is not on this server's brain" "$FL/remote1.log"
+check "fleet.conf keeps the remote coordinator" bash -c \
+  "set -a; . '$FAKE_HOME/.config/tg-agent/fleet.conf'; [ \"\$FLEET_COORDINATOR\" = lead ]"
+check "smoke: remote agent checked on the remote URLs" bash -c \
+  "grep -q 'helper-two -> 203.0.113.10:8767 supersede_decision ok' '$FL/remote1.log' \
+   && grep -q 'helper-two -> 203.0.113.10:8768 recent ok' '$FL/remote1.log' \
+   && grep -q 'helper-two -> 203.0.113.10:8766 ack ok' '$FL/remote1.log' \
+   && [ \"\$(grep -c ' ok$' '$FL/remote1.log')\" = 6 ]"
+check "remote token never printed" bash -c "! grep -q REMOTEBRAINTOKEN '$FL/remote1.log'"
+cp "$WS2/core/rules.md" "$FL/rules.remote1"
+if remote_run "$FL/remote2.log" --roster "$ROSTER"; then
+  ok "mixed re-run exits 0 (remote coordinator from fleet.conf, --roster)"
+else
+  bad "mixed re-run exits 0"; tail -10 "$FL/remote2.log"
+fi
+check "mixed re-run leaves rules.md unchanged" cmp -s "$FL/rules.remote1" "$WS2/core/rules.md"
+check "coordinator outside roster and agents refused" \
+  refused "$FL/remote3.log" "is not one of" --coordinator nobody
+cp "$ROSTER" "$FL/roster.keep"
+echo "Bad Name: nope" >> "$ROSTER"
+check "malformed roster line refused" refused "$FL/remote4.log" "fleet-roster line"
+cp "$FL/roster.keep" "$ROSTER"
+sed -i '/^GBRAIN_TOKEN=/d' "$SEC2/channel.conf"
+check "remote agent without its token fails the smoke" \
+  refused "$FL/remote5.log" "helper-two: GBRAIN_TOKEN is not set"
+printf 'GBRAIN_TOKEN="%s"\n' "$REMOTE_TOKEN2" >> "$SEC2/channel.conf"
+
+# Every agent on a remote brain: no local brain at all. A brain dir without its python
+# would be refused ("exists but") if the script still went for the local brain.
+wire_remote "$PLUGIN1" "$SEC1" "$REMOTE_TOKEN1"
+cp "$FL/etc/fleet.env" "$FL/fleet.env.remote"
+mv "$GB/.venv/bin/python" "$FL/python.moved"
+if remote_run "$FL/remote6.log"; then
+  ok "all agents on a remote brain: exits 0 without a local brain"
+else
+  bad "all-remote exits 0"; tail -10 "$FL/remote6.log"
+fi
+mv "$FL/python.moved" "$GB/.venv/bin/python"
+check "all-remote: local brain skipped, said so" \
+  grep -q "every agent is on a remote shared brain: skipping the local brain" "$FL/remote6.log"
+check "all-remote: no tokens issued, worker env untouched" bash -c \
+  "[ \"\$(wc -l < '$FL/issued.log')\" = '$ISSUED_BEFORE' ] && cmp -s '$FL/fleet.env.remote' '$FL/etc/fleet.env'"
+check "all-remote: both agents smoked on the remote brain" \
+  test "$(grep -c ' -> 203.0.113.10:[0-9]* [a-z_]* ok$' "$FL/remote6.log")" = 6
+
+# Opt-in: the old behaviour, local brain replaces the remote wiring.
+if remote_run "$FL/remote7.log" --replace-remote-brain; then
+  ok "--replace-remote-brain exits 0"
+else
+  bad "--replace-remote-brain exits 0"; tail -10 "$FL/remote7.log"
+fi
+check "--replace-remote-brain rewires to the local brain" jq -e \
+  '[.mcpServers["gbrain-memory","gbrain-recall","gbrain-swarm"]]
+   | all(.url | startswith("http://127.0.0.1:")) ' "$PLUGIN2/.mcp.json"
+check "--replace-remote-brain issues local tokens" bash -c \
+  "grep -q '^GBRAIN_BEARER=' '$SEC2/channel.conf' && grep -q '^GBRAIN_BEARER=' '$SEC1/channel.conf' \
+   && [ \"\$(wc -l < '$FL/issued.log')\" = $((ISSUED_BEFORE + 2)) ]"
+check "--replace-remote-brain warns" grep -q "replacing the remote shared brain" "$FL/remote7.log"
 
 echo "== 6b. doctor"
 # shellcheck source=tests/doctor.test.sh
