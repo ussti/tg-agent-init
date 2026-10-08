@@ -26,6 +26,7 @@
 | 0010 tests-redact-regressions | Regression tests: Drive file IDs, hyphenated IDs and URL slugs stay unmasked. |
 | 0011 claude-md-raw-html-reply-rule | `plugin/CLAUDE.md`: rule to pass raw HTML tags to `reply` and escape only literal `& < >`. |
 | 0012 webhook-file-inbox-delivery | `POST /hooks/agent` messages to a chat in DM inbox mode (0007) are committed as inbox files (fsync + rename) before the 200, and a failed commit answers 503 so the sender retries. Each one carries a unique `delivery_id` that the watcher uses as its submit fingerprint. Other chats keep the MCP notification. |
+| 0013 inbox-confirm-retry-dedupe | Attach-mode watcher: the paste echo and the submit must be proven by a delta against a pre-paste snapshot (a stale `[Pasted text #N]` placeholder no longer counts), and a unique fingerprint is pasted as a separate short anchor so it stays visible in a collapsed paste. An unconfirmed message stays queued with exponential backoff and in order (`inbox/.retry/`), is retried without re-pasting a body that may already be in the TUI, and after `MULTICHAT_REDELIVER_MAX` attempts moves to `inbox/.dead-letter/` with an ERROR line and an owner alert via `MULTICHAT_ALERT_CMD`. Webhook: a retried POST of the same swarm task nonce is deduped (`webhook-seen/`, 7-day TTL) and answers 200 `duplicate:true`. |
 
 Refreshing upstream: `scripts/update-vendor.sh` (keeps the old tree if any patch stops applying).
 

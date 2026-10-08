@@ -652,6 +652,33 @@ check "run-agent LAUNCH_CMD still exports agent.conf" bash -c \
   "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch2' 1 | grep -qx 'AGENT_X=from_conf'"
 check "run-agent LAUNCH_CMD works without keys.env" bash -c \
   "KIT='$KIT'; $(declare -f launch_prefix_env); launch_prefix_env '$WORK/launch3' 0 | grep -qx 'AGENT_X=from_conf'"
+# DM inbox mode is exported to the plugin only when the watchers can run, and
+# a watcher that cannot start makes run-agent exit instead of running unwatched.
+dm_mode_env() {  # dm_mode_env WATCHER_PATH DM_CHAT_IDS -> pane env after LAUNCH_CMD
+  local watcher="$1" ids="$2"
+  bash -c "
+    WATCHER='$watcher'; DM_CHAT_IDS='$ids'; DM_STATE_DIR=/x; DM_INBOX=0; LAUNCH_CMD=':'
+    $(sed -n '/^log() {/p; /^dm_chat_list() {/p; /^dm_inbox_preflight() {/,/^}/p; /^if dm_inbox_preflight; then/,/^fi/p' \
+        "$KIT/server/bin/run-agent.sh")
+    echo DM_INBOX=\$DM_INBOX
+    env -i PATH=\"\$PATH\" bash -c \"\$LAUNCH_CMD; env\"" 2>&1
+}
+touch "$WORK/fake-watcher.sh"
+check "run-agent: inbox mode exported when the watcher and chat ids exist" bash -c \
+  "KIT='$KIT'; $(declare -f dm_mode_env); out=\$(dm_mode_env '$WORK/fake-watcher.sh' '111,222'); \
+   grep -qx DM_INBOX=1 <<<\"\$out\" && grep -qx TELEGRAM_DM_DELIVERY_MODE=inbox <<<\"\$out\""
+check "run-agent: no inbox mode when the watcher file is missing" bash -c \
+  "KIT='$KIT'; $(declare -f dm_mode_env); out=\$(dm_mode_env '$WORK/no-such-watcher.sh' '111'); \
+   grep -qx DM_INBOX=0 <<<\"\$out\" && ! grep -q TELEGRAM_DM_DELIVERY_MODE <<<\"\$out\" \
+   && grep -q 'DM inbox mode off' <<<\"\$out\""
+check "run-agent: no inbox mode when no valid chat id is configured" bash -c \
+  "KIT='$KIT'; $(declare -f dm_mode_env); out=\$(dm_mode_env '$WORK/fake-watcher.sh' ' , '); \
+   grep -qx DM_INBOX=0 <<<\"\$out\" && ! grep -q TELEGRAM_DM_DELIVERY_MODE <<<\"\$out\""
+check "run-agent: a failed watcher start is fatal, never swallowed" bash -c \
+  "! grep -qE 'start_watchers \|\| (true|WATCHER_PIDS=)' '$KIT/server/bin/run-agent.sh' \
+   && [ \"\$(grep -c 'start_watchers || { log \"FATAL' '$KIT/server/bin/run-agent.sh')\" = 2 ]"
+check "run-agent: watchers get the owner alert command" \
+  grep -q 'MULTICHAT_ALERT_CMD="\$ALERT_CMD"' "$KIT/server/bin/run-agent.sh"
 check "installer puts ~/.local/bin on PATH before the login step" bash -c \
   "awk '/export PATH=\"\\\$HOME\\/.local\\/bin:\\\$PATH\"/{p=NR} /Log in to \\\$svc now/{l=NR} END{exit !(p && l && p<l)}' '$KIT/install-server.sh'"
 
