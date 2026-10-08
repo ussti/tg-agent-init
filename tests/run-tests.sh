@@ -721,6 +721,25 @@ else  # show why: CI keeps only this output
   bad "update: keeps at most 3 backups"
   sed 's/^/    /' "$WORK/keeps3.diag" 2> /dev/null || true
 fi
+# Two updates within one second must not share a backup dir (CI hit this on a fast runner).
+same_second() {
+  local bin="$WORK/fixed-date"
+  mkdir -p "$bin"
+  printf '#!/bin/sh\necho 20990101_000000\n' > "$bin/date"
+  chmod 755 "$bin/date"
+  local i
+  for i in 1 2; do
+    PATH="$bin:$PATH" run_update "$WORK/update-same$i.log" --no-pull --no-restart --ws "$WS" \
+      || { tail -5 "$WORK/update-same$i.log" > "$WORK/same.diag"; return 1; }
+  done
+  [ -d "$WS/backups/update_20990101_000000" ] && [ -d "$WS/backups/update_20990101_000000_2" ]
+}
+if same_second > /dev/null 2>&1; then
+  ok "update: two runs in one second get separate backups"
+else
+  bad "update: two runs in one second get separate backups"
+  sed 's/^/    /' "$WORK/same.diag" 2> /dev/null || true
+fi
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
