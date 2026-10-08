@@ -10,6 +10,9 @@
 #      when GBRAIN_TEST_PYTHON points at a python with the brain's deps)
 #   6. install-fleet end-to-end: two agents, fake brain (token issuer + stateful
 #      MCP servers), fake systemctl
+#   6a. install-fleet with a remote shared brain and a roster file
+#   6c. install-fleet refusals before any write: lost remote wiring, roster and
+#       coordinator rules, wiring classification, smoke of remote keys, leftovers
 #   6b. doctor: templates, list-agents, install-doctor end to end on fakes, doctor-hint
 #   7. with --with-plugin: build the patched plugin, bun install, typecheck, bun test
 set -euo pipefail
@@ -54,7 +57,7 @@ done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts"
            "$KIT/install-doctor.sh" "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
-  "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
+  "$KIT/server/fleet/brain-wiring.py" "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
 find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || true
 if python3 -c 'import yaml' 2>/dev/null; then
   check "versions workflow parses and has the agreed shape" python3 - \
@@ -1029,7 +1032,7 @@ cp "$PLUGIN2/.mcp.json" "$FL/remote-mcp.before"
 ROSTER="$FAKE_HOME/.config/tg-agent/fleet-roster"
 cat > "$ROSTER" <<'EOF'
 # Team members on other servers; one line each: name: role
-lead: Code and infrastructure, main server
+lead: Code and infrastructure, main server (coordinator)
 
 scout: Research, main server
 helper-two: Research helper on a remote brain
@@ -1086,13 +1089,13 @@ check "smoke: remote agent checked on the remote URLs" bash -c \
 check "remote token never printed" bash -c "! grep -q REMOTEBRAINTOKEN '$FL/remote1.log'"
 cp "$WS2/core/rules.md" "$FL/rules.remote1"
 if remote_run "$FL/remote2.log" --roster "$ROSTER"; then
-  ok "mixed re-run exits 0 (remote coordinator from fleet.conf, --roster)"
+  ok "mixed re-run exits 0 (coordinator declared in the roster, --roster)"
 else
   bad "mixed re-run exits 0"; tail -10 "$FL/remote2.log"
 fi
 check "mixed re-run leaves rules.md unchanged" cmp -s "$FL/rules.remote1" "$WS2/core/rules.md"
 check "coordinator outside roster and agents refused" \
-  refused "$FL/remote3.log" "is not one of" --coordinator nobody
+  refused "$FL/remote3.log" "not in the roster" --coordinator nobody
 cp "$ROSTER" "$FL/roster.keep"
 echo "Bad Name: nope" >> "$ROSTER"
 check "malformed roster line refused" refused "$FL/remote4.log" "fleet-roster line"
@@ -1133,6 +1136,205 @@ check "--replace-remote-brain issues local tokens" bash -c \
   "grep -q '^GBRAIN_BEARER=' '$SEC2/channel.conf' && grep -q '^GBRAIN_BEARER=' '$SEC1/channel.conf' \
    && [ \"\$(wc -l < '$FL/issued.log')\" = $((ISSUED_BEFORE + 2)) ]"
 check "--replace-remote-brain warns" grep -q "replacing the remote shared brain" "$FL/remote7.log"
+
+echo "== 6c. install-fleet: refusals before any write, wiring checks, remote smoke"
+# --- brain-wiring.py: how an agent's .mcp.json is classified.
+BW="$FL/bw"
+mkdir -p "$BW"
+# wiring_is STATUS JSON: brain-wiring.py prints STATUS as its first field.
+wiring_is() {
+  printf '%s\n' "$2" > "$BW/mcp.json"
+  [ "$(python3 "$KIT/server/fleet/brain-wiring.py" "$BW/mcp.json" | cut -f1)" = "$1" ]
+}
+# brain3 HOST [AUTH]: the three kit-named entries on http://HOST:<port>/mcp.
+brain3() {
+  local auth="${2:-Bearer \${GBRAIN_TOKEN\}}"
+  printf '{"mcpServers":{"dashi-channel":{"command":"bun","args":["./src/server.ts"]},'
+  printf '"gbrain-memory":{"type":"http","url":"http://%s:8767/mcp","headers":{"Authorization":"%s"}},' "$1" "$auth"
+  printf '"gbrain-recall":{"type":"http","url":"http://%s:8768/mcp","headers":{"Authorization":"%s"}},' "$1" "$auth"
+  printf '"gbrain-swarm":{"type":"http","url":"http://%s:8766/mcp","headers":{"Authorization":"%s"}}}}' "$1" "$auth"
+}
+loopback_all_local() {
+  local h
+  for h in 127.0.0.1 127.1 127.5.6.7 localhost localhost. LOCALHOST agent.localhost \
+           '[::1]' '[::ffff:127.0.0.1]' 0.0.0.0 "$(hostname)"; do
+    wiring_is local "$(brain3 "$h")" || { echo "not local: $h"; return 1; }
+  done
+}
+check "wiring: loopback variants and own hostname are local" loopback_all_local
+own_ip_local() {
+  local ip
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -z "$ip" ] || wiring_is local "$(brain3 "$ip")"
+}
+check "wiring: this server's own address is local" own_ip_local
+check "wiring: no brain entries yet is local" wiring_is local \
+  '{"mcpServers":{"dashi-channel":{"command":"bun","args":["./src/server.ts"]}}}'
+check "wiring: an unrelated stdio MCP with 'brain' in its name is not a brain entry" wiring_is local \
+  "$(brain3 127.0.0.1 | python3 -c 'import json, sys
+m = json.load(sys.stdin)
+m["mcpServers"]["second-brain"] = {"command": "npx", "args": ["obsidian-mcp", "/vault"]}
+print(json.dumps(m))')"
+check "wiring: remote host is remote" wiring_is remote "$(brain3 203.0.113.10)"
+check "wiring: remote brain under other names is remote" wiring_is remote \
+  '{"mcpServers":{"mem":{"type":"http","url":"http://203.0.113.10:8767/mcp"},
+    "rec":{"type":"http","url":"http://203.0.113.10:8768/mcp"},
+    "sw":{"type":"http","url":"http://203.0.113.10:8766/mcp"}}}'
+STDIO_REMOTE='{"mcpServers":{"dashi-channel":{"command":"bun","args":["./src/server.ts"]},
+  "brain-memory":{"command":"npx","args":["mcp-remote","http://203.0.113.10:8767/mcp","--header","Authorization: Bearer ${GBRAIN_TOKEN}"]},
+  "brain-recall":{"command":"npx","args":["mcp-remote","http://203.0.113.10:8768/mcp","--header","Authorization: Bearer ${GBRAIN_TOKEN}"]},
+  "brain-swarm":{"command":"npx","args":["mcp-remote","http://203.0.113.10:8766/mcp","--header","Authorization: Bearer ${GBRAIN_TOKEN}"]}}}'
+check "wiring: stdio proxy to a remote brain is remote" wiring_is remote "$STDIO_REMOTE"
+check "wiring: stdio brain entry with no URL is unknown" wiring_is unknown \
+  '{"mcpServers":{"gbrain-memory":{"command":"ssh","args":["brainhost","gbrain-memory-stdio"]}}}'
+check "wiring: \${VAR} host is unknown" wiring_is unknown "$(brain3 '${BRAIN_HOST}')"
+check "wiring: some entries local, some remote is mixed" wiring_is mixed \
+  '{"mcpServers":{"gbrain-memory":{"type":"http","url":"http://127.0.0.1:8767/mcp"},
+    "gbrain-recall":{"type":"http","url":"http://203.0.113.10:8768/mcp"},
+    "gbrain-swarm":{"type":"http","url":"http://127.0.0.1:8766/mcp"}}}'
+check "wiring: remote with an entry missing is mixed" wiring_is mixed \
+  '{"mcpServers":{"gbrain-memory":{"type":"http","url":"http://203.0.113.10:8767/mcp"},
+    "gbrain-recall":{"type":"http","url":"http://203.0.113.10:8768/mcp"}}}'
+check "wiring: kit's local entries plus a renamed remote one is mixed" wiring_is mixed \
+  "$(brain3 127.0.0.1 | python3 -c 'import json, sys
+m = json.load(sys.stdin)
+m["mcpServers"]["shared-brain"] = {"type": "http", "url": "https://brain.example.net/gbrain/mcp"}
+print(json.dumps(m))')"
+literal_auth_hidden() {
+  local out
+  printf '%s\n' "$(brain3 203.0.113.10 'Bearer LITERALKEYLITERALKEYLITERALKEY00')" > "$BW/mcp.json"
+  out="$(python3 "$KIT/server/fleet/brain-wiring.py" "$BW/mcp.json")"
+  [ "$(cut -f4 <<<"$out")" = '!' ] && ! grep -q LITERALKEY <<<"$out"
+}
+check "wiring: a literal key is flagged, never printed" literal_auth_hidden
+
+# --- install-fleet end to end. fleet_state: everything the script may write or run.
+fleet_state() {
+  {
+    find "$FAKE_HOME/agents" "$FAKE_HOME/.config" "$FL/etc" "$FL/systemd" "$FL/cron" "$FL/lib" \
+      -type f -print0 | sort -z | xargs -0 -r sha256sum
+    find "$FAKE_HOME/agents" "$FAKE_HOME/.config" "$FL/etc" "$FL/systemd" "$FL/cron" -print | sort
+    wc -l < "$FL/systemctl.log"
+    issued
+  } | sha256sum
+}
+# untouched LOG PATTERN [flags]: refused with PATTERN, and not one file or service touched.
+untouched() {
+  local before
+  before="$(fleet_state)"
+  refused "$@" && [ "$(fleet_state)" = "$before" ]
+}
+refused_remote() { FLEET_ENV_EXTRA="TG_FLEET_TEST_SMOKE_HOST=127.0.0.1" refused "$@"; }
+FLEET_CONF_T="$FAKE_HOME/.config/tg-agent/fleet.conf"
+check "--replace-remote-brain recorded the move in fleet.conf" \
+  grep -qx 'FLEET_LOCAL_BRAIN="helper-two testbot"' "$FLEET_CONF_T"
+# After 6a both agents are local again but still carry GBRAIN_TOKEN: the signature of a
+# remote agent the old script rewired. Without the record that this was meant: stop.
+sed -i '/^FLEET_LOCAL_BRAIN=/d' "$FLEET_CONF_T"
+check "lost remote wiring (GBRAIN_TOKEN, local .mcp.json) refused, nothing written" \
+  untouched "$FL/c1.log" "GBRAIN_TOKEN"
+check "lost remote wiring: says how to restore or acknowledge, no key printed" bash -c \
+  "grep -q 'replace-remote-brain' '$FL/c1.log' && ! grep -q REMOTEBRAINTOKEN '$FL/c1.log'"
+check "--replace-remote-brain acknowledges a lost remote wiring" \
+  run_fleet "$FL/c2.log" --replace-remote-brain
+check "acknowledged: plain re-run passes" run_fleet "$FL/c3.log"
+# The kit backed up the remote .mcp.json before 6a's rewrite: that backup alone is a sign.
+sed -i '/^GBRAIN_TOKEN=/d' "$SEC1/channel.conf" "$SEC2/channel.conf"
+check "kit made a backup before rewriting .mcp.json" \
+  bash -c "ls '$PLUGIN2'/.mcp.json.bak_fleet_* >/dev/null"
+sed -i '/^FLEET_LOCAL_BRAIN=/d' "$FLEET_CONF_T"
+check "backup with a remote brain wiring refused, nothing written" \
+  untouched "$FL/c4.log" "mcp.json.bak_fleet_"
+check "re-acknowledged with --replace-remote-brain" \
+  run_fleet "$FL/c5.log" --replace-remote-brain
+
+# helper-two back on the remote brain; testbot stays local.
+wire_remote "$PLUGIN2" "$SEC2" "$REMOTE_TOKEN2"
+mv "$ROSTER" "$FL/roster.away"
+check "remote agent without a roster refused, nothing written" \
+  untouched "$FL/c6.log" "no team roster" --coordinator lead
+check "missing roster: hint names the file and the line format" bash -c \
+  "grep -q 'fleet-roster' '$FL/c6.log' && grep -q 'name: one-line role' '$FL/c6.log'"
+mv "$FL/roster.away" "$ROSTER"
+sed -i 's/ (coordinator)$//' "$ROSTER"
+check "remote agent: coordinator not taken from fleet.conf" \
+  untouched "$FL/c7.log" "name the coordinator"
+check "remote agent: coordinator must be in the roster file" \
+  untouched "$FL/c8.log" "not in the roster" --coordinator testbot
+check "remote agent: explicit --coordinator with a roster passes" \
+  remote_run "$FL/c9.log" --coordinator lead
+cp "$FL/roster.keep" "$ROSTER"
+printf 'scout2: Second opinion (coordinator)\n' >> "$ROSTER"
+check "two coordinators in the roster refused" untouched "$FL/c10.log" "more than one coordinator"
+cp "$FL/roster.keep" "$ROSTER"
+
+# set_brain PLUGIN JSON: replace the agent's .mcp.json.
+set_brain() { printf '%s\n' "$2" > "$1/.mcp.json"; }
+cp "$PLUGIN2/.mcp.json" "$FL/remote-mcp.good"
+set_brain "$PLUGIN2" "$(brain3 '${BRAIN_HOST}')"
+check "\${VAR} brain host refused, nothing written" untouched "$FL/c11.log" "variable"
+set_brain "$PLUGIN2" '{"mcpServers":{"dashi-channel":{"command":"bun","args":["./src/server.ts"]},
+  "gbrain-memory":{"type":"http","url":"http://203.0.113.10:8767/mcp","headers":{"Authorization":"Bearer ${GBRAIN_TOKEN}"}},
+  "gbrain-recall":{"type":"http","url":"http://127.0.0.1:8768/mcp","headers":{"Authorization":"Bearer ${GBRAIN_BEARER}"}}}}'
+check "partial wiring refused, nothing written" untouched "$FL/c12.log" "mixed"
+set_brain "$PLUGIN2" "$STDIO_REMOTE"
+cp "$PLUGIN2/.mcp.json" "$FL/stdio.before"
+if remote_run "$FL/c13.log"; then ok "stdio proxy to the remote brain: exits 0"; else
+  bad "stdio proxy to the remote brain: exits 0"; tail -8 "$FL/c13.log"; fi
+check "stdio remote: .mcp.json untouched, smoked on the remote URLs" bash -c \
+  "cmp -s '$FL/stdio.before' '$PLUGIN2/.mcp.json' \
+   && grep -q 'helper-two: stays on the remote shared brain' '$FL/c13.log' \
+   && [ \"\$(grep -c 'helper-two -> 203.0.113.10:[0-9]* [a-z_]* ok' '$FL/c13.log')\" = 3 ]"
+python3 - "$PLUGIN2/.mcp.json" "$FL/remote-mcp.good" <<'PY'
+import json, sys
+mcp = json.load(open(sys.argv[2]))
+del mcp["mcpServers"]["gbrain-recall"]["headers"]
+mcp["mcpServers"]["gbrain-swarm"]["headers"]["Authorization"] = "Bearer LITERALKEYLITERALKEYLITERALKEY00"
+json.dump(mcp, open(sys.argv[1], "w"), indent=2)
+PY
+check "remote entry without a Bearer \${VAR} key fails the smoke" \
+  refused_remote "$FL/c14.log" "helper-two: no 'Bearer \${VAR}' key for recent"
+check "literal key in .mcp.json fails the smoke and is not printed" bash -c \
+  "grep -q 'helper-two: literal key for ack' '$FL/c14.log' && ! grep -q LITERALKEY '$FL/c14.log'"
+python3 - "$PLUGIN2/.mcp.json" "$FL/remote-mcp.good" <<'PY'
+import json, sys
+mcp = json.load(open(sys.argv[2]))
+mcp["mcpServers"]["gbrain-memory"]["url"] = "http://203.0.113.10:99999/mcp"
+json.dump(mcp, open(sys.argv[1], "w"), indent=2)
+PY
+check "unreadable brain URL fails the smoke by name" \
+  refused_remote "$FL/c15.log" "helper-two: cannot read the brain URL for supersede_decision"
+check "unreadable brain URL: no FAILED line with an empty host" \
+  bash -c "! grep -q -- '->  ' '$FL/c15.log'"
+cp "$FL/remote-mcp.good" "$PLUGIN2/.mcp.json"
+
+# All remote, leftovers of a local brain from an earlier run: warned about, never removed.
+wire_remote "$PLUGIN1" "$SEC1" "$REMOTE_TOKEN1"
+printf 'GBRAIN_BEARER="%s"\n' "STALELOCALTOKENSTALELOCALTOKEN00" >> "$SEC1/channel.conf"
+if remote_run "$FL/c16.log"; then ok "all-remote with leftovers exits 0"; else
+  bad "all-remote with leftovers exits 0"; tail -8 "$FL/c16.log"; fi
+check "leftovers listed with manual cleanup steps, nothing removed" bash -c \
+  "grep -q 'left over from a local brain' '$FL/c16.log' \
+   && grep -q '$FL/cron/tg-agent-gbrain-backup' '$FL/c16.log' \
+   && grep -q '$FL/etc/fleet.env' '$FL/c16.log' && grep -q 'tg-agent-fleet.conf' '$FL/c16.log' \
+   && grep -q 'back them up first' '$FL/c16.log' \
+   && [ -f '$FL/cron/tg-agent-gbrain-backup' ] && [ -f '$FL/etc/fleet.env' ] \
+   && [ -f '$FL/systemd/gbrain-swarm-worker.service.d/tg-agent-fleet.conf' ]"
+check "stale GBRAIN_BEARER of a remote agent warned about, kept, not printed" bash -c \
+  "grep -q 'testbot: stale GBRAIN_BEARER' '$FL/c16.log' && grep -q '^GBRAIN_BEARER=' '$SEC1/channel.conf' \
+   && ! grep -q STALELOCALTOKEN '$FL/c16.log'"
+# A key without write scope on 30-decisions still proves the brain accepted it.
+READONLY_TOKEN="REMOTEBRAINTOKENREADONLYtestbotXXXXXXXXXXXXXXXXX"
+sed -i '/^GBRAIN_TOKEN=/d' "$SEC1/channel.conf"
+printf 'GBRAIN_TOKEN="%s"\n' "$READONLY_TOKEN" >> "$SEC1/channel.conf"
+echo "$READONLY_TOKEN" >> "$FL/valid-tokens"
+if remote_run "$FL/c17.log"; then ok "key without 30-decisions write scope: exits 0"; else
+  bad "key without 30-decisions write scope: exits 0"; tail -8 "$FL/c17.log"; fi
+check "key without write scope: memory check passes with a note" grep -q \
+  'testbot -> 203.0.113.10:8767 supersede_decision ok (key accepted; no write scope on 30-decisions)' \
+  "$FL/c17.log"
+check "single-agent warning no longer claims the brain works" \
+  bash -c "! grep -q 'the brain works' '$KIT/install-fleet.sh'"
 
 echo "== 6b. doctor"
 # shellcheck source=tests/doctor.test.sh

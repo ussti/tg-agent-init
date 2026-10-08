@@ -30,8 +30,15 @@ TOOLS_BY_ROLE = {
 }
 
 
-def run_tool(name: str, args: dict) -> tuple[bool, str]:
-    """Mimic the upstream handler after authentication; return (is_error, text)."""
+def run_tool(name: str, args: dict, token: str = "") -> tuple[bool, str]:
+    """Mimic the upstream handler after authentication; return (is_error, text).
+
+    A token containing READONLY has no write scope: supersede_decision then fails
+    on the scope check, as upstream does before it looks for the old decision.
+    """
+    if name == "supersede_decision" and "READONLY" in token:
+        return True, ("Error executing tool supersede_decision: "
+                      "Agent 'smoke' cannot write to 30-decisions")
     if name == "supersede_decision":
         return True, ("Error executing tool supersede_decision: Original decision not found: "
                       f"{args.get('old_path')}")
@@ -97,7 +104,7 @@ def make_handler(role: str, tokens_file: pathlib.Path,
                     if calls_log is not None:
                         with calls_log.open("a") as fh:
                             fh.write(f"{role} {name}\n")
-                    is_error, text = run_tool(name, msg["params"].get("arguments") or {})
+                    is_error, text = run_tool(name, msg["params"].get("arguments") or {}, token)
                     result = {"isError": is_error, "content": [{"type": "text", "text": text}]}
                 else:
                     result = {"isError": True, "content": [{
