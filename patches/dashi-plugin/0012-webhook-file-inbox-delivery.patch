@@ -1,0 +1,632 @@
+Subject: [PATCH] webhook: сообщения /hooks/agent через файловый inbox
+
+Инцидент 2026-10-08 10:48 UTC: задача swarm maimozg -> bizmozg ушла
+в POST /hooks/agent, плагин ответил 200, воркер пометил доставку acked,
+а модель сообщение так и не увидела. Сообщение webhook уходило
+MCP-уведомлением, а оно может потеряться молча.
+
+Теперь, если чат в режиме DM inbox (как в 0007: задан state dir и chatId
+в списке), сообщение webhook пишется файлом в
+{state}/chats/{chatId}/inbox/ и вставляется в панель тем же
+attach-наблюдателем с проверенным Enter.
+
+- 200 отвечаем только после надёжной записи: write + fsync, rename,
+  fsync каталога. Любая ошибка записи даёт 503, и воркер повторит
+  попытку. Отката на MCP нет намеренно.
+- Чаты вне списка идут старым путём через MCP без изменений.
+- В открывающем теге <channel source="webhook" ...> появился атрибут
+  delivery_id: wh-<nonce задачи swarm>-<8 hex>, уникальный для каждого
+  POST, даже при повторе той же задачи.
+- prompt_fingerprint наблюдателя для блока <channel ...> берёт отпечаток
+  только из открывающего тега: сначала delivery_id, потом message_id.
+  Две подряд задачи с одинаковым началом текста больше не путаются,
+  а message_id из цитаты в теле не перебивает настоящий.
+- writeToInbox получил опцию durable. Пути Telegram (DM и группы)
+  пишут как раньше.
+
+--- a/plugin/src/chats/hooks/multichat-entrypoint.sh
++++ b/plugin/src/chats/hooks/multichat-entrypoint.sh
+@@ -141,6 +141,21 @@
+ #    carry an older message_id ahead of the current one.
+ # Double quotes only: this whole program is a single-quoted shell
+ # argument, so an apostrophe here would terminate it early.
++# 0a. A `<channel …>` block (DM transport, and webhook messages since
++#    patch 0012) is fingerprinted from its OPENING TAG only: attribute
++#    values are entity-escaped, so the first ">" ends the tag, and a
++#    message_id quoted in the body can no longer win. `delivery_id`
++#    first — webhook messages carry no message_id, and consecutive
++#    swarm tasks share a long identical prefix, so the per-POST id is
++#    the only thing that tells their echoes apart.
++stripped = raw.lstrip()
++if stripped.startswith("<channel "):
++    tag = stripped.split(">", 1)[0]
++    for attr in ("delivery_id", "message_id"):
++        found = re.findall(attr + r"=[^ >\t]{1,42}", tag)
++        if found:
++            sys.stdout.write(found[-1])
++            sys.exit(0)
+ ids = re.findall(r"message_id=[^ >\t]{1,42}", raw)
+ if ids:
+     sys.stdout.write(ids[-1])
+--- a/plugin/src/router/inbox-bridge.ts
++++ b/plugin/src/router/inbox-bridge.ts
+@@ -31,6 +31,7 @@
+ import {
+   chmod,
+   mkdir,
++  open,
+   readdir,
+   readFile,
+   rename,
+@@ -261,15 +262,23 @@
+  * Caller must have run {@link ensureChatStateDirs} for this chat at
+  * least once during the process lifetime.
+  *
++ * With `opts.durable` the tmp file is fsync'd before the rename and the
++ * inbox directory is fsync'd after it (best effort), so a returned path
++ * survives a crash or power loss. Callers that acknowledge the message
++ * to a remote sender on the strength of this return value (the webhook,
++ * patch 0012) need that; the Telegram paths keep the cheaper write.
++ *
+  * @param chatId stringified Telegram chat id
+  * @param message inbound DTO (will be JSON.stringify'd)
+  * @param stateDir plugin state root
++ * @param opts.durable fsync file + directory around the rename
+  * @returns absolute path of the committed file (after rename)
+  */
+ export async function writeToInbox(
+   chatId: string,
+   message: InboundMessage,
+   stateDir: string,
++  opts: { durable?: boolean } = {},
+ ): Promise<string> {
+   // TASK-5 bug 4 (2026-05-27): validate chatId before it reaches
+   // `path.join`. Defence in depth — `ensureChatStateDirs` should have
+@@ -286,7 +295,11 @@
+   // is the open(2) mode parameter, which is masked by the process
+   // umask — but we follow up with chmod inside the try block so the
+   // final perm is exactly 0o600 regardless of umask.
+-  await writeFile(tmpPath, body, { encoding: 'utf8', mode: STATE_FILE_MODE })
++  if (opts.durable === true) {
++    await writeFileSynced(tmpPath, body)
++  } else {
++    await writeFile(tmpPath, body, { encoding: 'utf8', mode: STATE_FILE_MODE })
++  }
+   try {
+     await chmod(tmpPath, STATE_FILE_MODE).catch(() => {})
+     await rename(tmpPath, finalPath)
+@@ -296,9 +309,38 @@
+     await unlink(tmpPath).catch(() => {})
+     throw renameErr
+   }
++  if (opts.durable === true) await syncDir(inboxDir)
+   return finalPath
+ }
+ 
++/** Write + fsync a new file; on failure the partial tmp is removed. */
++async function writeFileSynced(path: string, body: string): Promise<void> {
++  const fh = await open(path, 'w', STATE_FILE_MODE)
++  let synced = false
++  try {
++    await fh.writeFile(body, { encoding: 'utf8' })
++    await fh.sync()
++    synced = true
++  } finally {
++    // The data is on disk once sync() returned; a close error after that
++    // cannot lose it, so it is not allowed to fail the commit.
++    await fh.close().catch(() => {})
++    if (!synced) await unlink(path).catch(() => {})
++  }
++}
++
++/**
++ * fsync a directory so a rename inside it is persisted. Best effort:
++ * some filesystems refuse fsync on a directory handle, and the file
++ * itself is already synced, so a failure here is not fatal.
++ */
++async function syncDir(dir: string): Promise<void> {
++  const fh = await open(dir, 'r').catch(() => null)
++  if (fh === null) return
++  await fh.sync().catch(() => {})
++  await fh.close().catch(() => {})
++}
++
+ /**
+  * Drain the outbox directory once with two-phase delivery semantics
+  * (H2 fix): every readable file is **claimed** by renaming it into
+--- a/plugin/src/server.ts
++++ b/plugin/src/server.ts
+@@ -1595,6 +1595,10 @@
+     ...(taskRealityMirror !== undefined ? { taskRealityMirror } : {}),
+     watcher: inboundWatcher,
+     ...(memoryWriter !== undefined ? { memoryWriter } : {}),
++    // Patch 0012: webhook messages to an inbox-mode chat use the same
++    // durable file transport as DMs (patch 0007) instead of MCP notify.
++    ...(dmInboxStateDir !== undefined ? { dmInboxStateDir } : {}),
++    ...(dmInboxChatIds !== undefined ? { dmInboxChatIds } : {}),
+     // PRX-1 TASK-3 (2026-05-27): AskUserQuestion HTTP relay routes.
+     // Always wired here — the per-request feature gate lives inside the
+     // route handler (config.ask_user_question.enabled). Passing the
+--- /dev/null
++++ b/plugin/src/webhook/inbox-delivery.ts
+@@ -0,0 +1,117 @@
++// Webhook message delivery over the DM file inbox (patch 0012, 2026-10-08).
++//
++// Background. `POST /hooks/agent` with a `{message, chatId}` payload used to
++// be forwarded as an MCP notification and answered 200 as soon as the
++// notification call returned. The swarm worker treats any 2xx as "acked",
++// but an MCP notification can be dropped between the plugin and the model
++// with nothing reporting it: on 2026-10-08 10:48 UTC a maimozg -> bizmozg
++// task was acked and never seen.
++//
++// When the chat is in DM inbox mode (patch 0007: a state dir is configured
++// and the chat is in the list), the webhook now uses the same transport as
++// private DMs: one JSON file in `{stateDir}/chats/{chatId}/inbox/`, pasted
++// into the master pane by the attach-mode watcher with a verified Enter.
++// The file is written durably (fsync + rename + dir fsync) BEFORE the 200,
++// so "acked" now means "durably queued on this host".
++//
++// Fingerprint. The watcher verifies a submit by looking for a short,
++// per-message string on the pane. DMs have `message_id`; webhook messages
++// do not, and consecutive swarm tasks share a long identical prefix. Every
++// webhook delivery therefore gets a `delivery_id` attribute: the swarm task
++// nonce (for log correlation) plus a random suffix, so even a retried POST
++// of the same task never reuses an id still visible in the pane history.
++// It is deliberately NOT called message_id — the session must not mistake
++// it for a Telegram id usable with reply_to or react.
++
++import { randomBytes } from 'node:crypto'
++
++import { renderChannelBlock } from '../telegram/dm-inbox-delivery.js'
++import {
++  ensureChatStateDirs,
++  writeToInbox,
++  type InboundMessage,
++} from '../router/inbox-bridge.js'
++import type { Logger } from '../log.js'
++
++/** Random suffix bytes appended to a task nonce (8 hex chars). */
++const SUFFIX_BYTES = 4
++/** Random id bytes when the message carries no swarm task id (16 hex chars). */
++const FALLBACK_BYTES = 8
++/** Longest task nonce kept in the id; swarm nonces are 16 hex chars. */
++const MAX_NONCE_CHARS = 16
++
++// `swarm.ack(task_id="<from>::<to>::<nonce>")` as rendered by the swarm
++// worker. The last match wins: a quoted older task may precede it.
++const TASK_ID_RE = /swarm\.ack\(task_id="([^"]*)"/g
++
++export interface WebhookInboxOptions {
++  stateDir: string
++  chatId: string
++  content: string
++  agentId?: string
++  log: Logger
++}
++
++export interface WebhookInboxResult {
++  deliveryId: string
++  path: string
++}
++
++/** True when webhook messages for `chatId` must go through the file inbox. */
++export function isWebhookInboxChat(
++  stateDir: string | undefined,
++  chatIds: readonly string[] | undefined,
++  chatId: string,
++): stateDir is string {
++  return stateDir !== undefined && (chatIds ?? []).includes(chatId)
++}
++
++/**
++ * Build a unique, fingerprint-safe delivery id for one webhook message.
++ *
++ * Shape: `wh-<nonce>-<8 hex>` when the message carries a swarm task id,
++ * otherwise `wh-<16 hex>`. Only `[A-Za-z0-9_-]` survives from the nonce,
++ * so the id can never break out of its attribute or contain the space /
++ * `>` that end the watcher's fingerprint match.
++ */
++export function buildDeliveryId(message: string): string {
++  let taskId: string | undefined
++  for (const m of message.matchAll(TASK_ID_RE)) taskId = m[1]
++  const nonce = (taskId?.split('::').pop() ?? '')
++    .replace(/[^A-Za-z0-9_-]/g, '')
++    .slice(0, MAX_NONCE_CHARS)
++  if (nonce.length > 0) return `wh-${nonce}-${randomBytes(SUFFIX_BYTES).toString('hex')}`
++  return `wh-${randomBytes(FALLBACK_BYTES).toString('hex')}`
++}
++
++/**
++ * Durably commit one webhook message to the chat's file inbox.
++ *
++ * Resolves once the file is fsync'd and renamed into place; rejects on any
++ * failure. There is no MCP fallback on purpose: the caller answers 503 and
++ * the sender retries, which is safer than the lossy path this replaces.
++ */
++export async function deliverWebhookToInbox(
++  opts: WebhookInboxOptions,
++): Promise<WebhookInboxResult> {
++  const { stateDir, chatId, content, agentId, log } = opts
++  const deliveryId = buildDeliveryId(content)
++  // Same attributes the MCP path sends (source, chat_id, agent_id) plus the
++  // delivery id; renderChannelBlock escapes every value.
++  const meta: Record<string, string> = { source: 'webhook', chat_id: chatId }
++  if (agentId !== undefined) meta.agent_id = agentId
++  meta.delivery_id = deliveryId
++
++  await ensureChatStateDirs(chatId, stateDir)
++  const message: InboundMessage = {
++    text: renderChannelBlock(content, meta),
++    chat_id: chatId,
++    user_id: '',
++    // Empty: the watcher's build_prompt then pastes `text` verbatim.
++    user: '',
++    timestamp: new Date().toISOString(),
++  }
++  const path = await writeToInbox(chatId, message, stateDir, { durable: true })
++  log.info('webhook message committed to inbox', { chat_id: chatId, delivery_id: deliveryId })
++  return { deliveryId, path }
++}
+--- a/plugin/src/webhook/server.ts
++++ b/plugin/src/webhook/server.ts
+@@ -37,6 +37,7 @@
+ import type { ProgressReporter } from '../status/progress-reporter.js'
+ import type { TaskMirror } from '../status/task-mirror.js'
+ import type { InboundWatcher } from '../telegram/watcher.js'
++import { deliverWebhookToInbox, isWebhookInboxChat } from './inbox-delivery.js'
+ import { handleAskAnswer, handleAskRequest } from './routes/ask.js'
+ import { handleFallbackReply } from './routes/fallback-reply.js'
+ import { handlePermissionRequest } from './routes/permission.js'
+@@ -132,6 +133,13 @@
+   config: AppConfig
+   statePaths: StatePaths
+   log: Logger
++  // Patch 0012: DM file-inbox routing for `{message, chatId}` payloads.
++  // Same switch as patch 0007's DM delivery — when the state dir is set and
++  // the chat is listed, the message is committed as an inbox file (durably,
++  // before the 200) instead of an MCP notification. Both absent = the MCP
++  // path, unchanged.
++  dmInboxStateDir?: string
++  dmInboxChatIds?: string[]
+   // Optional — if absent, hook-event payloads are accepted but no Telegram
+   // status update happens. The 200 path stays open so Claude hooks never
+   // back-pressure on visibility outages.
+@@ -675,6 +683,29 @@
+     return
+   }
+ 
++  // Patch 0012: inbox-mode chats get the file transport. 200 only after the
++  // file is durably committed; any failure is a 503 so the sender retries.
++  // No MCP fallback here — that silent-loss path is what this replaces.
++  if (isWebhookInboxChat(deps.dmInboxStateDir, deps.dmInboxChatIds, payload.chatId)) {
++    try {
++      const { deliveryId } = await deliverWebhookToInbox({
++        stateDir: deps.dmInboxStateDir,
++        chatId: payload.chatId,
++        content: payload.message,
++        ...(payload.agentId !== undefined ? { agentId: payload.agentId } : {}),
++        log,
++      })
++      reply(res, 200, { status: 'accepted', delivery_id: deliveryId })
++    } catch (err) {
++      log.error('webhook inbox commit failed', {
++        chat_id: payload.chatId,
++        error: err instanceof Error ? err.message : String(err),
++      })
++      reply(res, 503, { error: 'inbox commit failed' })
++    }
++    return
++  }
++
+   // Forward message payload to MCP channel (existing behaviour).
+   const metaRaw: Record<string, unknown> = {
+     source: 'webhook',
+--- a/plugin/tests/chats/multichat-entrypoint-attach.test.ts
++++ b/plugin/tests/chats/multichat-entrypoint-attach.test.ts
+@@ -160,6 +160,17 @@
+   )
+ }
+ 
++// Same shape src/webhook/inbox-delivery.ts renders: no message_id, a
++// constant attribute prefix, and a body that starts identically for every
++// swarm task — only delivery_id differs.
++function webhookBlock(deliveryId: string, body: string): string {
++  return (
++    `<channel source="webhook" chat_id="${CHAT_ID}" agent_id="dashi-channel" ` +
++    `delivery_id="${deliveryId}"> Задача от maimozg через swarm, ` +
++    `пожалуйста выполни и подтверди: ${body} </channel>`
++  )
++}
++
+ function queuedJson(): string[] {
+   return readdirSync(inboxDir()).filter((f) => f.endsWith('.json'))
+ }
+@@ -270,6 +281,42 @@
+     expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
+   })
+ 
++  // Patch 0012: swarm tasks POSTed to /hooks/agent land in this inbox too.
++  // Their `<channel source="webhook" …>` tag carries no message_id, and the
++  // body of two consecutive tasks shares a long identical prefix — the
++  // per-delivery `delivery_id` is what keeps their fingerprints apart.
++  test('two consecutive webhook messages are both delivered and confirmed', () => {
++    installStubs()
++    writeInboxMessage(webhookBlock('wh-aaaa-11111111', 'задача один'), '1000-a.json')
++    writeInboxMessage(webhookBlock('wh-aaaa-22222222', 'задача два'), '1001-b.json')
++    const res = runAttach()
++    expect(res.code).toBe(0)
++    expect(queuedJson()).toEqual([])
++    const processed = processedNames()
++    expect(processed.length).toBe(2)
++    expect(processed.some((f) => f.startsWith('submit-unconfirmed-'))).toBe(false)
++    const enters = tmuxLog().filter((l) => l.startsWith('send-keys') && l.includes('Enter'))
++    expect(enters.length).toBe(2)
++  })
++
++  test('a swallowed webhook paste is not confirmed by the previous task in the transcript', () => {
++    installStubs()
++    // The previous task stays visible in the pane transcript above the
++    // composer. A fingerprint built from the shared tag/body prefix would
++    // "see" it as the echo of the new paste and press Enter on an empty
++    // composer. delivery_id is unique per POST, so the echo gate holds.
++    const old = webhookBlock('wh-aaaa-11111111', 'задача один')
++    const withHistory = `${old}\n${READY_PANE}`
++    writeFileSync(join(dir, 'pane.txt'), withHistory)
++    writeFileSync(join(dir, 'ready-pane.txt'), withHistory)
++    writeInboxMessage(webhookBlock('wh-aaaa-22222222', 'задача два'))
++    const res = runAttach({ TMUX_STUB_NO_ECHO: '1' })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('refusing to press Enter')
++    expect(tmuxLog().some((l) => l.includes('Enter'))).toBe(false)
++    expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
++  })
++
+   test('still refuses to start without CHAT_ID', () => {
+     installStubs()
+     const res = runAttach({ CHAT_ID: '' })
+--- a/plugin/tests/chats/multichat-entrypoint-media.test.ts
++++ b/plugin/tests/chats/multichat-entrypoint-media.test.ts
+@@ -251,3 +251,37 @@
+     expect(res.stdout.startsWith('<media kind="voice" file_id="abc"')).toBe(true)
+   })
+ })
++
++// Patch 0012: webhook messages (swarm tasks) arrive as
++// `<channel source="webhook" … delivery_id="wh-…">` with no message_id.
++describe('prompt_fingerprint — <channel> opening tag ids', () => {
++  function fp(prompt: string): string {
++    return runHelpers(`prompt_fingerprint '${prompt.replace(/'/g, "'\\''")}'`).stdout
++  }
++
++  test('webhook block fingerprints by delivery_id', () => {
++    const block =
++      '<channel source="webhook" chat_id="1" agent_id="maimozg" delivery_id="wh-abc-1234abcd">' +
++      ' Задача от maimozg через swarm, пожалуйста выполни </channel>'
++    expect(fp(block)).toBe('delivery_id="wh-abc-1234abcd"')
++  })
++
++  test('two webhook blocks with the same body get different fingerprints', () => {
++    const body = ' одинаковое тело задачи достаточно длинное </channel>'
++    const a = fp(`<channel source="webhook" chat_id="1" delivery_id="wh-x-00000001">${body}`)
++    const b = fp(`<channel source="webhook" chat_id="1" delivery_id="wh-x-00000002">${body}`)
++    expect(a).not.toBe(b)
++  })
++
++  test('a message_id quoted in the body does not steal the tag id', () => {
++    const block =
++      '<channel source="telegram" chat_id="1" user_id="1" message_id="200">' +
++      ' смотри message_id="100" выше </channel>'
++    expect(fp(block)).toBe('message_id="200"')
++  })
++
++  test('DM block without delivery_id still uses message_id', () => {
++    const block = '<channel source="telegram" chat_id="1" message_id="11752"> привет </channel>'
++    expect(fp(block)).toBe('message_id="11752"')
++  })
++})
+--- /dev/null
++++ b/plugin/tests/webhook/inbox-delivery.test.ts
+@@ -0,0 +1,203 @@
++// Webhook message payloads over the file inbox (patch 0012, 2026-10-08).
++//
++// Incident: 2026-10-08 10:48 UTC a swarm task maimozg -> bizmozg was POSTed
++// to /hooks/agent, answered 200, marked acked by the swarm worker — and
++// never reached the model. The MCP notification behind that 200 can be
++// dropped silently. When the target chat is in DM inbox mode the webhook
++// now commits the message as a file the attach-mode watcher injects with a
++// verified Enter, and answers 200 only after that commit is durable.
++
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
++import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs'
++import { tmpdir } from 'os'
++import { join } from 'path'
++
++import { getStatePaths, loadConfig, type AppConfig, type StatePaths } from '../../src/config.js'
++import { createLogger } from '../../src/log.js'
++import { ensureStateDirs } from '../../src/state/store.js'
++import { startWebhookServer, type WebhookServerHandle } from '../../src/webhook/server.js'
++import { buildDeliveryId } from '../../src/webhook/inbox-delivery.js'
++
++const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
++const WEBHOOK_TOKEN = 'wh_test_token_32_chars__________'
++const CHAT_ID = '164795011'
++
++let stateDir: string
++let inboxRoot: string
++let paths: StatePaths
++let baseConfig: AppConfig
++let handle: WebhookServerHandle | null
++
++type Captured = { method: string; params: unknown }
++function makeMcpStub(): { server: any; calls: Captured[] } {
++  const calls: Captured[] = []
++  const server = {
++    notification: async (msg: { method: string; params: unknown }) => {
++      calls.push({ method: msg.method, params: msg.params })
++    },
++  }
++  return { server, calls }
++}
++
++beforeEach(() => {
++  stateDir = mkdtempSync(join(tmpdir(), 'dashi-webhook-inbox-'))
++  inboxRoot = join(stateDir, 'dm-inbox')
++  process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
++  const env = { TELEGRAM_BOT_TOKEN: FAKE_TOKEN, TELEGRAM_STATE_DIR: stateDir }
++  baseConfig = loadConfig(env)
++  paths = getStatePaths(baseConfig, env)
++  ensureStateDirs(paths)
++  handle = null
++})
++
++afterEach(async () => {
++  if (handle) {
++    await handle.close()
++    handle = null
++  }
++  delete process.env.TELEGRAM_WEBHOOK_TOKEN
++  rmSync(stateDir, { recursive: true, force: true })
++})
++
++function config(): AppConfig {
++  return {
++    ...baseConfig,
++    webhook: { enabled: true, host: '127.0.0.1', port: 0 },
++  }
++}
++
++async function start(
++  inbox: { dmInboxStateDir?: string; dmInboxChatIds?: string[] },
++): Promise<ReturnType<typeof makeMcpStub>> {
++  const mcp = makeMcpStub()
++  const cfg = config()
++  const h = await startWebhookServer(cfg, {
++    mcpServer: mcp.server,
++    config: cfg,
++    statePaths: paths,
++    log: createLogger('test'),
++    ...inbox,
++  })
++  if (!h) throw new Error('expected handle')
++  handle = h
++  return mcp
++}
++
++async function post(message: string, chatId = CHAT_ID): Promise<Response> {
++  if (!handle) throw new Error('server not started')
++  return fetch(`http://${handle.host}:${handle.port}/hooks/agent`, {
++    method: 'POST',
++    headers: { Authorization: `Bearer ${WEBHOOK_TOKEN}`, 'Content-Type': 'application/json' },
++    body: JSON.stringify({ message, chatId: Number(chatId), agentId: 'dashi-channel' }),
++  })
++}
++
++function inboxDir(chatId = CHAT_ID): string {
++  return join(inboxRoot, 'chats', chatId, 'inbox')
++}
++
++function inboxFiles(chatId = CHAT_ID): string[] {
++  try {
++    return readdirSync(inboxDir(chatId)).filter((f) => f.endsWith('.json')).sort()
++  } catch {
++    return []
++  }
++}
++
++function readInbox(name: string, chatId = CHAT_ID): Record<string, unknown> {
++  return JSON.parse(readFileSync(join(inboxDir(chatId), name), 'utf8')) as Record<string, unknown>
++}
++
++const SWARM_TEXT =
++  'Задача от maimozg.\nswarm.ack(task_id="maimozg::bizmozg::0123456789abcdef")'
++
++describe('POST /hooks/agent in DM inbox mode', () => {
++  test('writes a committed inbox file and answers 200 without MCP', async () => {
++    const mcp = await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
++    const resp = await post(SWARM_TEXT)
++    expect(resp.status).toBe(200)
++    const body = (await resp.json()) as Record<string, unknown>
++    expect(body.status).toBe('accepted')
++    expect(typeof body.delivery_id).toBe('string')
++
++    expect(mcp.calls.length).toBe(0)
++    const files = inboxFiles()
++    expect(files.length).toBe(1)
++    // No half-written tmp file left next to it.
++    expect(readdirSync(inboxDir()).some((f) => f.endsWith('.tmp'))).toBe(false)
++
++    const msg = readInbox(files[0]!)
++    expect(msg.chat_id).toBe(CHAT_ID)
++    // Empty `user` -> the watcher pastes `text` verbatim.
++    expect(msg.user).toBe('')
++    const text = String(msg.text)
++    expect(text.startsWith('<channel ')).toBe(true)
++    expect(text).toContain('source="webhook"')
++    expect(text).toContain(`chat_id="${CHAT_ID}"`)
++    expect(text).toContain('agent_id="dashi-channel"')
++    expect(text).toContain(`delivery_id="${String(body.delivery_id)}"`)
++    expect(text).toContain('swarm.ack(task_id="maimozg::bizmozg::0123456789abcdef")')
++    expect(text.endsWith('</channel>')).toBe(true)
++  })
++
++  test('a failed commit answers 503 so the worker retries — no MCP fallback', async () => {
++    // State dir is a regular file: mkdir under it fails.
++    const blocker = join(stateDir, 'not-a-dir')
++    writeFileSync(blocker, 'x')
++    const mcp = await start({ dmInboxStateDir: blocker, dmInboxChatIds: [CHAT_ID] })
++    const resp = await post(SWARM_TEXT)
++    expect(resp.status).toBe(503)
++    const body = (await resp.json()) as Record<string, unknown>
++    expect(body.error).toBe('inbox commit failed')
++    expect(mcp.calls.length).toBe(0)
++  })
++
++  test('a chat outside the inbox list keeps the MCP path', async () => {
++    const mcp = await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: ['555'] })
++    const resp = await post('hello via webhook')
++    expect(resp.status).toBe(200)
++    expect(mcp.calls.length).toBe(1)
++    const params = mcp.calls[0]!.params as { content: string; meta: Record<string, string> }
++    expect(params.content).toBe('hello via webhook')
++    expect(params.meta.source).toBe('webhook')
++    expect(params.meta.delivery_id).toBeUndefined()
++    expect(inboxFiles().length).toBe(0)
++  })
++
++  test('without an inbox state dir the MCP path is unchanged', async () => {
++    const mcp = await start({ dmInboxChatIds: [CHAT_ID] })
++    const resp = await post('hello via webhook')
++    expect(resp.status).toBe(200)
++    expect(mcp.calls.length).toBe(1)
++  })
++
++  test('every webhook message gets its own delivery_id, even a retried task', async () => {
++    await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
++    const a = (await (await post(SWARM_TEXT)).json()) as Record<string, unknown>
++    const b = (await (await post(SWARM_TEXT)).json()) as Record<string, unknown>
++    expect(a.delivery_id).not.toBe(b.delivery_id)
++    const files = inboxFiles()
++    expect(files.length).toBe(2)
++    const ids = files.map((f) => /delivery_id="([^"]+)"/.exec(String(readInbox(f).text))?.[1])
++    expect(new Set(ids).size).toBe(2)
++  })
++})
++
++describe('buildDeliveryId', () => {
++  test('carries the swarm task nonce plus a random suffix', () => {
++    expect(buildDeliveryId(SWARM_TEXT)).toMatch(/^wh-0123456789abcdef-[0-9a-f]{8}$/)
++  })
++
++  test('falls back to a random id without a task_id', () => {
++    expect(buildDeliveryId('plain text')).toMatch(/^wh-[0-9a-f]{16}$/)
++  })
++
++  test('sanitizes a hostile nonce to the fingerprint-safe alphabet', () => {
++    const id = buildDeliveryId('swarm.ack(task_id="a::b::x\\"> <evil")')
++    expect(id).toMatch(/^wh-[A-Za-z0-9_-]+$/)
++  })
++
++  test('two calls never collide', () => {
++    expect(buildDeliveryId(SWARM_TEXT)).not.toBe(buildDeliveryId(SWARM_TEXT))
++  })
++})

@@ -20,6 +20,9 @@ cron: auth-monitor, snapshot, cleanup-media, learnings-lint, memory rotation
 - Private messages use the file inbox (patch 0007): the plugin commits each DM to disk
   and a watcher pastes it into the pane with a verified Enter, so a message cannot be
   lost to a dropped MCP notification.
+- Swarm tasks arriving on `/hooks/agent` for an inbox-mode chat take the same path
+  (patch 0012). The plugin answers 200 only after the file is fsync'd, so «acked» on the
+  sender means durably queued on this host, not yet read by the model.
 - `ratewatch.sh` handles the two silent freezes: the rate-limit menu (answers «wait»)
   and a stuck composer (presses Enter once the pending text is stable across two polls
   with no active turn).
