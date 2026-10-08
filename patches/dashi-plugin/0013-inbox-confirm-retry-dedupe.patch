@@ -1,0 +1,1568 @@
+Subject: [PATCH] inbox: доказанный echo, повторы с backoff, dead-letter, дедуп webhook
+
+Доработка 0007/0012 по итогам ревью доставки через файловый inbox.
+
+- Echo gate требует положительного доказательства. Все сигналы считаются
+  дельтой к снимку панели до вставки. Плейсхолдер «[Pasted text #N +M
+  lines]», который уже был в композере, больше не считается эхом. Для
+  уникального отпечатка (delivery_id= / message_id=) текст вставляется
+  двумя частями: якорь до отпечатка включительно (не больше 400 символов
+  и 3 строк) и остаток. Тогда отпечаток виден даже при свёрнутой вставке.
+  Подтверждение отправки: композер вернулся к исходным счётчикам и
+  появился индикатор генерации или отпечаток выше композера.
+- Неподтверждённая отправка остаётся в очереди. Состояние лежит в
+  inbox/.retry/<имя>.state, следующая попытка через
+  MULTICHAT_REDELIVER_BASE * 2^(n-1) секунд, порядок сообщений
+  сохраняется. Повтор (resume_prompt) не вставляет тело заново, если
+  оно могло попасть в TUI: только Enter или проверка по истории панели.
+  После MULTICHAT_REDELIVER_MAX попыток файл уходит в
+  inbox/.dead-letter/, в лог пишется ERROR, владелец получает алерт
+  через MULTICHAT_ALERT_CMD.
+- Наблюдатели опрашивают inbox по таймауту, чтобы повторы срабатывали
+  без новых файлов, и не крутятся вхолостую при ошибке inotifywait.
+- Webhook: дедуп по nonce задачи swarm. Повторный POST той же задачи
+  (ретрай воркера после таймаута) отвечает 200 с duplicate:true и не
+  создаёт второй файл. Метка в webhook-seen/ живёт 7 дней и снимается,
+  если запись в inbox не удалась. delivery_id стоит первым атрибутом
+  тега <channel>.
+
+Binary files base1/plugin/src/chats/hooks/__pycache__/stop-to-outbox.cpython-312.pyc and work1/plugin/src/chats/hooks/__pycache__/stop-to-outbox.cpython-312.pyc differ
+--- a/plugin/src/chats/hooks/multichat-entrypoint.sh
++++ b/plugin/src/chats/hooks/multichat-entrypoint.sh
+@@ -38,10 +38,15 @@
+ #     but claude still launches so the operator can attach and recover.
+ #   * python3 / json parse failure on a single file -> log to stderr,
+ #     skip the file (do NOT move to .processed/ — operator can retry).
+-#   * Submit unconfirmed after all retries -> the file is moved to
+-#     .processed/ with a `submit-unconfirmed-` prefix (NOT requeued: the
+-#     body already sits in the composer, so a re-paste would duplicate
+-#     it; the next inbound message's Enter flushes the stuck composer).
++#   * Submit unconfirmed (patch 0013) -> the file STAYS in the inbox with
++#     a retry record in inbox/.retry/<name>.state and the drain stops
++#     there, so later messages never overtake it. The next attempt waits
++#     MULTICHAT_REDELIVER_BASE * 2^(attempt-1) seconds and is handled by
++#     resume_prompt, which looks at the composer and the transcript first
++#     and never pastes a body that may already be in the TUI. After
++#     MULTICHAT_REDELIVER_MAX attempts the file moves to inbox/.dead-letter/,
++#     an ERROR line goes to stderr and MULTICHAT_ALERT_CMD (run-agent
++#     passes notify-owner.sh) alerts the owner.
+ #
+ # Concurrency note: the watcher runs as a subshell in the background.
+ # `trap ... EXIT` ensures we tear it down when claude exits so we do not
+@@ -67,6 +72,19 @@
+ # turns "fingerprint gone" from a guess into proof of a submit.
+ ECHO_POLL_INTERVAL="${MULTICHAT_ECHO_POLL_INTERVAL:-0.25}"
+ ECHO_POLL_MAX="${MULTICHAT_ECHO_POLL_MAX:-8}"
++# Anchor split (patch 0013): the longest prefix pasted on its own so the
++# unique id stays literally visible when the rest collapses.
++ANCHOR_MAX_CHARS="${MULTICHAT_ANCHOR_MAX_CHARS:-400}"
++# Redelivery of an unconfirmed submit (patch 0013): first backoff in
++# whole seconds (doubled per attempt) and total attempts, the first one
++# included, before the file is dead-lettered.
++REDELIVER_BASE="${MULTICHAT_REDELIVER_BASE:-15}"
++REDELIVER_MAX="${MULTICHAT_REDELIVER_MAX:-6}"
++[[ "$REDELIVER_BASE" =~ ^[0-9]+$ ]] || REDELIVER_BASE=15
++[[ "$REDELIVER_MAX" =~ ^[1-9][0-9]*$ ]] || REDELIVER_MAX=6
++# Seconds a quiet watcher waits for an inbox event before it looks again
++# (pane liveness, due retries).
++WATCH_POLL_TIMEOUT="${MULTICHAT_ATTACH_POLL_TIMEOUT:-10}"
+ 
+ # ───── Injection helpers ─────
+ # All helpers read $PANE (the target tmux pane id) as a global set by the
+@@ -192,74 +210,250 @@
+ ' || true
+ }
+ 
++# Full scrollback + visible pane. Used ONLY on a redelivery, to look for
++# a unique id (delivery_id / message_id) the transcript may have scrolled
++# past. Never used for the busy footer: stale frames live in scrollback.
++pane_history() {
++  tmux capture-pane -t "$PANE" -p -J -S - 2>/dev/null || true
++}
++
++# The composer region: the LAST line carrying the `❯` prompt and every
++# line below it (box border, footer hints). Claude Code draws the input
++# box at the bottom of the pane, so this is what is still unsent.
++composer_region() {
++  awk '/❯/ { buf = ""; found = 1 } found { buf = buf $0 "\n" } END { printf "%s", buf }' <<<"$1"
++}
++
++# Everything above the composer region: transcript, spinner, queued-message
++# display. A submitted prompt is echoed here.
++above_composer() {
++  awk '{ line[NR] = $0 } /❯/ { last = NR } END { for (i = 1; i < last; i++) print line[i] }' <<<"$1"
++}
++
++# count_fixed NEEDLE TEXT — occurrences of a fixed string (0 for empty).
++count_fixed() {
++  [[ -n "$1" ]] || { echo 0; return 0; }
++  local n
++  n="$(grep -oF -- "$1" <<<"$2" | wc -l)" || true
++  echo $((n))
++}
++
++# count_placeholders TEXT — Claude Code collapses a large paste into
++# `[Pasted text #N +M lines]`. Counted, never trusted by mere presence:
++# a stale one from an older paste can sit in the composer.
++count_placeholders() {
++  local n
++  n="$(grep -oiE '\[Pasted text #[0-9]+' <<<"$1" | wc -l)" || true
++  echo $((n))
++}
++
++# True when FP is a per-message unique id. Only such a fingerprint may be
++# looked up in history: a text fingerprint ("[from @user] да") can match
++# an older identical message and fake a delivery.
++fp_is_unique() {
++  [[ "$1" == delivery_id=* || "$1" == message_id=* ]]
++}
++
++# prompt_tail TEXT — the last <=30 characters of the last non-blank line
++# (UTF-8 safe). Proof that an uncollapsed second paste reached the
++# composer. Empty when there is nothing usable.
++prompt_tail() {
++  printf '%s' "$1" | python3 -c '
++import sys
++lines = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
++if lines and len(lines[-1]) >= 4:
++    sys.stdout.write(lines[-1][-30:])
++' || true
++}
++
++# take_snapshot FP [TAIL] — one capture of the visible pane, split at the
++# composer. Sets globals:
++#   SNAP_FP_COMPOSER   occurrences of FP inside the composer region
++#   SNAP_PH_COMPOSER   paste placeholders inside the composer region
++#   SNAP_TAIL_COMPOSER occurrences of TAIL inside the composer region
++#   SNAP_FP_ABOVE      occurrences of FP above the composer (transcript)
++#   SNAP_BUSY          1 when the "esc to interrupt" footer is shown
++take_snapshot() {
++  local fp="$1" tail="${2:-}" out comp above
++  out="$(pane_text)"
++  comp="$(composer_region "$out")"
++  above="$(above_composer "$out")"
++  SNAP_FP_COMPOSER="$(count_fixed "$fp" "$comp")"
++  SNAP_PH_COMPOSER="$(count_placeholders "$comp")"
++  SNAP_TAIL_COMPOSER="$(count_fixed "$tail" "$comp")"
++  SNAP_FP_ABOVE="$(count_fixed "$fp" "$above")"
++  SNAP_BUSY=0
++  if grep -qiE 'esc to interrupt' <<<"$out"; then SNAP_BUSY=1; fi
++}
++
++# paste_text TEXT — one bracketed paste. Returns 2 on a tmux failure.
++paste_text() {
++  local buf="multichat-${CHAT_ID}-$$"
++  printf '%s' "$1" | tmux load-buffer -b "$buf" - || {
++    echo "multichat-entrypoint(watcher): load-buffer failed" >&2
++    return 2
++  }
++  tmux paste-buffer -d -t "$PANE" -b "$buf" -p || {
++    echo "multichat-entrypoint(watcher): paste-buffer failed" >&2
++    return 2
++  }
++}
++
++# press_enter_until_submitted FP FP_BASE PH_BASE PRE_GENERATING FP_ABOVE_BASE
++#
++# Enter-only verify loop; the body is never re-sent here. A submit counts
++# as confirmed only on POSITIVE evidence that THIS prompt left the
++# composer and became a turn:
++#   cleared — the composer holds no more copies of FP than FP_BASE and no
++#             more paste placeholders than PH_BASE (what was there before
++#             our paste), AND
++#   turn    — the busy footer appeared while no generation was running
++#             before (PRE_GENERATING=0), OR FP now shows above the
++#             composer more often than FP_ABOVE_BASE (the prompt echoed
++#             into the transcript / queued-message display).
++# "The fingerprint is gone" alone is NOT enough: a collapsed paste hides
++# the fingerprint from the start, so its absence proves nothing.
++# Returns 0 confirmed, 1 not confirmed.
++press_enter_until_submitted() {
++  local fp="$1" fp_base="$2" ph_base="$3" pre_generating="$4" above_base="$5"
++  local attempt delay
++  delay="$SUBMIT_RETRY_DELAY"
++  for ((attempt = 1; attempt <= SUBMIT_RETRY_MAX; attempt++)); do
++    # Re-check before every retry: a modal that appeared mid-flight must
++    # not collect our Enter as an answer.
++    if ! composer_visible; then
++      echo "multichat-entrypoint(watcher): composer disappeared mid-submit — stopping Enter retries" >&2
++      return 1
++    fi
++    tmux send-keys -t "$PANE" Enter || true
++    sleep "$delay"
++
++    if [[ -z "$fp" ]]; then
++      # Nothing to verify against (empty/whitespace-only body) — assume
++      # the Enter landed. Degraded path, equals the pre-fix behaviour.
++      return 0
++    fi
++    take_snapshot "$fp"
++    if (( SNAP_FP_COMPOSER <= fp_base && SNAP_PH_COMPOSER <= ph_base )); then
++      if [[ "$pre_generating" == "0" && "$SNAP_BUSY" == "1" ]] \
++          || (( SNAP_FP_ABOVE > above_base )); then
++        return 0
++      fi
++    fi
++
++    delay="$(awk -v d="$delay" -v f="$SUBMIT_RETRY_FACTOR" \
++      'BEGIN { printf "%.2f", d * f }')"
++  done
++
++  echo "multichat-entrypoint(watcher): submit not confirmed after ${SUBMIT_RETRY_MAX} attempts" >&2
++  return 1
++}
++
+ # Paste the body, then press Enter until the turn provably started.
+ #
+-# FIX 2026-09-22 (positive confirmation). The old loop treated "the
+-# fingerprint is not on the pane" as success. That reading is only valid
+-# once the body has actually been SEEN in the composer — otherwise a
+-# paste that never arrived (modal grabbed the keyboard, tmux op failed)
+-# looks exactly like a submitted one, and the message is discarded with
+-# a success log. Order now: composer ready -> paste -> SEE the echo ->
+-# Enter until the echo clears.
++# FIX 2026-09-22 (positive confirmation) + patch 0013 (collapsed pastes).
++# Claude Code collapses a large paste (a ~40-line swarm task) into
++# `[Pasted text #N +M lines]`, so the fingerprint inside it never shows
++# on the pane. The old gate accepted ANY visible "pasted text" as the
++# echo and then read "fingerprint absent" as a submit — both true before
++# Enter was even pressed, so a swallowed Enter or a paste that never
++# landed was logged as delivered. Now every signal is a DELTA against a
++# snapshot taken right before the paste:
+ #
+-# Success signals (after the echo was seen):
+-#   * footer shows "esc to interrupt" AND generation was NOT already
+-#     running before our paste — a pre-existing turn would read as a
+-#     false success, so when one is in flight we fall back to the
+-#     fingerprint signal only (Claude Code queues submits made during
+-#     generation, so pasting immediately is still correct);
+-#   * the fingerprint vanished from the pane — composer cleared (covers
+-#     turns that finish faster than our poll, and queued submits).
+-# The body is pasted exactly once; only Enter is ever retried, so a
+-# false "not submitted" reading can never duplicate the message.
++#   1. Anchor split. When the fingerprint is a unique id near the start
++#      of the body (the `<channel …>` tag; webhook tags put delivery_id
++#      first), the text up to and including the id (at most
++#      ANCHOR_MAX_CHARS, under 3 lines) is pasted on its own as a small
++#      paste that never collapses, then the rest. The id stays literally
++#      visible in the composer and in the transcript; the two pastes
++#      concatenate to exactly the original text.
++#   2. Echo gate. Split: one more copy of the id in the composer AND
++#      (one more placeholder OR the rest's last line visible). Unsplit:
++#      one more copy of the fingerprint OR one more placeholder. A stale
++#      placeholder already sitting there never counts.
++#   3. Enter-only verify (press_enter_until_submitted): the composer is
++#      back to its pre-paste counts AND a turn visibly started (busy
++#      footer that was not already there, or the fingerprint echoed above
++#      the composer).
++#
++# The body is pasted at most once per call; only Enter is retried, so a
++# false "not submitted" reading can never duplicate the message here.
++# Redelivery of an unconfirmed message is resume_prompt's job.
+ #
+ # Return codes:
+ #   0 — submitted, positively confirmed
+-#   1 — the body was pasted but the submit was never confirmed; the
+-#       caller must NOT re-paste (that would duplicate it)
++#   1 — something may have been injected but the submit is unconfirmed.
++#       SUBMIT_PHASE tells resume_prompt what was seen: "pasted" (echo
++#       seen — never re-paste) or "unechoed" (no echo; SUBMIT_PH_MARK is
++#       the placeholder count before the paste)
+ #   2 — nothing was injected; the caller should leave the file queued
+ #       and try again later
+ submit_prompt() {
+   local msg_text="$1"
+-  local fp attempt delay buf out pre_generating echo_seen i
++  local fp pre_generating i anchor rest tail
++  local fp_c0 ph_c0 tail_c0 above0
+   fp="$(prompt_fingerprint "$msg_text")"
++  SUBMIT_PHASE="unechoed"
++  SUBMIT_PH_MARK=0
+ 
+   # Refuse to type into a pane that is not showing a composer.
+   wait_claude_ready || return 2
+ 
+-  pre_generating=0
+-  if pane_text | grep -qiE 'esc to interrupt'; then
+-    pre_generating=1
++  # Anchor split — only for a unique id (see the header above). A text
++  # fingerprint can sit deep inside reply context, so it is not split.
++  anchor=""
++  rest=""
++  tail=""
++  if [[ -n "$fp" ]] && fp_is_unique "$fp" && [[ "$msg_text" == *"$fp"* ]]; then
++    anchor="${msg_text%%"$fp"*}$fp"
++    rest="${msg_text:${#anchor}}"
++    if [[ -z "$rest" || "${#anchor}" -gt "$ANCHOR_MAX_CHARS" \
++        || "$(printf '%s' "$anchor" | wc -l)" -ge 3 ]]; then
++      anchor=""
++      rest=""
++    else
++      tail="$(prompt_tail "$rest")"
++    fi
+   fi
+ 
++  take_snapshot "$fp" "$tail"
++  fp_c0="$SNAP_FP_COMPOSER"
++  ph_c0="$SNAP_PH_COMPOSER"
++  tail_c0="$SNAP_TAIL_COMPOSER"
++  above0="$SNAP_FP_ABOVE"
++  pre_generating="$SNAP_BUSY"
++  SUBMIT_PH_MARK="$ph_c0"
++
+   # Bracketed paste: the TUI receives one atomic paste event, so embedded
+   # newlines stay soft newlines and the later Enter can never be grouped
+-  # into the paste. printf (not heredoc/<<<) avoids a trailing newline.
+-  # Explicit `|| return 2` on each tmux op: these run with errexit
+-  # suppressed (callers invoke us in `if` context), and a silently failed
+-  # paste would otherwise read as "fingerprint vanished" = false success
+-  # — losing the message entirely. 2, not 1: nothing landed in the
+-  # composer, so the file is safe to retry.
+-  buf="multichat-${CHAT_ID}-$$"
+-  printf '%s' "$msg_text" | tmux load-buffer -b "$buf" - || {
+-    echo "multichat-entrypoint(watcher): load-buffer failed" >&2
+-    return 2
+-  }
+-  tmux paste-buffer -d -t "$PANE" -b "$buf" -p || {
+-    echo "multichat-entrypoint(watcher): paste-buffer failed" >&2
+-    return 2
+-  }
++  # into the paste. A failed tmux op before anything landed returns 2:
++  # these run with errexit suppressed (callers invoke us in `if` context),
++  # and the file is safe to retry.
++  if [[ -n "$anchor" ]]; then
++    paste_text "$anchor" || return 2
++    sleep "$PASTE_SETTLE"
++    # The anchor is in the composer now: a failure from here on is a 1,
++    # and "pasted" so a redelivery never pastes a second anchor.
++    paste_text "$rest" || { SUBMIT_PHASE="pasted"; return 1; }
++  else
++    paste_text "$msg_text" || return 2
++  fi
+ 
+   sleep "$PASTE_SETTLE"
+ 
+-  # Echo gate. A large paste is collapsed by the TUI into a placeholder
+-  # ("[Pasted text #1 +42 lines]"), so accept either the fingerprint or
+-  # that placeholder as proof the composer took the body.
+-  echo_seen=0
+   if [[ -n "$fp" ]]; then
++    local echo_seen=0
+     for ((i = 0; i < ECHO_POLL_MAX; i++)); do
+-      out="$(pane_text)"
+-      if grep -qF -- "$fp" <<<"$out" || grep -qiE 'pasted text' <<<"$out"; then
++      take_snapshot "$fp" "$tail"
++      if [[ -n "$anchor" ]]; then
++        # Both halves must show: the literal anchor, and the rest either
++        # collapsed (one more placeholder) or literal (its tail visible).
++        if (( SNAP_FP_COMPOSER > fp_c0 \
++            && (SNAP_PH_COMPOSER > ph_c0 || SNAP_TAIL_COMPOSER > tail_c0) )); then
++          echo_seen=1
++          break
++        fi
++      elif (( SNAP_FP_COMPOSER > fp_c0 || SNAP_PH_COMPOSER > ph_c0 )); then
+         echo_seen=1
+         break
+       fi
+@@ -267,44 +461,81 @@
+     done
+     if [[ "$echo_seen" == "0" ]]; then
+       # The composer was up a moment ago and the paste reported success,
+-      # yet nothing shows. Something is eating input. Do NOT press Enter
+-      # blind — on a modal that would answer it with its default option.
++      # yet nothing new shows. Something is eating input. Do NOT press
++      # Enter blind — on a modal that would answer it with its default.
+       echo "multichat-entrypoint(watcher): paste not echoed by the pane — refusing to press Enter" >&2
+       return 1
+     fi
+   fi
++  SUBMIT_PHASE="pasted"
+ 
+-  delay="$SUBMIT_RETRY_DELAY"
+-  for ((attempt = 1; attempt <= SUBMIT_RETRY_MAX; attempt++)); do
+-    # Re-check before every retry: a modal that appeared mid-flight must
+-    # not collect our Enter as an answer.
+-    if ! composer_visible; then
+-      echo "multichat-entrypoint(watcher): composer disappeared mid-submit — stopping Enter retries" >&2
+-      return 1
+-    fi
+-    tmux send-keys -t "$PANE" Enter || true
+-    sleep "$delay"
++  press_enter_until_submitted "$fp" "$fp_c0" "$ph_c0" "$pre_generating" "$above0"
++}
+ 
+-    out="$(pane_text)"
+-    if [[ "$pre_generating" == "0" ]] \
+-        && grep -qiE 'esc to interrupt' <<<"$out"; then
+-      return 0
+-    fi
+-    if [[ -n "$fp" && "$echo_seen" == "1" ]] && ! grep -qF -- "$fp" <<<"$out"; then
++# resume_prompt TEXT PHASE PH_MARK — redeliver a message whose earlier
++# submit was not confirmed, WITHOUT ever pasting it twice. The composer
++# and transcript are inspected first:
++#   * fingerprint in the composer   -> the body is there: Enter only;
++#   * unique id found in the pane history above the composer
++#                                   -> it was submitted after all: done;
++#   * PHASE=pasted (an echo was seen earlier) and a paste placeholder in
++#     the composer                  -> most likely our collapsed body:
++#                                      Enter only;
++#   * PHASE=pasted, nothing visible -> cannot prove either way: no paste,
++#                                      no Enter, stay unconfirmed (the
++#                                      caller backs off, then dead-letters);
++#   * PHASE=unechoed and more placeholders than PH_MARK
++#                                   -> a late echo of our paste: Enter only;
++#   * PHASE=unechoed, nothing of ours anywhere
++#                                   -> the paste never landed: paste again.
++# Return codes as submit_prompt.
++resume_prompt() {
++  local msg_text="$1" phase="$2" ph_mark="$3"
++  local fp hist above_hist
++  fp="$(prompt_fingerprint "$msg_text")"
++  SUBMIT_PHASE="$phase"
++  SUBMIT_PH_MARK="$ph_mark"
++
++  wait_claude_ready || return 2
++  take_snapshot "$fp"
++  local pre_generating="$SNAP_BUSY"
++
++  if (( SNAP_FP_COMPOSER > 0 )); then
++    echo "multichat-entrypoint(watcher): redelivery: body still in the composer — Enter only" >&2
++    SUBMIT_PHASE="pasted"
++    press_enter_until_submitted "$fp" $((SNAP_FP_COMPOSER - 1)) \
++      $((SNAP_PH_COMPOSER > 0 ? SNAP_PH_COMPOSER - 1 : 0)) "$pre_generating" "$SNAP_FP_ABOVE"
++    return $?
++  fi
++
++  if [[ -n "$fp" ]] && fp_is_unique "$fp"; then
++    hist="$(pane_history)"
++    above_hist="$(above_composer "$hist")"
++    if (( $(count_fixed "$fp" "$above_hist") > 0 )); then
++      echo "multichat-entrypoint(watcher): redelivery: ${fp} found in the transcript — already submitted" >&2
+       return 0
+     fi
+-    if [[ -z "$fp" ]]; then
+-      # Nothing to verify against (empty/whitespace-only body) — assume
+-      # the Enter landed. Degraded path, equals the pre-fix behaviour.
+-      return 0
++  fi
++
++  if [[ "$phase" == "pasted" ]]; then
++    if (( SNAP_PH_COMPOSER > 0 )); then
++      echo "multichat-entrypoint(watcher): redelivery: collapsed paste in the composer — Enter only" >&2
++      press_enter_until_submitted "$fp" 0 $((SNAP_PH_COMPOSER - 1)) "$pre_generating" "$SNAP_FP_ABOVE"
++      return $?
+     fi
++    echo "multichat-entrypoint(watcher): redelivery: no trace of the message and no proof it was sent — not re-pasting" >&2
++    return 1
++  fi
+ 
+-    delay="$(awk -v d="$delay" -v f="$SUBMIT_RETRY_FACTOR" \
+-      'BEGIN { printf "%.2f", d * f }')"
+-  done
++  if (( SNAP_PH_COMPOSER > ph_mark )); then
++    echo "multichat-entrypoint(watcher): redelivery: late echo of the earlier paste — Enter only" >&2
++    SUBMIT_PHASE="pasted"
++    press_enter_until_submitted "$fp" 0 $((SNAP_PH_COMPOSER - 1)) "$pre_generating" "$SNAP_FP_ABOVE"
++    return $?
++  fi
+ 
+-  echo "multichat-entrypoint(watcher): submit not confirmed after ${SUBMIT_RETRY_MAX} attempts" >&2
+-  return 1
++  echo "multichat-entrypoint(watcher): redelivery: earlier paste never landed — pasting again" >&2
++  submit_prompt "$msg_text"
+ }
+ 
+ # Parse one JSON file into a single prompt string. Reads the file path
+@@ -386,11 +617,33 @@
+ PYEOF
+ }
+ 
++# Retry record of an inbox file: "<attempts> <next_at> <phase> <ph_mark>".
++retry_state_file() {
++  printf '%s/.retry/%s.state' "$INBOX" "$(basename "$1")"
++}
++
++# dead_letter FILE ATTEMPTS — give up on a message: move it out of the
++# queue (kept for the operator, never deleted), log an ERROR, alert.
++dead_letter() {
++  local f="$1" attempts="$2" name dl
++  name="$(basename "$f")"
++  dl="${INBOX}/.dead-letter"
++  mkdir -p "$dl"
++  mv "$f" "${dl}/${name}"
++  echo "multichat-entrypoint: ERROR: ${name} not confirmed after ${attempts} delivery attempts — moved to ${dl}" >&2
++  if [[ -n "${MULTICHAT_ALERT_CMD:-}" ]]; then
++    timeout 30 "$MULTICHAT_ALERT_CMD" dm-inbox \
++      "Message ${name} (chat ${CHAT_ID:-?}) was not delivered to the session after ${attempts} attempts. It is in ${dl}; check the session and resend it by hand." \
++      >/dev/null 2>&1 \
++      || echo "multichat-entrypoint: owner alert failed for ${name}" >&2
++  fi
++}
++
+ # Drain every committed *.json in inbox/ (sorted = ms-time order).
+ # NOTE: We deliberately do NOT recurse into .processed/ — `find -maxdepth 1`
+ # plus the leading-dot exclusion handled by the *.json glob keeps us safe.
+ process_inbox() {
+-  local f msg_text rc
++  local f msg_text rc st attempts next_at phase ph_mark now delay
+   while IFS= read -r -d '' f; do
+     [[ -f "$f" ]] || continue
+     rc=0
+@@ -401,29 +654,65 @@
+       # triage under a distinct prefix.
+       mv "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
+     elif [[ "$rc" -eq 0 && -n "$msg_text" ]]; then
++      st="$(retry_state_file "$f")"
++      attempts=0
++      next_at=0
++      phase="unechoed"
++      ph_mark=0
++      if [[ -f "$st" ]]; then
++        read -r attempts next_at phase ph_mark <"$st" || true
++        [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
++        [[ "$next_at" =~ ^[0-9]+$ ]] || next_at=0
++        [[ "$ph_mark" =~ ^[0-9]+$ ]] || ph_mark=0
++        [[ "$phase" == "pasted" ]] || phase="unechoed"
++      fi
++      now="$(date +%s)"
++      if (( now < next_at )); then
++        # Backoff still running. Stop the drain: a later message must not
++        # overtake this one.
++        return 0
++      fi
++
+       local src=0
+-      submit_prompt "$msg_text" || src=$?
++      if (( attempts > 0 )); then
++        resume_prompt "$msg_text" "$phase" "$ph_mark" || src=$?
++      else
++        submit_prompt "$msg_text" || src=$?
++      fi
+       if [[ "$src" -eq 0 ]]; then
+         mv "$f" "${PROCESSED}/$(basename "$f")"
++        rm -f "$st"
+       elif [[ "$src" -eq 2 ]]; then
+         # NOTHING was injected (composer hidden behind a modal, or a
+         # tmux call failed). Leave the file in the inbox and stop the
+         # drain: retrying now would only hit the same modal, and moving
+         # on would deliver later messages out of order. The next watcher
+-        # pass picks it up once the composer is back.
++        # pass picks it up once the composer is back. Not an attempt.
+         echo "multichat-entrypoint: injection deferred ($(basename "$f")) — composer unavailable" >&2
+         return 0
+       else
+-        # Body is in the composer but submit never confirmed. Do NOT
+-        # requeue (a re-paste would duplicate the message) — mark for
+-        # operator triage; the next message's Enter flushes the stuck
+-        # composer.
+-        mv "$f" "${PROCESSED}/submit-unconfirmed-$(basename "$f")"
++        # Not confirmed. Keep it queued and retry later (resume_prompt
++        # never re-pastes a body that may be in the TUI); give up after
++        # REDELIVER_MAX attempts. An echo seen once stays "pasted".
++        attempts=$((attempts + 1))
++        if [[ "$phase" == "pasted" ]]; then SUBMIT_PHASE="pasted"; fi
++        if (( attempts >= REDELIVER_MAX )); then
++          dead_letter "$f" "$attempts"
++          rm -f "$st"
++          continue
++        fi
++        delay=$((REDELIVER_BASE * (1 << (attempts - 1))))
++        mkdir -p "$(dirname "$st")"
++        printf '%s %s %s %s\n' "$attempts" "$((now + delay))" \
++          "${SUBMIT_PHASE:-unechoed}" "${SUBMIT_PH_MARK:-0}" >"$st"
++        echo "multichat-entrypoint: submit unconfirmed ($(basename "$f"), attempt ${attempts}/${REDELIVER_MAX}) — kept queued, retry in ${delay}s" >&2
++        return 0
+       fi
+     else
+       # Parse failed — leave the file in place for operator triage but
+       # rename it so we don't spin on it.
+       mv "$f" "${PROCESSED}/parse-failed-$(basename "$f")"
++      rm -f "$(retry_state_file "$f")"
+     fi
+   done < <(find "$INBOX" -maxdepth 1 -name '*.json' -print0 | sort -z)
+ }
+@@ -481,9 +770,12 @@
+ 
+   if command -v inotifywait >/dev/null 2>&1; then
+     while target_alive; do
+-      # -t so a quiet inbox still re-checks pane liveness periodically.
+-      inotifywait -q -t "${MULTICHAT_ATTACH_POLL_TIMEOUT:-30}" \
+-        -e create,moved_to --include '\.json$' "$INBOX" >/dev/null 2>&1 || true
++      # -t so a quiet inbox still re-checks pane liveness and fires due
++      # redeliveries. rc 1 = inotify error: back off instead of spinning.
++      wrc=0
++      inotifywait -q -t "$WATCH_POLL_TIMEOUT" \
++        -e create,moved_to --include '\.json$' "$INBOX" >/dev/null 2>&1 || wrc=$?
++      if [[ "$wrc" -eq 1 ]]; then sleep 1; fi
+       sleep 0.1  # debounce — rename() is atomic but bursts can stack
+       target_alive || break
+       process_inbox
+@@ -525,9 +817,12 @@
+   # Prefer inotifywait when available; fall back to polling.
+   if command -v inotifywait >/dev/null 2>&1; then
+     # --include filters to *.json so we ignore .tmp writes mid-rename.
+-    while parent_alive \
+-        && inotifywait -q -e create,moved_to --include '\.json$' "$INBOX" \
+-        >/dev/null 2>&1; do
++    # -t: a queued redelivery must fire on a quiet chat too (patch 0013).
++    while parent_alive; do
++      wrc=0
++      inotifywait -q -t "$WATCH_POLL_TIMEOUT" -e create,moved_to \
++        --include '\.json$' "$INBOX" >/dev/null 2>&1 || wrc=$?
++      if [[ "$wrc" -eq 1 ]]; then sleep 1; fi
+       sleep 0.1  # debounce — rename() is atomic but bursts can stack
+       parent_alive || exit 0
+       process_inbox
+--- a/plugin/src/webhook/inbox-delivery.ts
++++ b/plugin/src/webhook/inbox-delivery.ts
+@@ -22,8 +22,20 @@
+ // of the same task never reuses an id still visible in the pane history.
+ // It is deliberately NOT called message_id — the session must not mistake
+ // it for a Telegram id usable with reply_to or react.
++//
++// Dedupe (patch 0013). The swarm worker retries on timeout / 5xx even when
++// the first POST was already committed, so the same task can arrive twice.
++// Each task nonce is claimed with an exclusive-create marker file in
++// `{stateDir}/chats/{chatId}/webhook-seen/<nonce>` holding the delivery id.
++// A POST whose nonce is already claimed (and younger than the TTL) answers
++// 200 with the original delivery id and writes nothing. The marker outlives
++// the inbox file, so a retry after the watcher consumed the task is still a
++// no-op. A failed commit releases the marker so the 503 retry goes through.
++// Messages without a nonce are never deduped.
+ 
+ import { randomBytes } from 'node:crypto'
++import { mkdir, open, readFile, readdir, stat, unlink } from 'node:fs/promises'
++import { join } from 'node:path'
+ 
+ import { renderChannelBlock } from '../telegram/dm-inbox-delivery.js'
+ import {
+@@ -44,17 +56,32 @@
+ // worker. The last match wins: a quoted older task may precede it.
+ const TASK_ID_RE = /swarm\.ack\(task_id="([^"]*)"/g
+ 
++/** How long a task nonce stays claimed (7 days; swarm retries end far sooner). */
++export const WEBHOOK_DEDUPE_TTL_MS = 7 * 24 * 60 * 60 * 1000
++/** Minimum gap between two prune sweeps of one marker dir (1 hour). */
++const PRUNE_INTERVAL_MS = 60 * 60 * 1000
++const SEEN_SUBDIR = 'webhook-seen'
++const SEEN_DIR_MODE = 0o700
++const SEEN_FILE_MODE = 0o600
++
++const lastPruneAt = new Map<string, number>()
++
+ export interface WebhookInboxOptions {
+   stateDir: string
+   chatId: string
+   content: string
+   agentId?: string
+   log: Logger
++  /** Test seam: replaces the durable inbox write. */
++  writeInbox?: typeof writeToInbox
+ }
+ 
+ export interface WebhookInboxResult {
+   deliveryId: string
+-  path: string
++  /** Inbox file path; undefined when the message was a deduped duplicate. */
++  path?: string
++  /** True when this task nonce was already accepted; nothing was written. */
++  duplicate?: boolean
+ }
+ 
+ /** True when webhook messages for `chatId` must go through the file inbox. */
+@@ -67,6 +94,72 @@
+ }
+ 
+ /**
++ * Extract the sanitized swarm task nonce (`[A-Za-z0-9_-]`, at most 16
++ * chars) from a webhook message, or undefined when it carries none.
++ */
++export function extractTaskNonce(message: string): string | undefined {
++  let taskId: string | undefined
++  for (const m of message.matchAll(TASK_ID_RE)) taskId = m[1]
++  const nonce = (taskId?.split('::').pop() ?? '')
++    .replace(/[^A-Za-z0-9_-]/g, '')
++    .slice(0, MAX_NONCE_CHARS)
++  return nonce.length > 0 ? nonce : undefined
++}
++
++/**
++ * Atomically claim `nonce` for `deliveryId`.
++ *
++ * Returns undefined when the claim succeeded (first delivery), or the
++ * delivery id recorded by the earlier claim when the nonce was already
++ * seen within the TTL. An expired marker is replaced.
++ */
++async function claimNonce(
++  seenDir: string,
++  nonce: string,
++  deliveryId: string,
++): Promise<string | undefined> {
++  const marker = join(seenDir, nonce)
++  for (let attempt = 0; attempt < 2; attempt++) {
++    try {
++      const fh = await open(marker, 'wx', SEEN_FILE_MODE)
++      try {
++        await fh.writeFile(deliveryId)
++      } finally {
++        await fh.close()
++      }
++      return undefined
++    } catch (err) {
++      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
++    }
++    const st = await stat(marker)
++    if (Date.now() - st.mtimeMs <= WEBHOOK_DEDUPE_TTL_MS) {
++      const prior = (await readFile(marker, 'utf8')).trim()
++      // An empty marker means a concurrent claim is mid-write: still a dup.
++      return prior.length > 0 ? prior : deliveryId
++    }
++    await unlink(marker).catch(() => undefined)
++  }
++  // Lost the re-claim race to a concurrent request: treat as duplicate.
++  return (await readFile(marker, 'utf8').catch(() => '')).trim() || deliveryId
++}
++
++/** Best-effort removal of markers older than the TTL, at most hourly. */
++async function pruneSeen(seenDir: string): Promise<void> {
++  const now = Date.now()
++  if (now - (lastPruneAt.get(seenDir) ?? 0) < PRUNE_INTERVAL_MS) return
++  lastPruneAt.set(seenDir, now)
++  try {
++    for (const name of await readdir(seenDir)) {
++      const p = join(seenDir, name)
++      const st = await stat(p).catch(() => undefined)
++      if (st && now - st.mtimeMs > WEBHOOK_DEDUPE_TTL_MS) await unlink(p).catch(() => undefined)
++    }
++  } catch {
++    // Pruning is housekeeping only; never fail a delivery over it.
++  }
++}
++
++/**
+  * Build a unique, fingerprint-safe delivery id for one webhook message.
+  *
+  * Shape: `wh-<nonce>-<8 hex>` when the message carries a swarm task id,
+@@ -75,12 +168,8 @@
+  * `>` that end the watcher's fingerprint match.
+  */
+ export function buildDeliveryId(message: string): string {
+-  let taskId: string | undefined
+-  for (const m of message.matchAll(TASK_ID_RE)) taskId = m[1]
+-  const nonce = (taskId?.split('::').pop() ?? '')
+-    .replace(/[^A-Za-z0-9_-]/g, '')
+-    .slice(0, MAX_NONCE_CHARS)
+-  if (nonce.length > 0) return `wh-${nonce}-${randomBytes(SUFFIX_BYTES).toString('hex')}`
++  const nonce = extractTaskNonce(message)
++  if (nonce !== undefined) return `wh-${nonce}-${randomBytes(SUFFIX_BYTES).toString('hex')}`
+   return `wh-${randomBytes(FALLBACK_BYTES).toString('hex')}`
+ }
+ 
+@@ -95,14 +184,32 @@
+   opts: WebhookInboxOptions,
+ ): Promise<WebhookInboxResult> {
+   const { stateDir, chatId, content, agentId, log } = opts
++  const write = opts.writeInbox ?? writeToInbox
+   const deliveryId = buildDeliveryId(content)
+-  // Same attributes the MCP path sends (source, chat_id, agent_id) plus the
+-  // delivery id; renderChannelBlock escapes every value.
+-  const meta: Record<string, string> = { source: 'webhook', chat_id: chatId }
++  // delivery_id goes FIRST (patch 0013): the watcher's fingerprint must sit
++  // at the start of the pasted line so terminal wrapping cannot split it.
++  // Then the attributes the MCP path sends (source, chat_id, agent_id);
++  // renderChannelBlock escapes every value.
++  const meta: Record<string, string> = { delivery_id: deliveryId, source: 'webhook', chat_id: chatId }
+   if (agentId !== undefined) meta.agent_id = agentId
+-  meta.delivery_id = deliveryId
+ 
+   await ensureChatStateDirs(chatId, stateDir)
++
++  const nonce = extractTaskNonce(content)
++  const seenDir = join(stateDir, 'chats', chatId, SEEN_SUBDIR)
++  if (nonce !== undefined) {
++    await mkdir(seenDir, { recursive: true, mode: SEEN_DIR_MODE })
++    await pruneSeen(seenDir)
++    const prior = await claimNonce(seenDir, nonce, deliveryId)
++    if (prior !== undefined) {
++      log.info('webhook duplicate task nonce, not re-queued', {
++        chat_id: chatId,
++        delivery_id: prior,
++      })
++      return { deliveryId: prior, duplicate: true }
++    }
++  }
++
+   const message: InboundMessage = {
+     text: renderChannelBlock(content, meta),
+     chat_id: chatId,
+@@ -111,7 +218,14 @@
+     user: '',
+     timestamp: new Date().toISOString(),
+   }
+-  const path = await writeToInbox(chatId, message, stateDir, { durable: true })
++  let path: string
++  try {
++    path = await write(chatId, message, stateDir, { durable: true })
++  } catch (err) {
++    // Release the claim: the sender gets a 503 and its retry must land.
++    if (nonce !== undefined) await unlink(join(seenDir, nonce)).catch(() => undefined)
++    throw err
++  }
+   log.info('webhook message committed to inbox', { chat_id: chatId, delivery_id: deliveryId })
+   return { deliveryId, path }
+ }
+--- a/plugin/src/webhook/server.ts
++++ b/plugin/src/webhook/server.ts
+@@ -688,14 +688,18 @@
+   // No MCP fallback here — that silent-loss path is what this replaces.
+   if (isWebhookInboxChat(deps.dmInboxStateDir, deps.dmInboxChatIds, payload.chatId)) {
+     try {
+-      const { deliveryId } = await deliverWebhookToInbox({
++      const { deliveryId, duplicate } = await deliverWebhookToInbox({
+         stateDir: deps.dmInboxStateDir,
+         chatId: payload.chatId,
+         content: payload.message,
+         ...(payload.agentId !== undefined ? { agentId: payload.agentId } : {}),
+         log,
+       })
+-      reply(res, 200, { status: 'accepted', delivery_id: deliveryId })
++      reply(res, 200, {
++        status: 'accepted',
++        delivery_id: deliveryId,
++        ...(duplicate === true ? { duplicate: true } : {}),
++      })
+     } catch (err) {
+       log.error('webhook inbox commit failed', {
+         chat_id: payload.chatId,
+--- a/plugin/tests/chats/multichat-entrypoint-attach.test.ts
++++ b/plugin/tests/chats/multichat-entrypoint-attach.test.ts
+@@ -10,6 +10,13 @@
+ // The script runs as a real process here (not sourced) with a stub tmux
+ // and a stub claude on PATH, so we can assert both what it injected and
+ // that it never launched a second Claude session.
++//
++// Patch 0013: the stub models the Claude Code pane as a transcript, the
++// `❯` composer and a footer. A paste longer than TMUX_STUB_COLLAPSE_LINES
++// lines is shown the way the real TUI shows it — `[Pasted text #N +M
++// lines]`, the body itself invisible — and Enter moves the composer into
++// the transcript as `> …`. That is the state in which the old echo gate
++// accepted any placeholder as proof and "fingerprint gone" as a submit.
+ 
+ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+ import { spawnSync } from 'child_process'
+@@ -37,7 +44,6 @@
+ )
+ 
+ const CHAT_ID = '100000001'
+-const READY_PANE = '❯ \n⏵⏵ bypass permissions on (shift+tab to cycle)\n'
+ 
+ let dir: string
+ 
+@@ -54,10 +60,18 @@
+   return join(dir, 'state', 'chats', CHAT_ID, 'inbox')
+ }
+ 
+-// Stub tmux: logs every call, serves a ready pane for capture-pane, and
+-// answers `display-message` (the pane-liveness probe) with success for
+-// the first TMUX_STUB_ALIVE_CALLS invocations and failure afterwards —
+-// that is how a test ends the watcher loop deterministically.
++// Stub tmux. Pane = transcript.txt + (modal.txt | "❯ " + composer.txt +
++// footer). Every call is logged; every loaded buffer is also appended to
++// pasted-all.txt so a test can check what reached the TUI in total.
++//
++// Switches (env):
++//   TMUX_STUB_ALIVE_CALLS     display-message succeeds this many times
++//   TMUX_STUB_NO_ECHO=1       a paste never reaches the composer
++//   TMUX_STUB_COLLAPSE_LINES  pastes with at least this many newlines
++//                             collapse into a placeholder
++//   TMUX_STUB_ENTER_NOOP=1    Enter does nothing (deaf TUI)
++//   TMUX_STUB_ENTER_NOOP_FIRST=N  only the first N Enters do nothing
++//   TMUX_STUB_BUSY_ON_ENTER=1 a submit shows the "esc to interrupt" footer
+ function installStubs(): void {
+   const tmux = `#!/usr/bin/env bash
+ DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
+@@ -71,23 +85,41 @@
+   exit 0
+ fi
+ if [[ "$1" == "capture-pane" ]]; then
+-  cat "$DIR/pane.txt" 2>/dev/null || true
++  cat "$DIR/transcript.txt" 2>/dev/null || true
++  if [[ -f "$DIR/modal.txt" ]]; then
++    cat "$DIR/modal.txt"
++    exit 0
++  fi
++  printf '❯ %s\\n' "$(cat "$DIR/composer.txt" 2>/dev/null)"
++  cat "$DIR/footer.txt" 2>/dev/null || printf '⏵⏵ bypass permissions on (shift+tab to cycle)\\n'
+ fi
+ if [[ "$1" == "load-buffer" ]]; then
+   cat > "$DIR/loaded-buffer.txt"
++  cat "$DIR/loaded-buffer.txt" >> "$DIR/pasted-all.txt"
+ fi
+-if [[ "$1" == "paste-buffer" ]]; then
+-  # Model the composer: a paste echoes into the pane unless the test
+-  # asks for a swallowed paste (TMUX_STUB_NO_ECHO=1 — a modal holding
+-  # the keyboard).
+-  if [[ "\${TMUX_STUB_NO_ECHO:-0}" != "1" ]]; then
+-    cat "$DIR/loaded-buffer.txt" >> "$DIR/pane.txt"
++if [[ "$1" == "paste-buffer" && "\${TMUX_STUB_NO_ECHO:-0}" != "1" ]]; then
++  nl=$(tr -cd '\\n' < "$DIR/loaded-buffer.txt" | wc -c)
++  if [[ "$nl" -ge "\${TMUX_STUB_COLLAPSE_LINES:-100000}" ]]; then
++    k=$(cat "$DIR/paste-seq" 2>/dev/null || echo 0)
++    k=$((k + 1))
++    echo "$k" > "$DIR/paste-seq"
++    printf '[Pasted text #%d +%d lines]' "$k" "$nl" >> "$DIR/composer.txt"
++  else
++    cat "$DIR/loaded-buffer.txt" >> "$DIR/composer.txt"
+   fi
+ fi
+ if [[ "$1" == "send-keys" && "$*" == *Enter* ]]; then
+-  # Submit clears the composer back to an empty ready prompt.
+-  if [[ "\${TMUX_STUB_ENTER_NOOP:-0}" != "1" ]]; then
+-    printf '%s' "$(cat "$DIR/ready-pane.txt")" > "$DIR/pane.txt"
++  e=$(cat "$DIR/enter-count" 2>/dev/null || echo 0)
++  e=$((e + 1))
++  echo "$e" > "$DIR/enter-count"
++  if [[ "\${TMUX_STUB_ENTER_NOOP:-0}" != "1" && "$e" -gt "\${TMUX_STUB_ENTER_NOOP_FIRST:-0}" ]]; then
++    if [[ -s "$DIR/composer.txt" ]]; then
++      printf '> %s\\n' "$(cat "$DIR/composer.txt")" >> "$DIR/transcript.txt"
++      : > "$DIR/composer.txt"
++      if [[ "\${TMUX_STUB_BUSY_ON_ENTER:-0}" == "1" ]]; then
++        printf 'esc to interrupt\\n' > "$DIR/footer.txt"
++      fi
++    fi
+   fi
+ fi
+ exit 0
+@@ -105,8 +137,13 @@
+   writeFileSync(join(dir, 'bin', 'claude'), claude)
+   chmodSync(join(dir, 'bin', 'claude'), 0o755)
+ 
+-  writeFileSync(join(dir, 'pane.txt'), READY_PANE)
+-  writeFileSync(join(dir, 'ready-pane.txt'), READY_PANE)
++  // Owner-alert stub: what run-agent passes as MULTICHAT_ALERT_CMD.
++  const alert = `#!/usr/bin/env bash
++DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
++printf '%s|%s\\n' "$1" "$2" >> "$DIR/alerts.log"
++`
++  writeFileSync(join(dir, 'bin', 'alert'), alert)
++  chmodSync(join(dir, 'bin', 'alert'), 0o755)
+ }
+ 
+ function runAttach(
+@@ -129,6 +166,8 @@
+       MULTICHAT_SUBMIT_RETRY_MAX: '3',
+       MULTICHAT_ECHO_POLL_INTERVAL: '0.01',
+       MULTICHAT_ECHO_POLL_MAX: '3',
++      MULTICHAT_REDELIVER_BASE: '0',
++      MULTICHAT_ALERT_CMD: join(dir, 'bin', 'alert'),
+       ...extraEnv,
+     },
+     encoding: 'utf8',
+@@ -137,14 +176,32 @@
+   return { code: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' }
+ }
+ 
+-function tmuxLog(): string[] {
++function readOr(name: string): string {
+   try {
+-    return readFileSync(join(dir, 'tmux.log'), 'utf8').trim().split('\n')
++    return readFileSync(join(dir, name), 'utf8')
+   } catch {
+-    return []
++    return ''
+   }
+ }
+ 
++function tmuxLog(): string[] {
++  return readOr('tmux.log').trim().split('\n').filter((l) => l !== '')
++}
++
++function pasteCalls(): number {
++  return tmuxLog().filter((l) => l.startsWith('paste-buffer')).length
++}
++
++function enterCalls(): number {
++  return tmuxLog().filter((l) => l.startsWith('send-keys') && l.includes('Enter')).length
++}
++
++// Start a fresh tmux.log so a second run's calls can be counted alone.
++function resetLog(): void {
++  writeFileSync(join(dir, 'tmux.log'), '')
++  rmSync(join(dir, 'alive-count'), { force: true })
++}
++
+ function writeInboxMessage(text: string, name = `${Date.now()}-a.json`): void {
+   mkdirSync(inboxDir(), { recursive: true })
+   writeFileSync(
+@@ -160,17 +217,23 @@
+   )
+ }
+ 
+-// Same shape src/webhook/inbox-delivery.ts renders: no message_id, a
+-// constant attribute prefix, and a body that starts identically for every
+-// swarm task — only delivery_id differs.
++// Same shape src/webhook/inbox-delivery.ts renders since patch 0013:
++// delivery_id FIRST, no message_id, and a body that starts identically
++// for every swarm task — only delivery_id differs.
+ function webhookBlock(deliveryId: string, body: string): string {
+   return (
+-    `<channel source="webhook" chat_id="${CHAT_ID}" agent_id="dashi-channel" ` +
+-    `delivery_id="${deliveryId}"> Задача от maimozg через swarm, ` +
++    `<channel delivery_id="${deliveryId}" source="webhook" chat_id="${CHAT_ID}" ` +
++    `agent_id="dashi-channel"> Задача от maimozg через swarm, ` +
+     `пожалуйста выполни и подтверди: ${body} </channel>`
+   )
+ }
+ 
++// A swarm task the size that triggers Claude Code's paste collapse.
++function bigWebhookBlock(deliveryId: string): string {
++  const lines = Array.from({ length: 40 }, (_, i) => `шаг ${i + 1}: сделай что-то полезное`)
++  return webhookBlock(deliveryId, `\n${lines.join('\n')}\n`)
++}
++
+ function queuedJson(): string[] {
+   return readdirSync(inboxDir()).filter((f) => f.endsWith('.json'))
+ }
+@@ -180,6 +243,11 @@
+   return existsSync(p) ? readdirSync(p) : []
+ }
+ 
++function deadLetters(): string[] {
++  const p = join(inboxDir(), '.dead-letter')
++  return existsSync(p) ? readdirSync(p) : []
++}
++
+ describe('multichat-entrypoint attach mode', () => {
+   test('refuses to start without a target pane', () => {
+     installStubs()
+@@ -199,22 +267,22 @@
+ 
+   test('injects a pending message and never spawns claude', () => {
+     installStubs()
+-    writeInboxMessage(channelBlock('11752', 'привет'))
++    const text = channelBlock('11752', 'привет')
++    writeInboxMessage(text)
+     const res = runAttach()
+     expect(res.code).toBe(0)
+ 
+-    const log = tmuxLog()
+-    expect(log.some((l) => l.startsWith('load-buffer'))).toBe(true)
+-    expect(log.some((l) => l.includes('Enter'))).toBe(true)
++    expect(tmuxLog().some((l) => l.startsWith('load-buffer'))).toBe(true)
++    expect(enterCalls()).toBe(1)
+     // The pasted body is the channel payload verbatim — the session needs
+-    // the chat_id in it to answer with the reply tool.
+-    const pasted = readFileSync(join(dir, 'loaded-buffer.txt'), 'utf8')
+-    expect(pasted).toContain('chat_id="100000001"')
+-    expect(pasted).toContain('привет')
++    // the chat_id in it to answer with the reply tool. Split into an
++    // anchor paste and the rest, the pieces still add up to the original.
++    expect(readOr('pasted-all.txt')).toBe(text)
++    expect(readOr('transcript.txt')).toContain('message_id="11752"')
+ 
+     // Delivered → moved out of the inbox, into .processed/ unprefixed.
+-    expect(readdirSync(inboxDir()).filter((f) => f.endsWith('.json'))).toEqual([])
+-    const processed = readdirSync(join(inboxDir(), '.processed'))
++    expect(queuedJson()).toEqual([])
++    const processed = processedNames()
+     expect(processed.length).toBe(1)
+     expect(processed[0]?.startsWith('submit-unconfirmed-')).toBe(false)
+ 
+@@ -227,13 +295,13 @@
+     expect(res.code).toBe(0)
+     // A message that arrives after the watcher is gone stays untouched.
+     writeInboxMessage('поздно')
+-    expect(readdirSync(inboxDir()).filter((f) => f.endsWith('.json')).length).toBe(1)
++    expect(queuedJson().length).toBe(1)
+   })
+ 
+   test('a modal over the composer defers injection instead of eating the file', () => {
+     installStubs()
+     // No `❯` anywhere: a survey / trust prompt / picker owns the keyboard.
+-    writeFileSync(join(dir, 'pane.txt'), 'Do you trust the files in this folder?\n1. Yes\n2. No\n')
++    writeFileSync(join(dir, 'modal.txt'), 'Do you trust the files in this folder?\n1. Yes\n2. No\n')
+     writeInboxMessage(channelBlock('11752', 'привет'))
+     const res = runAttach()
+     expect(res.code).toBe(0)
+@@ -241,19 +309,19 @@
+     // Still queued — nothing was typed, so the next pass can retry it.
+     expect(queuedJson().length).toBe(1)
+     expect(processedNames()).toEqual([])
+-    expect(tmuxLog().some((l) => l.includes('Enter'))).toBe(false)
++    expect(enterCalls()).toBe(0)
+   })
+ 
+-  test('a paste the pane never echoes does not get an Enter', () => {
++  test('a paste the pane never echoes does not get an Enter and stays queued', () => {
+     installStubs()
+     writeInboxMessage(channelBlock('11753', 'привет'))
+-    const res = runAttach({ TMUX_STUB_NO_ECHO: '1' })
++    const res = runAttach({ TMUX_STUB_NO_ECHO: '1', MULTICHAT_REDELIVER_BASE: '60' })
+     expect(res.code).toBe(0)
+     expect(res.stderr).toContain('refusing to press Enter')
+-    expect(tmuxLog().some((l) => l.includes('Enter'))).toBe(false)
+-    // Pasted once, never re-pasted: the file is marked, not requeued.
+-    expect(queuedJson()).toEqual([])
+-    expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
++    expect(enterCalls()).toBe(0)
++    // Not lost and not marked done: queued for a backed-off retry.
++    expect(queuedJson().length).toBe(1)
++    expect(processedNames()).toEqual([])
+   })
+ 
+   test('two messages from the same chat get distinct fingerprints', () => {
+@@ -270,15 +338,16 @@
+     expect(processed.some((f) => f.startsWith('submit-unconfirmed-'))).toBe(false)
+   })
+ 
+-  test('an unconfirmed Enter marks the file rather than claiming success', () => {
++  test('an unconfirmed Enter keeps the file queued rather than claiming success', () => {
+     installStubs()
+     writeInboxMessage(channelBlock('11754', 'привет'))
+-    // Enter does nothing: the fingerprint stays on the pane and no
++    // Enter does nothing: the fingerprint stays in the composer and no
+     // generation starts — exactly the deaf-TUI state.
+-    const res = runAttach({ TMUX_STUB_ENTER_NOOP: '1' })
++    const res = runAttach({ TMUX_STUB_ENTER_NOOP: '1', MULTICHAT_REDELIVER_BASE: '60' })
+     expect(res.code).toBe(0)
+     expect(res.stderr).toContain('submit not confirmed')
+-    expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
++    expect(queuedJson().length).toBe(1)
++    expect(processedNames()).toEqual([])
+   })
+ 
+   // Patch 0012: swarm tasks POSTed to /hooks/agent land in this inbox too.
+@@ -295,8 +364,7 @@
+     const processed = processedNames()
+     expect(processed.length).toBe(2)
+     expect(processed.some((f) => f.startsWith('submit-unconfirmed-'))).toBe(false)
+-    const enters = tmuxLog().filter((l) => l.startsWith('send-keys') && l.includes('Enter'))
+-    expect(enters.length).toBe(2)
++    expect(enterCalls()).toBe(2)
+   })
+ 
+   test('a swallowed webhook paste is not confirmed by the previous task in the transcript', () => {
+@@ -305,16 +373,13 @@
+     // composer. A fingerprint built from the shared tag/body prefix would
+     // "see" it as the echo of the new paste and press Enter on an empty
+     // composer. delivery_id is unique per POST, so the echo gate holds.
+-    const old = webhookBlock('wh-aaaa-11111111', 'задача один')
+-    const withHistory = `${old}\n${READY_PANE}`
+-    writeFileSync(join(dir, 'pane.txt'), withHistory)
+-    writeFileSync(join(dir, 'ready-pane.txt'), withHistory)
++    writeFileSync(join(dir, 'transcript.txt'), `> ${webhookBlock('wh-aaaa-11111111', 'задача один')}\n`)
+     writeInboxMessage(webhookBlock('wh-aaaa-22222222', 'задача два'))
+-    const res = runAttach({ TMUX_STUB_NO_ECHO: '1' })
++    const res = runAttach({ TMUX_STUB_NO_ECHO: '1', MULTICHAT_REDELIVER_BASE: '60' })
+     expect(res.code).toBe(0)
+     expect(res.stderr).toContain('refusing to press Enter')
+-    expect(tmuxLog().some((l) => l.includes('Enter'))).toBe(false)
+-    expect(processedNames()[0]?.startsWith('submit-unconfirmed-')).toBe(true)
++    expect(enterCalls()).toBe(0)
++    expect(queuedJson().length).toBe(1)
+   })
+ 
+   test('still refuses to start without CHAT_ID', () => {
+@@ -324,3 +389,178 @@
+     expect(res.stderr).toContain('refusing to start')
+   })
+ })
++
++// Patch 0013, defect 1: Claude Code collapses a large paste into
++// `[Pasted text #N +M lines]`. The fingerprint inside it never shows, so
++// "fingerprint absent" and "a placeholder is visible" prove nothing.
++describe('attach mode: collapsed pastes need positive evidence', () => {
++  test('a collapsed swarm task is delivered and confirmed', () => {
++    installStubs()
++    const text = bigWebhookBlock('wh-bbbb-11111111')
++    writeInboxMessage(text)
++    const res = runAttach({ TMUX_STUB_COLLAPSE_LINES: '5' })
++    expect(res.code).toBe(0)
++    expect(queuedJson()).toEqual([])
++    expect(processedNames().length).toBe(1)
++    expect(enterCalls()).toBe(1)
++    // The two pastes concatenate to exactly the original text, and the
++    // anchor keeps the unique id literally visible in the transcript.
++    expect(readOr('pasted-all.txt')).toBe(text)
++    expect(readOr('transcript.txt')).toContain('delivery_id="wh-bbbb-11111111"')
++    expect(readOr('transcript.txt')).toContain('[Pasted text #1 +')
++  })
++
++  test('a collapsed paste whose Enter is swallowed is NOT reported delivered', () => {
++    installStubs()
++    writeInboxMessage(bigWebhookBlock('wh-bbbb-22222222'))
++    const res = runAttach({
++      TMUX_STUB_COLLAPSE_LINES: '5',
++      TMUX_STUB_ENTER_NOOP: '1',
++      MULTICHAT_REDELIVER_BASE: '60',
++    })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('submit not confirmed')
++    expect(queuedJson().length).toBe(1)
++    expect(processedNames()).toEqual([])
++  })
++
++  test('a paste that never landed is not confirmed by a stale placeholder', () => {
++    installStubs()
++    // A placeholder from an older paste already sits in the composer.
++    writeFileSync(join(dir, 'composer.txt'), '[Pasted text #1 +40 lines]')
++    writeInboxMessage(bigWebhookBlock('wh-bbbb-33333333'))
++    const res = runAttach({
++      TMUX_STUB_COLLAPSE_LINES: '5',
++      TMUX_STUB_NO_ECHO: '1',
++      MULTICHAT_REDELIVER_BASE: '60',
++    })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('refusing to press Enter')
++    expect(enterCalls()).toBe(0)
++    expect(queuedJson().length).toBe(1)
++    expect(processedNames()).toEqual([])
++  })
++})
++
++// Patch 0013, defect 2: an unconfirmed submit stays queued and is retried
++// with backoff, in order, never pasted twice; after the last attempt it is
++// dead-lettered with an error log and an owner alert.
++describe('attach mode: redelivery of unconfirmed submits', () => {
++  test('a swallowed Enter is retried with Enter only on the next pass', () => {
++    installStubs()
++    writeInboxMessage(bigWebhookBlock('wh-cccc-11111111'))
++    // SUBMIT_RETRY_MAX=3: the whole first pass hits a deaf composer, the
++    // second pass finds the body still there and only presses Enter.
++    const res = runAttach({
++      TMUX_STUB_COLLAPSE_LINES: '5',
++      TMUX_STUB_ENTER_NOOP_FIRST: '3',
++      TMUX_STUB_ALIVE_CALLS: '2',
++    })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('Enter only')
++    expect(queuedJson()).toEqual([])
++    expect(processedNames().length).toBe(1)
++    // Anchor + rest, pasted exactly once.
++    expect(pasteCalls()).toBe(2)
++    expect(enterCalls()).toBe(4)
++  })
++
++  test('a late submit found in the transcript is not pasted again', () => {
++    installStubs()
++    const text = bigWebhookBlock('wh-cccc-22222222')
++    writeInboxMessage(text)
++    runAttach({ TMUX_STUB_COLLAPSE_LINES: '5', TMUX_STUB_ENTER_NOOP: '1' })
++    expect(queuedJson().length).toBe(1)
++    // The TUI took the message after all, later than we looked.
++    const composer = readOr('composer.txt')
++    writeFileSync(join(dir, 'transcript.txt'), `> ${composer}\n`)
++    writeFileSync(join(dir, 'composer.txt'), '')
++
++    resetLog()
++    const res = runAttach({ TMUX_STUB_COLLAPSE_LINES: '5' })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('already submitted')
++    expect(pasteCalls()).toBe(0)
++    expect(enterCalls()).toBe(0)
++    expect(queuedJson()).toEqual([])
++    expect(processedNames().length).toBe(1)
++  })
++
++  test('a paste that never landed is pasted again exactly once', () => {
++    installStubs()
++    const text = bigWebhookBlock('wh-cccc-33333333')
++    writeInboxMessage(text)
++    runAttach({ TMUX_STUB_COLLAPSE_LINES: '5', TMUX_STUB_NO_ECHO: '1' })
++    expect(queuedJson().length).toBe(1)
++
++    resetLog()
++    writeFileSync(join(dir, 'pasted-all.txt'), '')
++    const res = runAttach({ TMUX_STUB_COLLAPSE_LINES: '5' })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('pasting again')
++    expect(readOr('pasted-all.txt')).toBe(text)
++    expect(enterCalls()).toBe(1)
++    expect(queuedJson()).toEqual([])
++    expect(readOr('transcript.txt').split('delivery_id="wh-cccc-33333333"').length).toBe(2)
++  })
++
++  test('an echoed paste that vanished without trace is never re-pasted', () => {
++    installStubs()
++    writeInboxMessage(bigWebhookBlock('wh-cccc-44444444'))
++    runAttach({ TMUX_STUB_COLLAPSE_LINES: '5', TMUX_STUB_ENTER_NOOP: '1' })
++    // Composer cleared by someone else, nothing in the transcript: we
++    // cannot tell whether it was sent, so a re-paste could duplicate it.
++    writeFileSync(join(dir, 'composer.txt'), '')
++
++    resetLog()
++    const res = runAttach({ TMUX_STUB_COLLAPSE_LINES: '5', MULTICHAT_REDELIVER_BASE: '60' })
++    expect(res.code).toBe(0)
++    expect(res.stderr).toContain('not re-pasting')
++    expect(pasteCalls()).toBe(0)
++    expect(enterCalls()).toBe(0)
++    expect(queuedJson().length).toBe(1)
++  })
++
++  test('after the last attempt the file is dead-lettered, logged and alerted', () => {
++    installStubs()
++    writeInboxMessage(bigWebhookBlock('wh-cccc-55555555'), '1000-dead.json')
++    const res = runAttach({
++      TMUX_STUB_COLLAPSE_LINES: '5',
++      TMUX_STUB_ENTER_NOOP: '1',
++      TMUX_STUB_ALIVE_CALLS: '3',
++      MULTICHAT_REDELIVER_MAX: '2',
++    })
++    expect(res.code).toBe(0)
++    expect(queuedJson()).toEqual([])
++    expect(processedNames()).toEqual([])
++    expect(deadLetters()).toEqual(['1000-dead.json'])
++    expect(res.stderr).toContain('ERROR')
++    expect(res.stderr).toContain('1000-dead.json')
++    const alerts = readOr('alerts.log')
++    expect(alerts).toContain('dm-inbox|')
++    expect(alerts).toContain('1000-dead.json')
++    // Two attempts, one paste (anchor + rest), never a second copy.
++    expect(pasteCalls()).toBe(2)
++    expect(existsSync(join(inboxDir(), '.retry', '1000-dead.json.state'))).toBe(false)
++  })
++
++  test('a pending retry holds back later messages (order kept)', () => {
++    installStubs()
++    writeInboxMessage(bigWebhookBlock('wh-dddd-11111111'), '1000-a.json')
++    writeInboxMessage(webhookBlock('wh-dddd-22222222', 'вторая'), '1001-b.json')
++    const res = runAttach({
++      TMUX_STUB_COLLAPSE_LINES: '5',
++      TMUX_STUB_ENTER_NOOP: '1',
++      TMUX_STUB_ALIVE_CALLS: '3',
++      MULTICHAT_REDELIVER_BASE: '60',
++    })
++    expect(res.code).toBe(0)
++    expect(queuedJson()).toEqual(['1000-a.json', '1001-b.json'])
++    expect(readOr('pasted-all.txt')).not.toContain('wh-dddd-22222222')
++    // The backoff holds: later passes neither press Enter nor count an
++    // attempt before the retry is due.
++    expect(enterCalls()).toBe(3)
++    const state = readFileSync(join(inboxDir(), '.retry', '1000-a.json.state'), 'utf8')
++    expect(state.split(' ')[0]).toBe('1')
++  })
++})
+--- a/plugin/tests/chats/multichat-entrypoint-submit.test.ts
++++ b/plugin/tests/chats/multichat-entrypoint-submit.test.ts
+@@ -219,12 +219,15 @@
+     expect(log.filter((l) => l === 'send-keys -t %1 Enter').length).toBe(3)
+   })
+ 
+-  test('fingerprint vanished counts as submitted (fast turn)', () => {
++  test('fast turn: the prompt echoed into the transcript confirms the submit', () => {
+     installStubTmux()
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+-    // After Enter: no "esc to interrupt" (turn already finished), and the
+-    // composer no longer shows the message.
+-    writeFileSync(join(dir, 'pane-5.txt'), `❯ \nanswer rendered above\n`)
++    // After Enter: no "esc to interrupt" (turn already finished), the
++    // composer is empty and the prompt shows in the transcript above it.
++    writeFileSync(
++      join(dir, 'pane-5.txt'),
++      `> fast turn message goes here ok\nanswer rendered above\n❯ \n`,
++    )
+ 
+     const res = runHelpers(`submit_prompt 'fast turn message goes here ok'`)
+ 
+@@ -234,6 +237,39 @@
+     ).toBe(1)
+   })
+ 
++  // Patch 0013: a collapsed paste never shows the fingerprint, so its
++  // absence after Enter proves nothing. Without a busy footer or the
++  // prompt in the transcript, the submit stays unconfirmed.
++  test('fingerprint merely absent is NOT a confirmed submit', () => {
++    installStubTmux()
++    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
++    writeFileSync(join(dir, 'pane-5.txt'), `❯ \nanswer rendered above\n`)
++
++    const res = runHelpers(`submit_prompt 'fast turn message goes here ok'`)
++
++    expect(res.code).toBe(1)
++    expect(res.stderr).toContain('submit not confirmed')
++    expect(tmuxLog().filter((l) => l.startsWith('paste-buffer')).length).toBe(1)
++  })
++
++  // Patch 0013: a placeholder left over from an older paste must not be
++  // read as the echo of this one.
++  test('stale paste placeholder is not an echo: no Enter, exit 1', () => {
++    installStubTmux()
++    writeFileSync(
++      join(dir, 'pane-1.txt'),
++      `❯ [Pasted text #1 +40 lines]\n⏵⏵ bypass permissions on\n`,
++    )
++
++    const res = runHelpers(`submit_prompt 'a message that never reaches the composer'`, {
++      TMUX_STUB_NO_ECHO: '1',
++    })
++
++    expect(res.code).toBe(1)
++    expect(res.stderr).toContain('refusing to press Enter')
++    expect(tmuxLog().filter((l) => l === 'send-keys -t %1 Enter').length).toBe(0)
++  })
++
+   test('load-buffer failure: exit 1, no paste, no Enter', () => {
+     installStubTmux()
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
+@@ -258,8 +294,11 @@
+     const stuckWhileGenerating = `✻ Reticulating…\n❯ queued message sitting in composer\nesc to interrupt\n`
+     writeFileSync(join(dir, 'pane-1.txt'), READY_PANE.replace('\n', '\nesc to interrupt\n'))
+     writeFileSync(join(dir, 'pane-5.txt'), stuckWhileGenerating)
+-    // Eventually the composer clears (queued submit accepted).
+-    writeFileSync(join(dir, 'pane-7.txt'), `✻ Reticulating…\n❯ \nesc to interrupt\n`)
++    // Eventually the composer clears and the queued prompt shows above it.
++    writeFileSync(
++      join(dir, 'pane-7.txt'),
++      `✻ Reticulating…\n> queued message sitting in composer\n❯ \nesc to interrupt\n`,
++    )
+ 
+     const res = runHelpers(
+       `submit_prompt 'queued message sitting in composer'`,
+@@ -304,7 +343,7 @@
+ })
+ 
+ describe('process_inbox', () => {
+-  test('unconfirmed submit moves file to submit-unconfirmed-, no requeue', () => {
++  test('unconfirmed submit stays queued with a retry record, never marked done', () => {
+     installStubTmux()
+     // Permanently stuck composer → submit_prompt fails.
+     writeFileSync(
+@@ -321,13 +360,18 @@
+ 
+     const res = runHelpers(
+       `INBOX='${inbox}'; PROCESSED='${processed}'; process_inbox`,
++      { MULTICHAT_REDELIVER_BASE: '60' },
+     )
+ 
+     expect(res.code).toBe(0)
+     const ls = spawnSync('ls', [processed], { encoding: 'utf8' })
+-    expect(ls.stdout).toContain('submit-unconfirmed-100-aa.json')
++    expect(ls.stdout).toBe('')
+     const inboxLs = spawnSync('ls', [inbox], { encoding: 'utf8' })
+-    expect(inboxLs.stdout).not.toContain('100-aa.json\n')
++    expect(inboxLs.stdout).toContain('100-aa.json')
++    const state = readFileSync(join(inbox, '.retry', '100-aa.json.state'), 'utf8')
++    // attempts next_at phase placeholder-mark
++    expect(state.split(' ')[0]).toBe('1')
++    expect(state.split(' ')[2]).toBe('pasted')
+   })
+ 
+   test('confirmed submit moves file to .processed/ unprefixed', () => {
+--- a/plugin/tests/webhook/inbox-delivery.test.ts
++++ b/plugin/tests/webhook/inbox-delivery.test.ts
+@@ -8,7 +8,14 @@
+ // verified Enter, and answers 200 only after that commit is durable.
+ 
+ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs'
++import {
++  mkdtempSync,
++  readFileSync,
++  readdirSync,
++  rmSync,
++  utimesSync,
++  writeFileSync,
++} from 'fs'
+ import { tmpdir } from 'os'
+ import { join } from 'path'
+ 
+@@ -16,7 +23,11 @@
+ import { createLogger } from '../../src/log.js'
+ import { ensureStateDirs } from '../../src/state/store.js'
+ import { startWebhookServer, type WebhookServerHandle } from '../../src/webhook/server.js'
+-import { buildDeliveryId } from '../../src/webhook/inbox-delivery.js'
++import {
++  WEBHOOK_DEDUPE_TTL_MS,
++  buildDeliveryId,
++  deliverWebhookToInbox,
++} from '../../src/webhook/inbox-delivery.js'
+ 
+ const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
+ const WEBHOOK_TOKEN = 'wh_test_token_32_chars__________'
+@@ -171,15 +182,80 @@
+     expect(mcp.calls.length).toBe(1)
+   })
+ 
+-  test('every webhook message gets its own delivery_id, even a retried task', async () => {
++  test('a retried POST of the same swarm task is deduped by nonce: 200, one file', async () => {
++    // The worker retries on timeout / 5xx even when the first POST was
++    // committed; a second inbox file would paste the task twice.
+     await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
+-    const a = (await (await post(SWARM_TEXT)).json()) as Record<string, unknown>
+-    const b = (await (await post(SWARM_TEXT)).json()) as Record<string, unknown>
+-    expect(a.delivery_id).not.toBe(b.delivery_id)
++    const ra = await post(SWARM_TEXT)
++    const rb = await post(SWARM_TEXT)
++    expect(ra.status).toBe(200)
++    expect(rb.status).toBe(200)
++    const a = (await ra.json()) as Record<string, unknown>
++    const b = (await rb.json()) as Record<string, unknown>
++    expect(a.duplicate).toBeUndefined()
++    expect(b.status).toBe('accepted')
++    expect(b.duplicate).toBe(true)
++    expect(b.delivery_id).toBe(a.delivery_id)
++    expect(inboxFiles().length).toBe(1)
++  })
++
++  test('dedupe still holds after the first file was consumed by the watcher', async () => {
++    await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
++    await post(SWARM_TEXT)
++    for (const f of inboxFiles()) rmSync(join(inboxDir(), f))
++    const rb = await post(SWARM_TEXT)
++    expect(rb.status).toBe(200)
++    expect(((await rb.json()) as Record<string, unknown>).duplicate).toBe(true)
++    expect(inboxFiles().length).toBe(0)
++  })
++
++  test('different task nonces and nonce-less messages are never deduped', async () => {
++    await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
++    await post(SWARM_TEXT)
++    await post(SWARM_TEXT.replace('0123456789abcdef', 'fedcba9876543210'))
++    const p1 = (await (await post('plain text')).json()) as Record<string, unknown>
++    const p2 = (await (await post('plain text')).json()) as Record<string, unknown>
++    expect(p1.delivery_id).not.toBe(p2.delivery_id)
+     const files = inboxFiles()
+-    expect(files.length).toBe(2)
++    expect(files.length).toBe(4)
+     const ids = files.map((f) => /delivery_id="([^"]+)"/.exec(String(readInbox(f).text))?.[1])
+-    expect(new Set(ids).size).toBe(2)
++    expect(new Set(ids).size).toBe(4)
++  })
++
++  test('a failed commit releases the nonce so the retry is delivered', async () => {
++    const log = createLogger('test')
++    const failing = async (): Promise<string> => {
++      throw new Error('disk full')
++    }
++    await expect(
++      deliverWebhookToInbox({
++        stateDir: inboxRoot,
++        chatId: CHAT_ID,
++        content: SWARM_TEXT,
++        log,
++        writeInbox: failing,
++      }),
++    ).rejects.toThrow('disk full')
++    const r = await deliverWebhookToInbox({ stateDir: inboxRoot, chatId: CHAT_ID, content: SWARM_TEXT, log })
++    expect(r.duplicate).toBeUndefined()
++    expect(inboxFiles().length).toBe(1)
++  })
++
++  test('a nonce marker older than the TTL no longer dedupes', async () => {
++    await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
++    await post(SWARM_TEXT)
++    const seen = join(inboxRoot, 'chats', CHAT_ID, 'webhook-seen')
++    const old = new Date(Date.now() - WEBHOOK_DEDUPE_TTL_MS - 60_000)
++    for (const f of readdirSync(seen)) utimesSync(join(seen, f), old, old)
++    await post(SWARM_TEXT)
++    expect(inboxFiles().length).toBe(2)
++  })
++
++  test('delivery_id is the first channel attribute (fingerprint survives wrapping)', async () => {
++    await start({ dmInboxStateDir: inboxRoot, dmInboxChatIds: [CHAT_ID] })
++    await post(SWARM_TEXT)
++    const text = String(readInbox(inboxFiles()[0]!).text)
++    expect(text).toMatch(/^<channel delivery_id="wh-[^"]+" source="webhook"/)
+   })
+ })
+ 

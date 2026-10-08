@@ -43,23 +43,40 @@ DM_CHAT_IDS="${DM_CHAT_IDS:-${OWNER_CHAT_ID:?OWNER_CHAT_ID unset}}"
 WATCHER="$WORKDIR/src/chats/hooks/multichat-entrypoint.sh"
 WATCHER_LOG="$LOG_DIR/dm-inbox-watcher.log"
 WATCHER_PIDS=""
+# Owner alert for a message the watcher gave up on (dead-lettered).
+ALERT_CMD="$HERE/notify-owner.sh"
+# 1 once dm_inbox_preflight passed; only then is the plugin put in inbox mode.
+DM_INBOX=0
 
 mkdir -p "$LOG_DIR" "$DM_STATE_DIR"
 
 log() { printf '[%s] [run-agent] %s\n' "$(date -Is)" "$*"; }
 
+# dm_chat_list: DM_CHAT_IDS as one id per line; empty and non-numeric dropped.
+dm_chat_list() { printf '%s' "$DM_CHAT_IDS" | tr ', ' '\n\n' | grep -E '^-?[0-9]+$' || true; }
+
+# dm_inbox_preflight: can the watchers run at all? Decided BEFORE the TUI is
+# launched, because the plugin's inbox mode is fixed by its env at launch.
+# Inbox mode without a watcher strands every DM on disk, so on failure the
+# plugin stays on MCP notify delivery (lossy, but visible) and we log why.
+dm_inbox_preflight() {
+  [ -f "$WATCHER" ] || { log "WARNING: watcher missing at $WATCHER - DM inbox mode off"; return 1; }
+  [ -n "$(dm_chat_list)" ] || { log "WARNING: no valid DM chat ids - DM inbox mode off"; return 1; }
+  return 0
+}
+
 start_watchers() {
   [ -f "$WATCHER" ] || { log "WARNING: watcher missing at $WATCHER"; return 1; }
   WATCHER_PIDS=""
   local chat_id pid
-  for chat_id in $(printf '%s' "$DM_CHAT_IDS" | tr ',' ' '); do
-    [ -n "$chat_id" ] || continue
+  for chat_id in $(dm_chat_list); do
     mkdir -p "$DM_STATE_DIR/chats/$chat_id/inbox"
     # Through bash on purpose: upstream ships the file without +x.
     CHAT_ID="$chat_id" \
     MULTICHAT_STATE_DIR="$DM_STATE_DIR" \
     MULTICHAT_WATCH_ONLY=1 \
     MULTICHAT_TARGET_PANE="$SESSION" \
+    MULTICHAT_ALERT_CMD="$ALERT_CMD" \
       bash "$WATCHER" >>"$WATCHER_LOG" 2>&1 &
     pid=$!
     WATCHER_PIDS="$WATCHER_PIDS $pid"
@@ -127,7 +144,10 @@ KEYS_CONF="$(keys_conf)"
 LAUNCH_CMD="set -a; . '$TG_AGENT_CONF'; . '$CHANNEL_CONF'"
 [ -f "$KEYS_CONF" ] && LAUNCH_CMD+="; . '$KEYS_CONF'"
 LAUNCH_CMD+="; set +a"
-LAUNCH_CMD+="; export TELEGRAM_DM_DELIVERY_MODE=inbox TELEGRAM_DM_DELIVERY_STATE_DIR='$DM_STATE_DIR' TELEGRAM_DM_DELIVERY_CHAT_IDS='$DM_CHAT_IDS'"
+if dm_inbox_preflight; then
+  DM_INBOX=1
+  LAUNCH_CMD+="; export TELEGRAM_DM_DELIVERY_MODE=inbox TELEGRAM_DM_DELIVERY_STATE_DIR='$DM_STATE_DIR' TELEGRAM_DM_DELIVERY_CHAT_IDS='$DM_CHAT_IDS'"
+fi
 if [ -f "$AUTH_CONF" ]; then
   LAUNCH_CMD+="; export CLAUDE_CODE_OAUTH_TOKEN=\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' '$AUTH_CONF' | head -1 | tr -d '\"')"
 fi
@@ -182,8 +202,12 @@ if ! port_listening; then
 fi
 
 # 5c. Watchers start after the TUI is up (their readiness gate needs a prompt)
-# and after the webhook (so injected messages are memorized).
-start_watchers || true
+# and after the webhook (so injected messages are memorized). The plugin is
+# already in inbox mode, so a failure here must not leave it running unwatched:
+# exit and let systemd respawn the stack.
+if [ "$DM_INBOX" -eq 1 ]; then
+  start_watchers || { log "FATAL: DM inbox mode on but no watcher started - exiting for respawn"; exit 1; }
+fi
 
 # 6. Monitor loop.
 log "monitoring; exit non-zero on bun / port / tmux loss"
@@ -195,7 +219,7 @@ while true; do
     if [ "$down" -eq 1 ]; then
       log "dm inbox watcher gone — restarting the set"
       for pid in $WATCHER_PIDS; do kill "$pid" 2>/dev/null || true; done
-      start_watchers || WATCHER_PIDS=""
+      start_watchers || { log "FATAL: dm inbox watchers cannot restart - exiting for respawn"; exit 1; }
     fi
   fi
   [ -n "$(bun_pids)" ] || { log "bun process gone — exiting for respawn"; exit 1; }
