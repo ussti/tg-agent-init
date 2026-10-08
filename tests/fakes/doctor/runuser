@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake runuser -u USER -- CMD...: run CMD as the current user.
+echo "runuser $1 $2" >> "${TG_DOCTOR_ROOT:?}/.fake/log"
+shift 3
+exec "$@"

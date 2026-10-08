@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake getent passwd NAME: known only after the fake useradd.
+[ "$1" = passwd ] && [ -e "${TG_DOCTOR_ROOT:?}/.fake/user-$2" ] || exit 2
+echo "$2:x:1500:1500::/home/$2:/bin/bash"

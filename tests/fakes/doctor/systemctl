@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fake systemctl for doctor tests. State under $TG_DOCTOR_ROOT/.fake:
+#   log            every call
+#   inactive       marker: is-active answers "failed" (exit 3)
+#   enabled-<unit> marker: is-enabled succeeds; enable creates it
+#   fail-start     marker: restart/start exit 1
+#   units          printed by list-units
+set -euo pipefail
+F="${TG_DOCTOR_ROOT:?fake systemctl needs TG_DOCTOR_ROOT}/.fake"
+mkdir -p "$F"
+echo "systemctl $*" >> "$F/log"
+quiet=0
+for a in "$@"; do [ "$a" = --quiet ] && quiet=1; done
+say() { [ "$quiet" = 1 ] || echo "$1"; }
+last="${*: -1}"
+case "$1" in
+  is-active)
+    if [ -e "$F/inactive" ]; then say failed; exit 3; fi
+    say active ;;
+  is-enabled)
+    if [ -e "$F/enabled-$last" ]; then say enabled; exit 0; fi
+    say disabled; exit 1 ;;
+  restart | start) [ -e "$F/fail-start" ] && exit 1 ;;
+  enable) touch "$F/enabled-$last" ;;
+  list-units) cat "$F/units" 2> /dev/null || true ;;
+esac
+exit 0

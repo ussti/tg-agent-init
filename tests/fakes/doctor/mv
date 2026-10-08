@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake mv for doctor tests: logs the call to $TG_DOCTOR_ROOT/.fake/log, then runs the real
+# mv. Lets a test prove the sudoers file was moved into place, not written directly.
+set -euo pipefail
+if [ -n "${TG_DOCTOR_ROOT:-}" ] && [ -d "$TG_DOCTOR_ROOT/.fake" ]; then
+  echo "mv $*" >> "$TG_DOCTOR_ROOT/.fake/log"
+fi
+for real in /bin/mv /usr/bin/mv; do
+  [ -x "$real" ] && exec "$real" "$@"
+done
+echo "fake mv: no real mv found" >&2
+exit 127

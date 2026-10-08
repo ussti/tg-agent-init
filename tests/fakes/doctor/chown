@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake chown: tests run unprivileged; record the call only.
+echo "chown $*" >> "${TG_DOCTOR_ROOT:?}/.fake/log"

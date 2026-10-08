@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Fake visudo for doctor tests. "-cf FILE" goes to the real visudo (the syntax check
+# needs no root); markers under $TG_DOCTOR_ROOT/.fake make a check fail:
+#   visudo-cf-fail  -cf fails       visudo-c-fail  the full "-c" check fails
+# A plain "-c" reads the real /etc/sudoers (root only), so it is answered here.
+set -euo pipefail
+F="${TG_DOCTOR_ROOT:?fake visudo needs TG_DOCTOR_ROOT}/.fake"
+echo "visudo $*" >> "$F/log"
+case "${1:-}" in
+  -cf)
+    [ -e "$F/visudo-cf-fail" ] && { echo "fake visudo: syntax error" >&2; exit 1; }
+    for real in /usr/sbin/visudo /sbin/visudo; do
+      [ -x "$real" ] && exec "$real" -cf "$2"
+    done
+    grep -Eqx '[a-z_][a-z0-9_-]* ALL=\(ALL\) NOPASSWD:ALL' "$2" ;;
+  -c)
+    [ -e "$F/visudo-c-fail" ] && { echo "fake visudo: /etc/sudoers.d: parse error" >&2; exit 1; }
+    echo "/etc/sudoers: parsed OK" ;;
+  *) echo "fake visudo: unexpected args $*" >&2; exit 2 ;;
+esac

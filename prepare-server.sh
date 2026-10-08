@@ -113,4 +113,9 @@ cat <<EOF
   cd tg-agent-init && ./install-server.sh
 
 At the end the installer prints two commands for root: type exit, then paste them.
+After the first agent, install the doctor (a second bot with root that fixes agents).
+As root, from a root-owned clone (never from the agent's copy above):
+
+  sudo git clone https://github.com/ussti/tg-agent-init /opt/agent-doctor/kit
+  sudo bash /opt/agent-doctor/kit/install-doctor.sh
 EOF

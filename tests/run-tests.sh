@@ -10,6 +10,7 @@
 #      when GBRAIN_TEST_PYTHON points at a python with the brain's deps)
 #   6. install-fleet end-to-end: two agents, fake brain (token issuer + stateful
 #      MCP servers), fake systemctl
+#   6b. doctor: templates, list-agents, install-doctor end to end on fakes, doctor-hint
 #   7. with --with-plugin: build the patched plugin, bun install, typecheck, bun test
 set -euo pipefail
 
@@ -50,7 +51,7 @@ while IFS= read -r f; do
   check "bash -n ${f#"$KIT"/}" bash -n "$f"
 done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts" "$KIT/core/cron" \
            "$KIT/install-server.sh" "$KIT/install-fleet.sh" "$KIT/update.sh" \
-           "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
+           "$KIT/install-doctor.sh" "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
   "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
@@ -177,6 +178,34 @@ else
   bad "installer exits 0 (log below)"
   tail -20 "$WORK/install.log"
 fi
+check "install-server ends with the doctor step" \
+  grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
+check "install-server: doctor hint is non-fatal" bash -c \
+  "tail -1 '$KIT/install-server.sh' | grep -q 'doctor-hint.sh.*|| true'"
+# The text prepare-server.sh prints at the end: its last cat <<EOF body, expanded with
+# sample values the way the script expands it, so a command elsewhere in the file (a
+# comment, a dead branch) cannot satisfy the checks below.
+prep_final_text() {
+  local body
+  body="$(awk '/^cat <<EOF$/ { buf = ""; on = 1; next }
+    on && /^EOF$/ { last = buf; on = 0; next }
+    on { buf = buf $0 "\n" }
+    END { printf "%s", last }' "$KIT/prepare-server.sh")"
+  [ -n "$body" ] || return 1
+  AGENT_USER=agent DEST=/home/agent/tg-agent-init bash -c "cat <<EOF
+$body
+EOF"
+}
+prep_final_ok() {
+  local text
+  text="$(prep_final_text)" \
+    && grep -qxF '  su - agent' <<< "$text" \
+    && grep -qxF '  sudo git clone https://github.com/ussti/tg-agent-init /opt/agent-doctor/kit' \
+      <<< "$text" \
+    && grep -qxF '  sudo bash /opt/agent-doctor/kit/install-doctor.sh' <<< "$text" \
+    && ! grep -q 'tg-agent-init/install-doctor' <<< "$text"
+}
+check "prepare-server final text: clone and run the root-owned doctor kit" prep_final_ok
 
 check "installer stops on Node.js older than 24 and names prepare-server" bash -c "
   ! out=\$(HOME='$WORK/oldnode' FAKE_NODE_VERSION=v22.1.0 TG_AGENT_NONINTERACTIVE=1 \
@@ -334,7 +363,7 @@ V="$KIT/kit/versions.env"
 vpin() { sed -n "s/^$1=//p" "$V" | tr -d '\r'; }
 check "versions.env pins every third-party item" bash -c \
   "for k in AGENT_BROWSER_VERSION VERCEL_CLI_VERSION GWS_CLI_VERSION CRAWL4AI_VERSION \
-   LAST30DAYS_REPO LAST30DAYS_COMMIT; do grep -Eq \"^\$k=.+\" '$V' || exit 1; done"
+   LAST30DAYS_REPO LAST30DAYS_COMMIT DOCTOR_BOT_TAG; do grep -Eq \"^\$k=.+\" '$V' || exit 1; done"
 check "no stray UPSTREAM pin file" test ! -e "$KIT/kit/skills/research/last30days/UPSTREAM"
 check "no version literals outside versions.env" bash -c \
   "! grep -rnE '(agent-browser@|gws-cli==|crawl4ai==|vercel@)[0-9]' \
@@ -692,6 +721,25 @@ else  # show why: CI keeps only this output
   bad "update: keeps at most 3 backups"
   sed 's/^/    /' "$WORK/keeps3.diag" 2> /dev/null || true
 fi
+# Two updates within one second must not share a backup dir (CI hit this on a fast runner).
+same_second() {
+  local bin="$WORK/fixed-date"
+  mkdir -p "$bin"
+  printf '#!/bin/sh\necho 20990101_000000\n' > "$bin/date"
+  chmod 755 "$bin/date"
+  local i
+  for i in 1 2; do
+    PATH="$bin:$PATH" run_update "$WORK/update-same$i.log" --no-pull --no-restart --ws "$WS" \
+      || { tail -5 "$WORK/update-same$i.log" > "$WORK/same.diag"; return 1; }
+  done
+  [ -d "$WS/backups/update_20990101_000000" ] && [ -d "$WS/backups/update_20990101_000000_2" ]
+}
+if same_second > /dev/null 2>&1; then
+  ok "update: two runs in one second get separate backups"
+else
+  bad "update: two runs in one second get separate backups"
+  sed 's/^/    /' "$WORK/same.diag" 2> /dev/null || true
+fi
 
 echo "== 5. brain build"
 GB_BUILD="$WORK/gbrain-build"
@@ -930,6 +978,10 @@ check "half-present brain refused" refused "$FL/run12.log" "exists but"
 mv "$FL/python.moved" "$GB/.venv/bin/python"
 sed -i 's/^    body = {$/    body = {\n        "agentId": to_agent,/' "$GB/services/swarm_mcp/worker.py"
 check "unpatched brain refused" refused "$FL/run6.log" "lacks patch 0001"
+
+echo "== 6b. doctor"
+# shellcheck source=tests/doctor.test.sh
+source "$KIT/tests/doctor.test.sh"
 
 if [ "$WITH_PLUGIN" = "1" ]; then
   echo "== 7. plugin build + tests"

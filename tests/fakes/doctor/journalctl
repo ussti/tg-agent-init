@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake journalctl: a recognisable line so tests see the journal was printed, plus the
+# httpx line the real package logs at INFO, with the bot token inside the URL.
+echo "journalctl $*" >> "${TG_DOCTOR_ROOT:?}/.fake/log"
+echo "fake journal line"
+env_file="$TG_DOCTOR_ROOT/etc/agent-doctor/env"
+if [ -r "$env_file" ]; then
+  tok="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$env_file" | head -n 1)"
+  echo "httpx INFO HTTP Request: POST https://api.telegram.org/bot$tok/getUpdates \"200 OK\""
+fi

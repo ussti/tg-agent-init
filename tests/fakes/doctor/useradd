@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake useradd: marks the user as existing and makes its home under the fake root.
+set -euo pipefail
+name="${*: -1}"
+[ -e "${TG_DOCTOR_ROOT:?}/.fake/useradd-fail" ] && exit 1
+touch "${TG_DOCTOR_ROOT:?}/.fake/user-$name"
+mkdir -p "$TG_DOCTOR_ROOT/home/$name"
+echo "useradd $*" >> "$TG_DOCTOR_ROOT/.fake/log"

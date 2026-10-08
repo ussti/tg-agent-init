@@ -81,9 +81,17 @@ BUN_BIN="$(command -v bun)"
 export AGENT_HOME AGENT_WS SECRETS_DIR BUN_BIN CLAUDE_BIN
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-BAK="$AGENT_WS/backups/update_$STAMP"
 PLUGIN_ROOT="$AGENT_WS/dashi-plugin"
-mkdir -p "$BAK"
+MAX_BAK_TRIES=99
+mkdir -p "$AGENT_WS/backups"
+# mkdir without -p is atomic: a second run in the same second takes the next free suffix
+BAK="$AGENT_WS/backups/update_$STAMP"
+n=1
+until mkdir "$BAK" 2> /dev/null; do
+  n=$((n + 1))
+  [ "$n" -le "$MAX_BAK_TRIES" ] || die "cannot create a backup dir for $STAMP"
+  BAK="$AGENT_WS/backups/update_${STAMP}_$n"
+done
 say "agent $AGENT_NAME, workspace $AGENT_WS"
 
 # ---------------------------------------------------------------- build (nothing live changes yet)
