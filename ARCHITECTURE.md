@@ -108,14 +108,57 @@ agent B ─ MCP ──▶│                                   gbrain-swarm-work
   to a dashi webhook gets 404. install-fleet refuses a brain that lacks it.
 - `core/rules.md` of each agent gets a block between `team-layer:start/end` markers,
   rendered from `server/templates/team-rules.md`; a re-run replaces it in place.
-- Team state: `~/.config/tg-agent/fleet.conf` (`FLEET_AGENTS`, `FLEET_COORDINATOR`).
+- Plan, then apply. Everything up to `# ===== apply` only reads; every refusal happens
+  there, before the first write or token.
+- Wiring: `server/fleet/brain-wiring.py` classifies each agent's `.mcp.json` as
+  `local`, `remote`, `unknown` or `mixed`. A brain entry is any server with `gbrain` in
+  its name, URL path or command, or a URL on ports 8766-8768; its role comes from the
+  name (`mem`/`memory`, `rec`/`recall`, `sw`/`swarm`), else the port. stdio entries
+  (`mcp-remote`) are placed by the URL in their args. Local means `localhost`,
+  `*.localhost`, any loopback or unspecified address (IPv4 shorthand and v4-mapped
+  included), or the server's hostname / `hostname -I` addresses. A `${VAR}` host or a
+  stdio entry without URL is `unknown`; local plus remote entries, or a remote wiring
+  missing or duplicating a role, is `mixed`. Both stop the run.
+- Remote shared brain: an agent whose three roles all point at another server stays
+  wired as it is: no `.mcp.json` rewrite, no `GBRAIN_BEARER`, no entry in `fleet.env`;
+  only its rules block is rewritten. When every agent is remote, the local brain,
+  tokens, worker drop-in and backup are skipped; leftovers of earlier runs (backup
+  cron, `fleet.env`, the drop-in) and a stale `GBRAIN_BEARER` are only warned about,
+  with backup-first manual steps, never deleted.
+- Broken-wiring signature: a local agent with `GBRAIN_TOKEN` in `channel.conf` that
+  `.mcp.json` never references, or a `.mcp.json?*` backup that classifies as
+  remote/mixed, looks like an earlier run rewired a remote brain. The run stops with
+  restore guidance. `--replace-remote-brain` rewires such agents (and remote ones) to
+  127.0.0.1 and records them in `fleet.conf` as `FLEET_LOCAL_BRAIN`, so later runs
+  skip the check for them. Every `.mcp.json` change leaves
+  `.mcp.json.bak_fleet_<stamp>[_n]` next to it.
+- Roster: `~/.config/tg-agent/fleet-roster` (`name: one-line role`, `#` comments;
+  `--roster FILE` for another path) lists teammates across servers. The rules block lists
+  them in file order, then local agents the file omits; a file role beats the CLAUDE.md
+  first line. A role ending in `(coordinator)` marks the coordinator (one at most);
+  `--coordinator` / `TG_FLEET_COORDINATOR` wins over it. With a remote agent on the
+  server the roster is required and the coordinator must be explicit (flag, env or
+  marker, never `fleet.conf`) and listed in the roster. The coordinator may be any roster
+  name; a remote coordinator with local agents is warned about, because the local
+  worker only knows local webhooks.
+- Team state: `~/.config/tg-agent/fleet.conf` (`FLEET_AGENTS`, `FLEET_COORDINATOR`,
+  `FLEET_LOCAL_BRAIN`).
   `/etc/gbrain/tg-agent-fleet.marker` records that the kit installed the brain; a brain
   without it needs `--use-existing-brain`, which also rotates tokens.
 - Backup: `server/fleet/gbrain-backup.sh`, cron 03:17 as root, `pg_dump -Fc` + vault
   tarball into `/var/backups/gbrain`, 14 days kept. Restore steps are in the script header.
 - Smoke: `server/fleet/mcp-smoke.py` does what Claude Code does on each server
   (`initialize`, keep `Mcp-Session-Id`, `notifications/initialized`) and then calls one
-  read-only tool with the agent's token: `slot_list`, `recent`, `stats`. Upstream runs
+  tool with the agent's token. Upstream serves only `GBRAIN_TOOLS=core`, so the calls are
+  memory `supersede_decision` on a missing decision (passes on the expected "Original
+  decision not found", which comes after the token and write-scope checks; nothing is
+  written), recall `recent {"scope":"30-decisions","limit":1}`, swarm `ack` on a
+  nonexistent task id. A key without write scope on `30-decisions` fails the memory call
+  with a scope error before the lookup; that still proves the key, so it passes with a
+  note. Remote agents are smoked on their own URLs with the bearer variable their
+  `.mcp.json` names; a missing or literal key, an unset variable or an unreadable URL is
+  a failure (the literal is never printed), and so is an agent with zero passing
+  checks. Upstream runs
   the servers in stateful streamable-http mode, so a bare `tools/list` without a session
   gets 400; and the bearer is checked only inside tool handlers, so `tools/list` would
   pass with any token. Any failure stops the run.
@@ -147,6 +190,13 @@ Then the brain build (worker tests when `GBRAIN_TEST_PYTHON` is set) and an inst
 run over two agents against a fake token issuer, fake `systemctl` and
 `tests/fake-brain-mcp.py` (stateful like upstream: 400 without a session, bad token →
 tool error): tokens, `.mcp.json`, rules block, `fleet.env`, drop-in, cron, smoke with
-live and dead tokens, idempotent re-run, rotation, adoption of an existing brain and
-every refusal, including that refusals issue no tokens.
+live and dead tokens (only core tools called), idempotent re-run, rotation, adoption of
+an existing brain and every refusal, including that refusals issue no tokens. Section 6a
+covers a remote shared brain (wiring and key untouched, smoke on the remote URLs through
+`TG_FLEET_TEST_SMOKE_HOST`), an all-remote server (no local brain), the roster file with
+a remote coordinator, and `--replace-remote-brain`. Section 6c covers the classifier
+(loopback forms, own host, variable host, stdio and renamed entries, mixed and partial
+wiring), the broken-wiring signature and its acknowledgement, the required roster and
+coordinator, leftover warnings and the smoke failure modes; refusals there are checked
+to leave the agent files unchanged.
 `--with-plugin` adds the plugin build, typecheck and its test suite.
