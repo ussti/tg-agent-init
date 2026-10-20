@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import http.client
-import json
 import logging
 import os
 import re
@@ -69,10 +68,8 @@ SERVICES: tuple[Service, ...] = (
             "https://console.groq.com/keys", "GET",
             "https://api.groq.com/openai/v1/models"),
     Service("perplexity", "PERPLEXITY_API_KEY", "deep research with sources (paid)",
-            "https://www.perplexity.ai/settings/api", "POST",
-            "https://api.perplexity.ai/chat/completions",
-            body=json.dumps({"model": "sonar", "max_tokens": 1,
-                             "messages": [{"role": "user", "content": "ping"}]})),
+            "https://www.perplexity.ai/settings/api", "GET",
+            "https://api.perplexity.ai/v1/models"),
     Service("cal", "CAL_API_KEY", "Cal.com bookings",
             "https://app.cal.com/settings/developer/api-keys", "GET",
             "https://api.cal.com/v2/me", extra=(("cal-api-version", "2024-08-13"),)),

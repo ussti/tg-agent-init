@@ -1,7 +1,7 @@
 ---
 name: perplexity-research
 description: >
-  Deep web research with citations through the Perplexity Sonar API: one request
+  Deep web research with citations through the Perplexity Agent API: one request
   gathers and cross-checks many sources. Use when the user wants a detailed answer
   with sources, a serious fact-check, or a market / competitor overview.
   Not for quick facts or a single page — use the built-in WebSearch / WebFetch.
@@ -12,35 +12,41 @@ description: >
 # Perplexity Research -- web search with sources
 
 Search the web, fact-check claims, analyze trends, and find best practices using the
-Perplexity Sonar API. The key is read from the environment variable `PERPLEXITY_API_KEY`.
+Perplexity Agent API. The key is read from the environment variable `PERPLEXITY_API_KEY`.
 
 ## Usage
 
 1. Check the key: `[ -n "${PERPLEXITY_API_KEY:-}" ]` (see "No key" below if it is empty).
-2. Query the Sonar API.
+2. Query the Agent API.
 3. Return structured results with the sources it cites.
 
 ## Example
 
 ```bash
-curl -X POST "https://api.perplexity.ai/chat/completions" \
+curl -s -X POST "https://api.perplexity.ai/v1/agent" \
   -H "Authorization: Bearer $PERPLEXITY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "sonar",
-    "messages": [
-      {"role": "user", "content": "What are the best practices for Claude Code agent architecture in 2026?"}
-    ]
+    "preset": "fast",
+    "input": "What are the best practices for Claude Code agent architecture in 2026?"
   }'
 ```
 
+`preset` sets the depth: `fast` for everyday questions, `low` for multi-step
+comparisons, `high` for a deep review (slower and more expensive). The old
+`/chat/completions` endpoint is closed and answers 403.
+
 ## Reading the response
 
-The answer is `choices[0].message.content`; the sources are in the top-level
-`citations` array (list of URLs). Pipe through jq:
+`output` is a list of steps: a `search_results` item with the sources and a
+`message` item with the answer text. Pipe through jq:
 
 ```bash
-... | jq -r '.choices[0].message.content, "", "Sources:", (.citations[]? | "- " + .)'
+... | jq -r '([.output[] | select(.type == "message") | .content[]
+        | select(.type == "output_text") | .text] | join("\n")),
+      "", "Sources:",
+      (.output[] | select(.type == "search_results") | .results[]
+        | "- \(.title) \(.url)")'
 ```
 
 Always list the sources next to the answer.
