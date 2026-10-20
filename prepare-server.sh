@@ -6,9 +6,9 @@
 #   git clone https://github.com/ussti/tg-agent-init.git && cd tg-agent-init && ./prepare-server.sh
 #
 # It installs what install-server.sh needs (system packages, Node.js, browser libraries,
-# bun, Claude Code), creates a separate Unix user for the agent (Claude Code does not run
-# without confirmations as root) and copies this repo into that user's home. Safe to
-# re-run: anything already in place is kept.
+# bun, Claude Code, GitHub CLI), creates a separate Unix user for the agent (Claude Code
+# does not run without confirmations as root) and copies this repo into that user's home.
+# Safe to re-run: anything already in place is kept.
 #
 # Usage: prepare-server.sh [user]     (default user: agent)
 set -euo pipefail
@@ -21,7 +21,7 @@ readonly BUN_URL="https://bun.sh/install"
 readonly CLAUDE_URL="https://claude.ai/install.sh"
 readonly APT_PACKAGES=(
   ca-certificates curl git jq tmux patch cron iproute2 openssl unzip
-  python3 python3-venv pipx
+  python3 python3-venv pipx gh
 )
 
 say() { echo "[prepare] $*"; }

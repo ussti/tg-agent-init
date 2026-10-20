@@ -11,8 +11,8 @@
 ## Что понадобится
 
 - Linux-сервер (Ubuntu 22.04+), пользователь с sudo для systemd-юнитов
-- `bun`, `tmux`, `jq`, `node` 24+ и `npm`, `python3`, `pipx`, `git`, `curl`, `openssl`, `patch`,
-  `crontab`, системные библиотеки для браузеров (всё это ставит `prepare-server.sh`)
+- `bun`, `tmux`, `jq`, `node` 24+ и `npm`, `python3`, `pipx`, `git`, `gh`, `curl`, `openssl`,
+  `patch`, `crontab`, системные библиотеки для браузеров (всё это ставит `prepare-server.sh`)
 - Claude Code (`claude`) и подписка или OAuth-токен
 - Telegram-бот от @BotFather и свой числовой Telegram ID (узнать у @userinfobot)
 - по желанию ключ Groq для расшифровки голосовых сообщений
