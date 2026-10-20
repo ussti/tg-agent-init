@@ -661,6 +661,11 @@ echo "UPDATE-MARKER-USER" >> "$WS/core/USER.md"
 echo "UPDATE_MARKER_KEY=keep" >> "$SEC/keys.env"
 echo "stale" > "$PLUGIN/STALE-FILE"
 echo "local" > "$PLUGIN/.env"
+# Servers added after install (install-fleet, skill packs, by hand) must survive an update;
+# the kit's own dashi-channel entry is always taken from the new build.
+jq '.mcpServers += {"gbrain-recall": {"type": "http", "url": "http://127.0.0.1:1/mcp"},
+    "notebooklm": {"command": "nlm"}} | .mcpServers["dashi-channel"].args = ["stale"]' \
+  "$PLUGIN/.mcp.json" > "$WORK/mcp.tmp" && mv "$WORK/mcp.tmp" "$PLUGIN/.mcp.json"
 user_sum="$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)"
 run_update() {  # run_update LOG ARGS...
   local log="$1"; shift
@@ -673,6 +678,11 @@ else
 fi
 check "update: plugin rebuilt" test ! -e "$PLUGIN/STALE-FILE"
 check "update: local plugin env file carried over" grep -qx local "$PLUGIN/.env"
+check "update: added MCP servers carried over" jq -e \
+  '.mcpServers["gbrain-recall"].url == "http://127.0.0.1:1/mcp" and .mcpServers.notebooklm.command == "nlm"' \
+  "$PLUGIN/.mcp.json"
+check "update: dashi-channel entry comes from the new build" jq -e \
+  '.mcpServers["dashi-channel"].args != ["stale"]' "$PLUGIN/.mcp.json"
 check "update: skills symlink in the new plugin" \
   bash -c "[ \"\$(readlink '$PLUGIN/.claude/skills')\" = ../../../skills ]"
 check "update: plugin settings rendered, no placeholders" bash -c \

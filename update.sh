@@ -112,6 +112,24 @@ python3 "$KIT_DIR/scripts/render-template.py" \
 for f in .env .claude/settings.local.json; do
   [ ! -f "$PLUGIN_ROOT/plugin/$f" ] || cp -p "$PLUGIN_ROOT/plugin/$f" "$NEW/plugin/$f"
 done
+# MCP servers added after install (install-fleet, skill packs, by hand) live in .mcp.json
+# next to the kit's own; keep them, but the kit's entries always come from the new build.
+if [ -f "$PLUGIN_ROOT/plugin/.mcp.json" ]; then
+  python3 - "$PLUGIN_ROOT/plugin/.mcp.json" "$NEW/plugin/.mcp.json" <<'PY' \
+    || die "cannot carry over .mcp.json; the agent keeps running the old version"
+import json
+import pathlib
+import sys
+
+old_path, new_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+old = json.loads(old_path.read_text()).get("mcpServers", {})
+new = json.loads(new_path.read_text()) if new_path.exists() else {}
+servers = new.setdefault("mcpServers", {})
+for name, conf in old.items():
+    servers.setdefault(name, conf)
+new_path.write_text(json.dumps(new, indent=2) + "\n")
+PY
+fi
 
 # ---------------------------------------------------------------- backup
 say "backup: $BAK"
