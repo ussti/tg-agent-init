@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""agent-selfcheck -- prove that the shipped kit works on this server, without the user.
+
+One real call per tool, an installed + enabled check per skill and plugin, a
+write -> read -> delete round-trip for reminders and learnings, and a live
+re-check of every saved key (values are never printed).
+
+Statuses:
+    works          the check passed
+    not connected  a key, login or tool is absent: a setup step, not a failure
+    unchecked      a saved key could not be checked live (service unreachable or no check)
+    broken         the call failed or the key was rejected
+
+Usage:
+    agent-selfcheck            table, one line per check
+    agent-selfcheck --json     the same as JSON, for the /check skill
+
+Exit code: 1 when anything is broken, else 0.
+Environment: AGENT_WS, CLAUDE_CONFIG_DIR, SECRETS_DIR (or AGENT_KEYS_FILE);
+SELFCHECK_URL, SELFCHECK_YT_URL and SELFCHECK_TIMEOUT override the probes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import Callable
+
+LOG = logging.getLogger("agent-selfcheck")
+WORKS = "works"
+NOT_CONNECTED = "not connected"
+UNCHECKED = "unchecked"
+BROKEN = "broken"
+DEFAULT_TIMEOUT_S: float = 30.0
+DEFAULT_URL = "https://example.com"
+DEFAULT_YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+FIX_UPDATE = "re-run update.sh (it reinstalls the kit tools)"
+FIX_GOOGLE = "agent-login google"
+FIX_RESTART = "restart the agent (the session loads keys.env only at start)"
+YT_NAME = "youtube-transcript (yt-dlp)"
+PLUGINS: tuple[str, ...] = (
+    "superpowers@claude-plugins-official",
+    "vercel@claude-plugins-official",
+)
+PROBE_TEXT = "selfcheck probe"
+KEY_STATUS_MAP: dict[str, str] = {
+    "ok": WORKS,
+    "not connected": NOT_CONNECTED,
+    "unverified": UNCHECKED,
+    "invalid": BROKEN,
+    "no credit": BROKEN,
+}
+LIST_LINE = re.compile(r"^(\d+):- \[ \] (.*)$")
+CAPTURED = re.compile(r"captured (EP-\S+)")
+
+
+@dataclass(frozen=True)
+class Check:
+    """One line of the self-check report; never carries a key value.
+
+    Attributes:
+        group: "keys", "tools" or "skills".
+        name: what was checked.
+        status: works / not connected / unchecked / broken.
+        why: the reason, when there is something to say.
+        fix: the command that fixes it, or "".
+    """
+
+    group: str
+    name: str
+    status: str
+    why: str = ""
+    fix: str = ""
+
+
+@dataclass(frozen=True)
+class Env:
+    """Where the agent lives and how long one probe may take."""
+
+    ws: Path
+    config_dir: Path | None
+    timeout: float
+    url: str
+    yt_url: str
+    path: str
+
+
+def load_env() -> Env:
+    """Read the agent environment; ~/.local/bin joins PATH (the kit installs tools there)."""
+    ws = Path(os.environ.get("AGENT_WS") or Path.cwd())
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    local_bin = str(Path.home() / ".local" / "bin")
+    path = os.environ.get("PATH", "")
+    if local_bin not in path.split(os.pathsep):
+        path = os.pathsep.join(p for p in (path, local_bin) if p)
+    try:
+        timeout = float(os.environ.get("SELFCHECK_TIMEOUT") or DEFAULT_TIMEOUT_S)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT_S
+    return Env(ws, Path(config) if config else None, timeout,
+               os.environ.get("SELFCHECK_URL") or DEFAULT_URL,
+               os.environ.get("SELFCHECK_YT_URL") or DEFAULT_YT_URL, path)
+
+
+def run(env: Env, args: list[str], extra: dict[str, str] | None = None
+        ) -> subprocess.CompletedProcess[str]:
+    """Run one probe with the timeout; a timeout comes back as rc 124."""
+    child_env = {**os.environ, "PATH": env.path, **(extra or {})}
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=env.timeout,
+                              env=child_env, check=False)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"timed out after {env.timeout:g}s")
+    except OSError as err:
+        return subprocess.CompletedProcess(args, 127, "", str(err))
+
+
+def failure(proc: subprocess.CompletedProcess[str]) -> str:
+    """Short reason from a failed probe: the last stderr line, else the exit code."""
+    lines = [line for line in (proc.stderr or "").strip().splitlines() if line.strip()]
+    return f"exit {proc.returncode}: {lines[-1].strip()[:160]}" if lines else \
+        f"exit {proc.returncode}"
+
+
+def which(env: Env, name: str) -> str | None:
+    """Find a tool on the probe PATH."""
+    return shutil.which(name, path=env.path)
+
+
+# --- keys ------------------------------------------------------------------
+
+def load_agent_keys() -> ModuleType:
+    """Import the sibling agent-keys script (no .py suffix, so via SourceFileLoader)."""
+    source = Path(__file__).resolve().parent / "agent-keys"
+    loader = importlib.machinery.SourceFileLoader("agent_keys", str(source))
+    spec = importlib.util.spec_from_loader("agent_keys", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agent_keys"] = module  # dataclasses resolves string annotations via it
+    loader.exec_module(module)
+    return module
+
+
+def check_keys() -> list[Check]:
+    """Live re-check of every saved key; no keys file means every key is not connected."""
+    ak = load_agent_keys()
+    try:
+        path = ak.keys_path()
+    except SystemExit:
+        path = None
+    try:
+        keys = ak.load_keys(path) if path and path.is_file() else {}
+    except OSError as exc:
+        return [Check("keys", "keys.env", BROKEN, f"cannot read the keys file ({exc.strerror})",
+                      "agent-keys list")]
+    results = []
+    for r in ak.check_all(keys):
+        check = Check("keys", r.id, KEY_STATUS_MAP.get(r.status, BROKEN), r.note, r.fix)
+        # Skills read the key from this session's environment, not from keys.env.
+        if check.status == WORKS and os.environ.get(r.env) != keys.get(r.env):
+            check = Check("keys", r.id, UNCHECKED,
+                          "key saved, but this session started without it", FIX_RESTART)
+        results.append(check)
+    return results
+
+
+# --- tools -----------------------------------------------------------------
+
+def check_agent_browser(env: Env) -> Check:
+    """Open a page in a throwaway session and read its title."""
+    name = "agent-browser"
+    if not which(env, name):
+        return Check("tools", name, NOT_CONNECTED, "agent-browser is not installed", FIX_UPDATE)
+    session = ["--session", f"selfcheck-{os.getpid()}"]
+    try:
+        opened = run(env, [name, *session, "open", env.url])
+        if opened.returncode != 0:
+            return Check("tools", name, BROKEN, f"open failed, {failure(opened)}", FIX_UPDATE)
+        title = run(env, [name, *session, "eval", "document.title"])
+        if title.returncode != 0 or not title.stdout.strip():
+            return Check("tools", name, BROKEN, f"page did not answer, {failure(title)}",
+                         FIX_UPDATE)
+        return Check("tools", name, WORKS)
+    finally:
+        run(env, [name, *session, "close"])
+
+
+def check_crawl4ai(env: Env) -> Check:
+    """Crawl one page to Markdown."""
+    name = "crawl4ai"
+    if not which(env, "crwl"):
+        return Check("tools", name, NOT_CONNECTED, "crwl is not installed", FIX_UPDATE)
+    proc = run(env, ["crwl", "crawl", env.url, "-o", "md"])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return Check("tools", name, BROKEN, f"crawl failed, {failure(proc)}", FIX_UPDATE)
+    return Check("tools", name, WORKS)
+
+
+def check_yt_dlp(env: Env) -> Check:
+    """Read one YouTube title without downloading (the free path of youtube-transcript)."""
+    name = YT_NAME
+    if not which(env, "yt-dlp"):
+        return Check("tools", name, NOT_CONNECTED, "yt-dlp is not installed", FIX_UPDATE)
+    proc = run(env, ["yt-dlp", "--quiet", "--no-warnings", "--skip-download",
+                     "--print", "title", env.yt_url])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return Check("tools", name, BROKEN,
+                     f"YouTube did not answer (server IP may be blocked), {failure(proc)}",
+                     "agent-keys add transcriptapi")
+    return Check("tools", name, WORKS)
+
+
+def check_markdown_new(env: Env) -> Check:
+    """Fetch one page as Markdown through the skill's own script."""
+    name = "markdown-new"
+    script = env.ws / "skills" / "markdown-new" / "scripts" / "to-markdown.sh"
+    if not script.is_file():
+        return Check("tools", name, NOT_CONNECTED, "the skill script is missing", FIX_UPDATE)
+    proc = run(env, ["bash", str(script), env.url])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return Check("tools", name, BROKEN, f"fetch failed, {failure(proc)}", "")
+    return Check("tools", name, WORKS)
+
+
+def check_gws(env: Env) -> Check:
+    """Google login state (the same check agent-login uses)."""
+    name = "gws (Google)"
+    if not which(env, "gws-cli"):
+        return Check("tools", name, NOT_CONNECTED, "gws-cli is not installed", FIX_UPDATE)
+    proc = run(env, ["gws-cli", "auth", "status"])
+    if proc.returncode != 0:
+        return Check("tools", name, NOT_CONNECTED, "not logged in to Google", FIX_GOOGLE)
+    return Check("tools", name, WORKS)
+
+
+TOOL_CHECKS: tuple[Callable[[Env], Check], ...] = (
+    check_agent_browser, check_crawl4ai, check_markdown_new, check_yt_dlp, check_gws,
+)
+
+
+# --- skills and plugins ----------------------------------------------------
+
+def manifest_skills(ws: Path) -> list[tuple[str, str]]:
+    """(skill, kind) rows of the installed kit manifest."""
+    manifest = ws / "kit" / "manifest.tsv"
+    if not manifest.is_file():
+        return []
+    rows = []
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0] and not parts[0].startswith("#"):
+            rows.append((parts[1], parts[2]))
+    return rows
+
+
+def check_skills(env: Env) -> list[Check]:
+    """Every manifest skill must be visible to Claude as skills/<name>/SKILL.md."""
+    rows = manifest_skills(env.ws)
+    if not rows:
+        return [Check("skills", "kit", NOT_CONNECTED, "no kit manifest in the workspace",
+                      FIX_UPDATE)]
+    checks = []
+    for skill, kind in rows:
+        link = env.ws / "skills" / skill
+        if not (link / "SKILL.md").is_file():
+            checks.append(Check("skills", skill, BROKEN, "skills/<name>/SKILL.md is missing",
+                                FIX_UPDATE))
+        elif kind == "upstream" and "vendor" not in link.resolve().parts:
+            checks.append(Check("skills", skill, NOT_CONNECTED,
+                                "only the stub is installed, the download did not finish",
+                                FIX_UPDATE))
+        else:
+            checks.append(Check("skills", skill, WORKS))
+    return checks
+
+
+def read_json(path: Path) -> dict[str, object]:
+    """A JSON object from a file, or {} when it is absent or unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def check_plugins(env: Env) -> list[Check]:
+    """Each kit plugin is installed and not switched off in enabledPlugins."""
+    if env.config_dir is None:
+        return [Check("skills", p.split("@")[0], NOT_CONNECTED, "CLAUDE_CONFIG_DIR is not set",
+                      FIX_UPDATE) for p in PLUGINS]
+    installed = read_json(env.config_dir / "plugins" / "installed_plugins.json").get("plugins")
+    installed = installed if isinstance(installed, dict) else {}
+    enabled: dict[str, object] = {}
+    for settings in (env.config_dir / "settings.json", env.ws / "settings.json"):
+        value = read_json(settings).get("enabledPlugins")
+        if isinstance(value, dict):
+            enabled.update(value)
+    checks = []
+    for plugin in PLUGINS:
+        name = plugin.split("@")[0]
+        if not installed.get(plugin):
+            checks.append(Check("skills", name, NOT_CONNECTED, "plugin is not installed",
+                                FIX_UPDATE))
+        elif enabled.get(plugin) is False:
+            checks.append(Check("skills", name, BROKEN, "plugin is installed but switched off",
+                                f"claude plugin enable {plugin}"))
+        else:
+            checks.append(Check("skills", name, WORKS))
+    return checks
+
+
+def check_reminders(env: Env) -> Check:
+    """add -> list -> done on a throwaway reminders file."""
+    name = "quick-reminders round-trip"
+    script = env.ws / "skills" / "quick-reminders" / "scripts" / "reminders.sh"
+    if not script.is_file():
+        return Check("skills", name, BROKEN, "reminders.sh is missing", FIX_UPDATE)
+    with tempfile.TemporaryDirectory(prefix="selfcheck-") as tmp:
+        extra = {"REMINDERS_FILE": str(Path(tmp) / "reminders.md")}
+        added = run(env, ["bash", str(script), "add", PROBE_TEXT], extra)
+        listed = run(env, ["bash", str(script), "list"], extra)
+        line = next((m.group(1) for m in map(LIST_LINE.match, listed.stdout.splitlines())
+                     if m and m.group(2).startswith(PROBE_TEXT)), None)
+        if added.returncode != 0 or line is None:
+            return Check("skills", name, BROKEN, "the reminder was not saved", "")
+        done = run(env, ["bash", str(script), "done", line], extra)
+        after = run(env, ["bash", str(script), "list"], extra)
+        if done.returncode != 0 or PROBE_TEXT in after.stdout:
+            return Check("skills", name, BROKEN, "the reminder could not be closed", "")
+    return Check("skills", name, WORKS)
+
+
+def check_learnings(env: Env) -> Check:
+    """capture -> score -> archive on throwaway learnings files."""
+    name = "learnings round-trip"
+    engine = env.ws / "scripts" / "learnings-engine.mjs"
+    if not engine.is_file():
+        return Check("skills", name, BROKEN, "learnings-engine.mjs is missing", FIX_UPDATE)
+    if not which(env, "node"):
+        return Check("skills", name, NOT_CONNECTED, "node is not installed", FIX_UPDATE)
+    with tempfile.TemporaryDirectory(prefix="selfcheck-") as tmp:
+        extra = {"LEARNINGS_EPISODES": str(Path(tmp) / "episodes.jsonl"),
+                 "LEARNINGS_FILE": str(Path(tmp) / "LEARNINGS.md")}
+        payload = json.dumps({"context": "selfcheck", "rule": PROBE_TEXT, "merge": False})
+        child_env = {**os.environ, "PATH": env.path, **extra}
+        try:
+            captured = subprocess.run(["node", str(engine), "capture"], input=payload,
+                                      capture_output=True, text=True, timeout=env.timeout,
+                                      env=child_env, check=False)
+        except (subprocess.TimeoutExpired, OSError) as err:
+            return Check("skills", name, BROKEN, f"capture failed: {err}", "")
+        match = CAPTURED.search(captured.stdout)
+        if captured.returncode != 0 or not match:
+            return Check("skills", name, BROKEN, f"capture failed, {failure(captured)}", "")
+        episode = match.group(1)
+        scored = run(env, ["node", str(engine), "score"], extra)
+        if episode not in scored.stdout:
+            return Check("skills", name, BROKEN, "the captured lesson was not read back", "")
+        archived = run(env, ["node", str(engine), "archive", episode], extra)
+        after = run(env, ["node", str(engine), "score"], extra)
+        if archived.returncode != 0 or episode in after.stdout:
+            return Check("skills", name, BROKEN, "the lesson could not be archived", "")
+    return Check("skills", name, WORKS)
+
+
+# --- report ----------------------------------------------------------------
+
+def run_all(env: Env) -> list[Check]:
+    """Every check, in report order: keys, tools, skills."""
+    results = check_keys()
+    paid_transcripts = any(r.name == "transcriptapi" and r.status == WORKS for r in results)
+    for probe in TOOL_CHECKS:
+        check = probe(env)
+        # A blocked server IP is not a failure when the paid transcript key covers YouTube.
+        if check.name == YT_NAME and check.status == BROKEN and paid_transcripts:
+            check = Check("tools", YT_NAME, UNCHECKED,
+                          f"{check.why}; youtube-transcript uses transcriptapi instead")
+        results.append(check)
+    results += check_skills(env) + check_plugins(env)
+    results += [check_reminders(env), check_learnings(env)]
+    return results
+
+
+def render(results: list[Check]) -> str:
+    """One line per check: group, name, status, why, fix."""
+    lines = []
+    for r in results:
+        tail = "; ".join(part for part in (r.why, r.fix and f"fix: {r.fix}") if part)
+        lines.append(f"{r.group:7} {r.name:28} {r.status:14} {tail}".rstrip())
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point; exit 1 when anything is broken."""
+    logging.basicConfig(level=logging.WARNING, format="agent-selfcheck: %(message)s")
+    parser = argparse.ArgumentParser(prog="agent-selfcheck", description=__doc__.splitlines()[0])
+    parser.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    args = parser.parse_args(argv)
+    results = run_all(load_env())
+    if args.json:
+        print(json.dumps([asdict(r) for r in results], ensure_ascii=False, indent=1))
+    else:
+        print(render(results))
+    return 1 if any(r.status == BROKEN for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -8,6 +8,7 @@ Usage:
     agent-keys setup            walk through every service, Enter skips
     agent-keys add <service>    add or replace one key
     agent-keys list             which keys are set (never shows values)
+    agent-keys check [--json]   live re-check of every saved key (never shows values)
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import http.client
+import json
 import logging
 import os
 import re
@@ -22,7 +24,8 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 LOG = logging.getLogger("agent-keys")
@@ -32,6 +35,9 @@ SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/+=-]+$")
 NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 LINE = re.compile(r'^([A-Z][A-Z0-9_]*)="([A-Za-z0-9._:/+=-]*)"$')
 REJECT_CODES: frozenset[int] = frozenset({401, 403})
+NOT_CONNECTED = "not connected"
+NO_CREDIT = "no credit"
+BROKEN_STATUSES: frozenset[str] = frozenset({"invalid", NO_CREDIT})
 
 
 @dataclass(frozen=True)
@@ -228,6 +234,54 @@ def render_list(path: Path) -> str:
                      for s in SERVICES)
 
 
+@dataclass(frozen=True)
+class KeyStatus:
+    """Result of re-checking one service's saved key; never carries the value.
+
+    Attributes:
+        id: service id.
+        env: environment variable of the key.
+        status: "ok", "not connected", "invalid", "no credit" or "unverified".
+        note: why, when there is something to say.
+        fix: the command that fixes it, or "".
+    """
+
+    id: str
+    env: str
+    status: str
+    note: str
+    fix: str
+
+
+def check_one(service: Service, value: str, timeout: float = TIMEOUT_S) -> KeyStatus:
+    """Re-check one saved key; an absent key is "not connected", not a failure."""
+    fix = f"agent-keys add {service.id}"
+    if not value:
+        return KeyStatus(service.id, service.env, NOT_CONNECTED, "no key saved", fix)
+    status, note = check(service, value, timeout)
+    if status == "ok" and note == CODE_NOTES[402]:
+        status = NO_CREDIT
+    if status == NO_CREDIT:
+        fix = f"top up the {service.id} account"
+    return KeyStatus(service.id, service.env, status, note,
+                     fix if status in BROKEN_STATUSES else "")
+
+
+def check_all(keys: dict[str, str], timeout: float = TIMEOUT_S) -> list[KeyStatus]:
+    """Re-check every service in parallel, in SERVICES order."""
+    with ThreadPoolExecutor(max_workers=len(SERVICES)) as pool:
+        return list(pool.map(lambda s: check_one(s, keys.get(s.env, ""), timeout), SERVICES))
+
+
+def render_check(results: list[KeyStatus]) -> str:
+    """One line per service: status, note, fix. Never prints values."""
+    lines = []
+    for r in results:
+        tail = "; ".join(part for part in (r.note, r.fix and f"fix: {r.fix}") if part)
+        lines.append(f"{r.id:15} {r.status:14} {tail}".rstrip())
+    return "\n".join(lines)
+
+
 def ask_one(service: Service, path: Path) -> None:
     """Prompt for one key (hidden), check it, save it. Enter skips."""
     current = load_keys(path).get(service.env)
@@ -266,11 +320,20 @@ def main(argv: list[str] | None = None) -> int:
     add = sub.add_parser("add")
     add.add_argument("service", choices=[s.id for s in SERVICES])
     sub.add_parser("list")
+    check_cmd = sub.add_parser("check")
+    check_cmd.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args(argv)
     path = keys_path()
     if args.cmd == "list":
         print(render_list(path))
         return 0
+    if args.cmd == "check":
+        results = check_all(load_keys(path))
+        if args.json:
+            print(json.dumps([asdict(r) for r in results], ensure_ascii=False))
+        else:
+            print(render_check(results))
+        return 1 if any(r.status in BROKEN_STATUSES for r in results) else 0
     targets = SERVICES if args.cmd == "setup" else [s for s in SERVICES if s.id == args.service]
     try:
         for service in targets:

@@ -16,6 +16,7 @@ stays inert and says what to set; nothing else breaks. Every key and login is op
 | learnings | score mistakes, promote repeated lessons to rules | none | |
 | quick-reminders | one-off reminders in the agent's workspace | none | |
 | onboard | first-run questions: profile, goals, style, services | none | |
+| check | /check: proves keys, tools, skills and plugins work (`agent-selfcheck`) | none | |
 
 ### Research
 
