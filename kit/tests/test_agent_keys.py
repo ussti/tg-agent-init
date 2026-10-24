@@ -242,5 +242,79 @@ class ListTest(unittest.TestCase):
         self.assertNotIn("gsk_secret_value", out)
 
 
+class CheckTest(unittest.TestCase):
+    """agent-keys check: live re-check of saved keys against a local server."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        import dataclasses
+        from unittest import mock
+        local = tuple(dataclasses.replace(s, check_url=f"{self.base}/{s.id}") if s.method else s
+                      for s in ak.SERVICES)
+        patcher = mock.patch.object(ak, "SERVICES", local)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def by_id(self, results: list) -> dict:
+        return {r.id: r for r in results}
+
+    def test_no_keys_means_not_connected_not_failure(self) -> None:
+        results = ak.check_all({})
+        self.assertEqual({r.status for r in results}, {"not connected"})
+        self.assertEqual(self.by_id(results)["groq"].fix, "agent-keys add groq")
+
+    def test_statuses(self) -> None:
+        from unittest import mock
+        groq = next(s for s in ak.SERVICES if s.id == "groq")
+        paid = mock.patch.object(ak, "SERVICES", tuple(
+            ak.Service(s.id, s.env, s.label, s.url, s.method, f"{self.base}/c402")
+            if s.id == "perplexity" else s for s in ak.SERVICES))
+        with paid:
+            r = self.by_id(ak.check_all({"GROQ_API_KEY": "good1", "CAL_API_KEY": "wrong",
+                                         "PERPLEXITY_API_KEY": "good2", "JINA_API_KEY": "j"}))
+        self.assertEqual(r["groq"].status, "ok")
+        self.assertEqual(r["groq"].fix, "")
+        self.assertEqual(r["cal"].status, "invalid")
+        self.assertEqual(r["cal"].fix, "agent-keys add cal")
+        self.assertEqual(r["perplexity"].status, "no credit")
+        self.assertEqual(r["perplexity"].fix, "top up the perplexity account")
+        self.assertEqual(r["jina"].status, "unverified")
+        self.assertEqual(r["brave"].status, "not connected")
+        self.assertTrue(groq.method)
+
+    def run_main(self, keys: dict, *args: str) -> tuple[int, str]:
+        import io
+        from unittest import mock
+        path = Path(tempfile.mkdtemp()) / "keys.env"
+        for name, value in keys.items():
+            ak.save_key(path, name, value)
+        with mock.patch.dict(os.environ, {"AGENT_KEYS_FILE": str(path)}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = ak.main(["check", *args])
+        return code, out.getvalue()
+
+    def test_main_never_prints_values_and_exit_code(self) -> None:
+        import json
+        code, out = self.run_main({"GROQ_API_KEY": "good_secret_1", "CAL_API_KEY": "bad_secret_2"})
+        self.assertEqual(code, 1)
+        self.assertNotIn("secret", out)
+        self.assertIn("agent-keys add cal", out)
+        code, out = self.run_main({"GROQ_API_KEY": "good_secret_1"}, "--json")
+        self.assertEqual(code, 0)
+        self.assertNotIn("secret", out)
+        rows = {row["id"]: row for row in json.loads(out)}
+        self.assertEqual(rows["groq"]["status"], "ok")
+        self.assertEqual(rows["cal"]["status"], "not connected")
+
+
 if __name__ == "__main__":
     unittest.main()

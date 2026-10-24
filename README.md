@@ -89,8 +89,13 @@ Telegram ID, порт вебхука и токен бота (ввод скрыт
 # установщик в конце печатает эти команды с правильными SECRETS_DIR и AGENT_NAME
 SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys list
 SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys add <сервис>
+SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys check
 ~/agents/<имя>/.claude/kit/bin/agent-login google         # или github, vercel, status
 ```
+
+`agent-keys check` заново проверяет все сохранённые ключи живым запросом и никогда не
+показывает их значения. Полную самопроверку набора (ключи, инструменты, навыки, плагины)
+агент делает сам по команде `/check` в чате, она же идёт последним шагом `/onboard`.
 
 Входы gh, vercel и gws-cli хранятся в домашней папке пользователя Unix, поэтому их разделяют
 все агенты этого пользователя.

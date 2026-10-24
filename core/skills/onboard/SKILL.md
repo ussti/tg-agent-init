@@ -48,7 +48,11 @@ The script finds the workspace itself (the folder with `core/USER.md`). If it ca
    the keys folder from TOOLS.md. Exit 3 from `fill` means the same.
 6. When the list is done, show the operator everything written, grouped by file, and ask
    whether to correct anything. Corrections go through a direct edit of those same lines only.
-7. Finish with one line: onboarding done, the new profile is loaded from the next session
+7. Self-check, step «Проверим, что я умею» (in the operator's language). Offer it in one
+   message; the operator may skip it. On yes, follow `$AGENT_WS/skills/check/SKILL.md`: the
+   silent machine check with one summary, then the live tries one at a time. On skip, say that
+   `/check` runs it any time.
+8. Finish with one line: onboarding done, the new profile is loaded from the next session
    (USER.md, CLAUDE.md and rules.md are read at session start).
 
 ## Rules
