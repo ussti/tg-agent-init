@@ -129,8 +129,10 @@ agent B ─ MCP ──▶│                                   gbrain-swarm-work
   and proves the submit. An unconfirmed submit is retried with backoff and ends in
   `inbox/.dead-letter/` with an owner alert, so a task is no longer lost silently when
   the session is busy or restarting.
-- Known limit: if the watcher is killed after the short anchor of a split message was
-  pasted but before the rest, the retry presses Enter and submits only the anchor.
+- Known limits: if the watcher is killed after the short anchor of a split message was
+  pasted but before the rest, the retry presses Enter and submits only the anchor. If the
+  composer is never found (a modal that stays open), delivery is deferred without an
+  attempt count or an alert; the watcher log shows `injection deferred`.
 
 ## Build
 

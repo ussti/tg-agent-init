@@ -41,14 +41,22 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
   не вставит текст второй раз. Когда ничего не вставлено (код 2),
   прежняя запись восстанавливается.
 - В запись добавлен пятый столбец: токен панели tmux (pane_id.pane_pid).
-  Если TUI перезапустился и токен другой, запись «pasted» понижается
-  до «unechoed», и текст вставляется заново.
+  Если TUI перезапустился и токен другой, запись любой фазы становится
+  «lost»: в новом композере ничего нашего нет, чужой плейсхолдер Enter
+  не получает, текст вставляется заново. Пустой токен с любой стороны
+  считается «неизвестно», и фаза остаётся прежней.
 - Повтор жмёт Enter только на своём плейсхолдере. Для разрезанного
   сообщения без отпечатка в композере Enter не нажимается. Для
   неразрезанного нужен рост счётчика плейсхолдеров относительно метки.
 
-Известное ограничение: если наблюдателя убили между якорем и
-остатком, повтор нажмёт Enter и отправит только якорь.
+- Метку nonce webhook удаляет только пока в ней всё ещё его запись
+  (перехват устаревшей метки и откат после ошибки записи). Чужой
+  захват больше не стирается.
+
+Известные ограничения: если наблюдателя убили между якорем и
+остатком, повтор нажмёт Enter и отправит только якорь. Если композер
+не находится совсем, отправка откладывается без счётчика попыток и
+без алерта; это видно в логе наблюдателя («injection deferred»).
 
 --- a/plugin/src/chats/hooks/multichat-entrypoint.sh
 +++ b/plugin/src/chats/hooks/multichat-entrypoint.sh
@@ -436,7 +444,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
          echo_seen=1
          break
        fi
-@@ -267,44 +488,118 @@
+@@ -267,44 +488,125 @@
      done
      if [[ "$echo_seen" == "0" ]]; then
        # The composer was up a moment ago and the paste reported success,
@@ -520,6 +528,13 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +  fp="$(prompt_fingerprint "$msg_text")"
 +  SUBMIT_PHASE="$phase"
 +  SUBMIT_PH_MARK="$ph_mark"
++  # "lost" = recorded in another TUI: nothing in this composer is ours.
++  local lost=0
++  if [[ "$phase" == "lost" ]]; then
++    lost=1
++    phase="unechoed"
++    SUBMIT_PHASE="unechoed"
++  fi
 +
 +  wait_claude_ready || return 2
 +  take_snapshot "$fp"
@@ -550,7 +565,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +  # absent any placeholder there belongs to someone else: never Enter it.
 +  split_anchor "$msg_text" "$fp"
 +  local ours=0
-+  if [[ -z "$SPLIT_ANCHOR" ]] && (( SNAP_PH_COMPOSER > ph_mark )); then
++  if (( ! lost )) && [[ -z "$SPLIT_ANCHOR" ]] && (( SNAP_PH_COMPOSER > ph_mark )); then
 +    ours=1
 +  fi
 +
@@ -581,7 +596,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
  }
  
  # Parse one JSON file into a single prompt string. Reads the file path
-@@ -386,11 +681,34 @@
+@@ -386,11 +688,34 @@
  PYEOF
  }
  
@@ -613,11 +628,11 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
  # plus the leading-dot exclusion handled by the *.json glob keeps us safe.
  process_inbox() {
 -  local f msg_text rc
-+  local f msg_text rc st attempts next_at phase ph_mark tok prior now delay
++  local f msg_text rc st attempts next_at phase ph_mark tok cur_tok prior now delay
    while IFS= read -r -d '' f; do
      [[ -f "$f" ]] || continue
      rc=0
-@@ -401,29 +719,84 @@
+@@ -401,29 +726,88 @@
        # triage under a distinct prefix.
        mv "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
      elif [[ "$rc" -eq 0 && -n "$msg_text" ]]; then
@@ -627,6 +642,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +      phase="unechoed"
 +      ph_mark=0
 +      tok=""
++      cur_tok=""
 +      prior=""
 +      if [[ -f "$st" ]]; then
 +        prior="$(cat "$st")"
@@ -635,11 +651,14 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +        [[ "$next_at" =~ ^[0-9]+$ ]] || next_at=0
 +        [[ "$ph_mark" =~ ^[0-9]+$ ]] || ph_mark=0
 +        [[ "$phase" == "pasted" ]] || phase="unechoed"
-+        # "pasted" only binds the TUI it was seen in. A restarted session
-+        # has an empty composer, so a lost paste must be pasted again.
-+        if [[ "$phase" == "pasted" && "$tok" != "$(pane_token)" ]]; then
-+          echo "multichat-entrypoint: $(basename "$f"): pasted into another session (${tok:-unknown}) — treating as not pasted" >&2
-+          phase="unechoed"
++        # The record only binds the TUI it was written in. A restarted
++        # session lost whatever we pasted, and a placeholder there belongs
++        # to someone else: paste again, never Enter. An unknown token on
++        # either side is not proof of a restart.
++        cur_tok="$(pane_token)"
++        if [[ -n "$tok" && -n "$cur_tok" && "$tok" != "$cur_tok" ]]; then
++          echo "multichat-entrypoint: $(basename "$f"): recorded in another session (${tok}) — pasting again" >&2
++          phase="lost"
 +          ph_mark=0
 +        fi
 +      fi
@@ -709,7 +728,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
      fi
    done < <(find "$INBOX" -maxdepth 1 -name '*.json' -print0 | sort -z)
  }
-@@ -481,9 +854,12 @@
+@@ -481,9 +865,12 @@
  
    if command -v inotifywait >/dev/null 2>&1; then
      while target_alive; do
@@ -725,7 +744,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
        sleep 0.1  # debounce — rename() is atomic but bursts can stack
        target_alive || break
        process_inbox
-@@ -525,9 +901,12 @@
+@@ -525,9 +912,12 @@
    # Prefer inotifywait when available; fall back to polling.
    if command -v inotifywait >/dev/null 2>&1; then
      # --include filters to *.json so we ignore .tmp writes mid-rename.
@@ -815,7 +834,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
  }
  
  /** True when webhook messages for `chatId` must go through the file inbox. */
-@@ -67,6 +111,91 @@
+@@ -67,6 +111,101 @@
  }
  
  /**
@@ -829,6 +848,16 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +    .replace(/[^A-Za-z0-9_-]/g, '')
 +    .slice(0, MAX_NONCE_CHARS)
 +  return nonce.length > 0 ? nonce : undefined
++}
++
++/**
++ * Remove `marker` only while it still holds `expected`, so a claim another
++ * request took over is left alone. Read-then-unlink is not atomic; the
++ * remaining window can only cost a duplicate, never a loss.
++ */
++async function unlinkIfUnchanged(marker: string, expected: string): Promise<void> {
++  const current = (await readFile(marker, 'utf8').catch(() => undefined))?.trim()
++  if (current === expected) await unlink(marker).catch(() => undefined)
 +}
 +
 +/**
@@ -867,7 +896,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +      if (pending) throw new WebhookNoncePendingError(nonce)
 +      return prior
 +    }
-+    await unlink(marker).catch(() => undefined)
++    await unlinkIfUnchanged(marker, prior)
 +  }
 +  // Lost the re-claim race to a concurrent request: that one is in flight.
 +  throw new WebhookNoncePendingError(nonce)
@@ -907,7 +936,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
   * Build a unique, fingerprint-safe delivery id for one webhook message.
   *
   * Shape: `wh-<nonce>-<8 hex>` when the message carries a swarm task id,
-@@ -75,12 +204,8 @@
+@@ -75,12 +214,8 @@
   * `>` that end the watcher's fingerprint match.
   */
  export function buildDeliveryId(message: string): string {
@@ -922,7 +951,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
    return `wh-${randomBytes(FALLBACK_BYTES).toString('hex')}`
  }
  
-@@ -95,14 +220,32 @@
+@@ -95,14 +230,32 @@
    opts: WebhookInboxOptions,
  ): Promise<WebhookInboxResult> {
    const { stateDir, chatId, content, agentId, log } = opts
@@ -959,7 +988,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
    const message: InboundMessage = {
      text: renderChannelBlock(content, meta),
      chat_id: chatId,
-@@ -111,7 +254,25 @@
+@@ -111,7 +264,27 @@
      user: '',
      timestamp: new Date().toISOString(),
    }
@@ -969,7 +998,9 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +    path = await write(chatId, message, stateDir, { durable: true })
 +  } catch (err) {
 +    // Release the claim: the sender gets a 503 and its retry must land.
-+    if (nonce !== undefined) await unlink(join(seenDir, nonce)).catch(() => undefined)
++    if (nonce !== undefined) {
++      await unlinkIfUnchanged(join(seenDir, nonce), PENDING_PREFIX + deliveryId)
++    }
 +    throw err
 +  }
 +  if (nonce !== undefined) {
@@ -1677,7 +1708,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
    })
  
    test('confirmed submit moves file to .processed/ unprefixed', () => {
-@@ -352,3 +412,269 @@
+@@ -352,3 +412,296 @@
      expect(ls.stdout).not.toContain('submit-unconfirmed-200-bb.json')
    })
  })
@@ -1857,16 +1888,27 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +    expect(ls(box.processed)).toContain('330-cf.json')
 +  })
 +
-+  test('finding 3: a legacy record without a pane token is not trusted as pasted', () => {
++  test('re-review 4: a record without a pane token keeps "pasted" — unknown is not a mismatch', () => {
 +    installStubTmux()
 +    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
-+    writeFileSync(join(dir, 'pane-after-enter.txt'), GENERATING_PANE)
 +    const box = setupInbox('340-cg.json', 'message from before the upgrade', '1 0 pasted 0\n')
 +
 +    runHelpers(box.run, RETRY_ENV)
 +
-+    expect(tmuxLog().filter((l) => l.startsWith('paste-buffer')).length).toBe(1)
-+    expect(ls(box.processed)).toContain('340-cg.json')
++    expect(tmuxLog().filter((l) => l.startsWith('paste-buffer')).length).toBe(0)
++    expect(readOr(box.st).trim().split(' ')[2]).toBe('pasted')
++  })
++
++  test('re-review 4: an unreadable current pane token keeps "pasted"', () => {
++    installStubTmux()
++    writeFileSync(join(dir, 'pane-1.txt'), READY_PANE)
++    writeFileSync(join(dir, 'pane-token'), '')
++    const box = setupInbox('345-ck.json', 'message in a pane we cannot name', '1 0 pasted 0 %1.100\n')
++
++    runHelpers(box.run, RETRY_ENV)
++
++    expect(tmuxLog().filter((l) => l.startsWith('paste-buffer')).length).toBe(0)
++    expect(readOr(box.st).trim().split(' ')[2]).toBe('pasted')
 +  })
 +
 +  test('finding 3: same TUI, pasted, no trace — still refuses to re-paste', () => {
@@ -1946,6 +1988,22 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +    expect(tmuxLog().filter((l) => l.startsWith('paste-buffer')).length).toBe(0)
 +    expect(tmuxLog().filter((l) => l === 'send-keys -t %1 Enter').length).toBe(1)
 +  })
++
++  for (const phase of ['pasted', 'unechoed']) {
++    test(`re-review 1: ${phase} record from another TUI never Enters a foreign placeholder`, () => {
++      installStubTmux()
++      writeFileSync(join(dir, 'pane-1.txt'), PLACEHOLDER_PANE)
++      const box = setupInbox('360-cl.json', 'message lost with the old session', `1 0 ${phase} 0 %9.999\n`)
++
++      runHelpers(box.run, RETRY_ENV)
++
++      const log = tmuxLog()
++      const firstPaste = log.findIndex((l) => l.startsWith('paste-buffer'))
++      const firstEnter = log.findIndex((l) => l.startsWith('send-keys'))
++      expect(firstPaste).toBeGreaterThanOrEqual(0)
++      expect(firstEnter === -1 || firstEnter > firstPaste).toBe(true)
++    })
++  }
 +})
 --- a/plugin/tests/webhook/inbox-delivery.test.ts
 +++ b/plugin/tests/webhook/inbox-delivery.test.ts
@@ -1982,7 +2040,7 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
  
  const FAKE_TOKEN = '123456789:AAH-fake_test_token_with_at_least_thirty_chars'
  const WEBHOOK_TOKEN = 'wh_test_token_32_chars__________'
-@@ -171,15 +186,136 @@
+@@ -171,15 +186,157 @@
      expect(mcp.calls.length).toBe(1)
    })
  
@@ -2049,6 +2107,27 @@ Subject: [PATCH] inbox: доказанный echo, повторы с backoff, de
 +    const r = await deliverWebhookToInbox({ stateDir: inboxRoot, chatId: CHAT_ID, content: SWARM_TEXT, log })
 +    expect(r.duplicate).toBeUndefined()
 +    expect(inboxFiles().length).toBe(1)
++  })
++
++  // Re-review, finding 5: the failure path removed the marker blindly and
++  // could drop a claim another request had taken over meanwhile.
++  test('a failed commit leaves a marker it no longer owns', async () => {
++    const log = createLogger('test')
++    const marker = join(inboxRoot, 'chats', CHAT_ID, 'webhook-seen', '0123456789abcdef')
++    const takenOver = async (): Promise<string> => {
++      writeFileSync(marker, 'wh-0123456789abcdef-cafebabe')
++      throw new Error('disk full')
++    }
++    await expect(
++      deliverWebhookToInbox({
++        stateDir: inboxRoot,
++        chatId: CHAT_ID,
++        content: SWARM_TEXT,
++        log,
++        writeInbox: takenOver,
++      }),
++    ).rejects.toThrow('disk full')
++    expect(readFileSync(marker, 'utf8')).toBe('wh-0123456789abcdef-cafebabe')
 +  })
 +
 +  test('a nonce marker older than the TTL no longer dedupes', async () => {
