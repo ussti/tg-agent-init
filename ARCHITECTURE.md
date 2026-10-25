@@ -124,10 +124,13 @@ agent B ─ MCP ──▶│                                   gbrain-swarm-work
   unknown coordinator. Rotation together with `--no-restart` is refused (live agents
   would keep dead tokens). A brain dir without the brain's python or token script is
   refused instead of installed over. Ports 8766-8768 are fixed by upstream's units.
-- Known limit: a swarm task reaches the receiving agent through the dashi webhook, which
-  hands it to the session as an MCP channel notification. If the session is busy or
-  restarting, that notification can be lost; the delivery stays in the brain
-  (`get_delivery`, `list_my_pending`), but nobody is woken up for it.
+- Swarm delivery: the dashi webhook commits a swarm task to the agent's inbox as a file
+  before answering 200 (patches 0012, 0013), and the watcher pastes it into the session
+  and proves the submit. An unconfirmed submit is retried with backoff and ends in
+  `inbox/.dead-letter/` with an owner alert, so a task is no longer lost silently when
+  the session is busy or restarting.
+- Known limit: if the watcher is killed after the short anchor of a split message was
+  pasted but before the rest, the retry presses Enter and submits only the anchor.
 
 ## Build
 
