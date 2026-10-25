@@ -269,7 +269,7 @@ for pair in $KEY_SERVICES; do
     || die "$envname: not a valid key"
 done
 if [ "$NONINTERACTIVE" != "1" ]; then
-  say "keys for skills -- all optional, Enter skips, add later with agent-keys add <service>"
+  say "keys for skills -- paste each key you prepared; Enter skips one you do not have (add it later: agent-keys add <service>)"
   AGENT_KEYS_FILE="$KEYS_FILE" AGENT_NAME="$AGENT_NAME" \
     python3 "$KIT_DIR/kit/bin/agent-keys" setup || true
 fi

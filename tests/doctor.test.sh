@@ -266,6 +266,10 @@ check "doctor: uv runs from / with project config off" uv_isolated
 check "doctor: opt tree readable by others" bash -c \
   "[ -z \"\$(find '$E/opt/agent-doctor' ! -perm -o+r)\" ]"
 check "doctor: claude installed for doctor" test -x "$E/home/doctor/.local/bin/claude"
+check "doctor: first Claude start skips theme and trust screens" bash -c \
+  "jq -e '.hasCompletedOnboarding == true and .theme == \"dark\"
+          and .projects[\"$E/home/doctor\"].hasTrustDialogAccepted == true' \
+     '$E/home/doctor/.claude.json' > /dev/null"
 check "doctor: greeting sent to the owner" grep -qx \
   'Я doctor, наладчик сервера. Пиши, если агент сломался' "$E/.fake/sent.txt"
 token_only_in_env() {
