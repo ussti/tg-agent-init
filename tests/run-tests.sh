@@ -88,6 +88,8 @@ check "agent-login unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_login.py'
 check "kit skills unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_kit_skills.py'
+check "agent-selfcheck unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_selfcheck.py'
 check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/scripts/tests"
 
@@ -182,6 +184,46 @@ check "install-server ends with the doctor step" \
   grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
 check "install-server: doctor hint is non-fatal" bash -c \
   "tail -1 '$KIT/install-server.sh' | grep -q 'doctor-hint.sh.*|| true'"
+check "installer does not ask model, folder, port or long-lived token" bash -c \
+  "! grep -Eq 'Claude model for the agent|Model name for the identity|Where to create the agent|Local webhook port|long-lived token' '$KIT/install-server.sh'"
+# Port not given: the installer skips a busy port and takes the next free one.
+BUSY_PORT=18095
+python3 -c "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',$BUSY_PORT)); s.listen(); time.sleep(120)" &
+BUSY_PID=$!
+for _ in $(seq 1 50); do ss -ltnH "sport = :$BUSY_PORT" | grep -q . && break; sleep 0.1; done
+PORT_HOME="$WORK/porthome"
+mkdir -p "$PORT_HOME"
+if HOME="$PORT_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
+   TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=portbot OWNER_CHAT_ID="$OWNER" \
+   OPERATOR_NAME="Test Owner" TIMEZONE=UTC TG_AGENT_PORT_FROM="$BUSY_PORT" \
+   BASE_DIR="$PORT_HOME/agents" \
+   bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install-port.log" 2>&1; then
+  check "installer picks the next free port when none is given" \
+    grep -q "\"port\": $((BUSY_PORT + 1))" "$PORT_HOME/agents/portbot/.claude/state/telegram/config.json"
+else
+  bad "installer without WEBHOOK_PORT exits 0 (log below)"
+  tail -20 "$WORK/install-port.log"
+fi
+kill "$BUSY_PID" 2>/dev/null || true
+# Interactive: a typo in an answer or the token is asked again, not a restart.
+TYPO_HOME="$WORK/typohome"
+mkdir -p "$TYPO_HOME"
+printf '%s\n' 'Typo Bot' typobot '' '' '' '' '' abc "$OWNER" Mars/Base UTC '' '' short "$DUMMY_TOKEN" \
+  | HOME="$TYPO_HOME" TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 WEBHOOK_PORT=18097 \
+    BASE_DIR="$TYPO_HOME/agents" \
+    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install-typo.log" 2>&1 \
+  || true
+check "typed answers that fail validation are asked again" bash -c "
+  grep -q 'agent name: lowercase letters.*type it again' '$WORK/install-typo.log' \
+  && grep -q 'owner ID must be a positive number -- type it again' '$WORK/install-typo.log' \
+  && grep -q 'unknown timezone: Mars/Base -- type it again' '$WORK/install-typo.log' \
+  && grep -q 'bot token format is wrong -- paste it again' '$WORK/install-typo.log' \
+  && ! grep -q 'ERROR' '$WORK/install-typo.log' \
+  && grep -q \"\\\"port\\\": 18097\" '$TYPO_HOME/agents/typobot/.claude/state/telegram/config.json'"
+check "a bad answer from the environment still stops the installer" bash -c "
+  ! out=\$(HOME='$WORK/badenv' TG_AGENT_NONINTERACTIVE=1 AGENT_NAME=Bad \
+      bash '$KIT/install-server.sh' --no-systemd --no-cron --no-live-test 2>&1) \
+  && grep -q 'ERROR: agent name' <<< \"\$out\""
 # The text prepare-server.sh prints at the end: its last cat <<EOF body, expanded with
 # sample values the way the script expands it, so a command elsewhere in the file (a
 # comment, a dead branch) cannot satisfy the checks below.
@@ -244,6 +286,8 @@ check "config.json valid, all IDs = owner" jq -e \
 check "config.json bot_id from token" jq -e '.bot_id == 987654321' "$WS/state/telegram/config.json"
 check "config.json webhook on port" jq -e ".webhook.enabled and .webhook.port == $PORT" \
   "$WS/state/telegram/config.json"
+check "config.json typing indicator on (header «печатает…»)" jq -e \
+  '.status.enabled == true and .status.simple_typing == true' "$WS/state/telegram/config.json"
 check "no upstream canary IDs in agent" bash -c \
   "! grep -rqE '164795011|8507713167' '$WS/state' '$WS/agent.conf' '$PLUGIN/.claude' '$SEC'"
 check "plugin settings valid JSON" jq -e '.hooks.Stop' "$PLUGIN/.claude/settings.json"
@@ -316,6 +360,10 @@ ids = [s["id"] for s in json.loads(out)]
 assert ids == ["core/USER.md#profile", "core/USER.md#links", "core/USER.md#goals",
                "core/USER.md#overrides", "tools/TOOLS.md#services"], ids
 PY
+check "onboarding ends with the skippable self-check step" bash -c \
+  "grep -q 'Проверим, что я умею' '$WS/skills/onboard/SKILL.md' && \
+   grep -q 'skills/check/SKILL.md' '$WS/skills/onboard/SKILL.md' && \
+   test -f '$WS/skills/check/SKILL.md' && test -x '$WS/kit/bin/agent-selfcheck'"
 check "style defaults prefilled in USER.md" bash -c \
   "grep -q '^- One complete solution and the main trade-off' '$WS/core/USER.md' && \
    grep -q '^- Disagree with reasons' '$WS/core/USER.md'"
@@ -688,6 +736,11 @@ echo "UPDATE-MARKER-USER" >> "$WS/core/USER.md"
 echo "UPDATE_MARKER_KEY=keep" >> "$SEC/keys.env"
 echo "stale" > "$PLUGIN/STALE-FILE"
 echo "local" > "$PLUGIN/.env"
+# Servers added after install (install-fleet, skill packs, by hand) must survive an update;
+# the kit's own dashi-channel entry is always taken from the new build.
+jq '.mcpServers += {"gbrain-recall": {"type": "http", "url": "http://127.0.0.1:1/mcp"},
+    "notebooklm": {"command": "nlm"}} | .mcpServers["dashi-channel"].args = ["stale"]' \
+  "$PLUGIN/.mcp.json" > "$WORK/mcp.tmp" && mv "$WORK/mcp.tmp" "$PLUGIN/.mcp.json"
 user_sum="$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)"
 run_update() {  # run_update LOG ARGS...
   local log="$1"; shift
@@ -700,6 +753,11 @@ else
 fi
 check "update: plugin rebuilt" test ! -e "$PLUGIN/STALE-FILE"
 check "update: local plugin env file carried over" grep -qx local "$PLUGIN/.env"
+check "update: added MCP servers carried over" jq -e \
+  '.mcpServers["gbrain-recall"].url == "http://127.0.0.1:1/mcp" and .mcpServers.notebooklm.command == "nlm"' \
+  "$PLUGIN/.mcp.json"
+check "update: dashi-channel entry comes from the new build" jq -e \
+  '.mcpServers["dashi-channel"].args != ["stale"]' "$PLUGIN/.mcp.json"
 check "update: skills symlink in the new plugin" \
   bash -c "[ \"\$(readlink '$PLUGIN/.claude/skills')\" = ../../../skills ]"
 check "update: plugin settings rendered, no placeholders" bash -c \

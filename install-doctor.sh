@@ -396,6 +396,32 @@ claude_ok() {
   as_doctor bash -c 'cd "$HOME" && timeout "$1" "$2" -p ping' _ \
     "$LOGIN_CHECK_TIMEOUT_S" "$R$CLAUDE_BIN" < /dev/null > /dev/null 2>&1
 }
+# Skip the first-run theme picker and folder-trust prompt: the login is the only screen left.
+as_doctor python3 - "$R$DOCTOR_HOME" "$(as_doctor "$R$CLAUDE_BIN" --version 2>/dev/null \
+  | awk '{print $1}')" <<'PY' || say "WARN: could not pre-seed Claude settings"
+import json
+import pathlib
+import sys
+
+home, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+
+
+def merge(path: pathlib.Path, patch: dict) -> None:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    data.update({k: v for k, v in patch.items() if k != "projects"})
+    for d, flags in patch.get("projects", {}).items():
+        data.setdefault("projects", {}).setdefault(d, {}).update(flags)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+merge(home / ".claude" / "settings.json", {"theme": "dark"})
+patch = {"theme": "dark", "hasCompletedOnboarding": True,
+         "projects": {str(home): {"hasTrustDialogAccepted": True}}}
+if version:
+    patch["lastOnboardingVersion"] = version
+merge(home / ".claude.json", patch)
+PY
 if ! claude_ok; then
   [ "$NONINTERACTIVE" = 1 ] \
     && die "Claude is not logged in for $DOCTOR_USER; run: su - doctor -c claude, then /login"

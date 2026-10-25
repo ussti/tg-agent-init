@@ -11,8 +11,8 @@
 ## Что понадобится
 
 - Linux-сервер (Ubuntu 22.04+), пользователь с sudo для systemd-юнитов
-- `bun`, `tmux`, `jq`, `node` 24+ и `npm`, `python3`, `pipx`, `git`, `curl`, `openssl`, `patch`,
-  `crontab`, системные библиотеки для браузеров (всё это ставит `prepare-server.sh`)
+- `bun`, `tmux`, `jq`, `node` 24+ и `npm`, `python3`, `pipx`, `git`, `gh`, `curl`, `openssl`,
+  `patch`, `crontab`, системные библиотеки для браузеров (всё это ставит `prepare-server.sh`)
 - Claude Code (`claude`) и подписка или OAuth-токен
 - Telegram-бот от @BotFather и свой числовой Telegram ID (узнать у @userinfobot)
 - по желанию ключ Groq для расшифровки голосовых сообщений
@@ -89,8 +89,13 @@ Telegram ID, порт вебхука и токен бота (ввод скрыт
 # установщик в конце печатает эти команды с правильными SECRETS_DIR и AGENT_NAME
 SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys list
 SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys add <сервис>
+SECRETS_DIR=~/.config/tg-agent/<имя> AGENT_NAME=<имя> ~/agents/<имя>/.claude/kit/bin/agent-keys check
 ~/agents/<имя>/.claude/kit/bin/agent-login google         # или github, vercel, status
 ```
+
+`agent-keys check` заново проверяет все сохранённые ключи живым запросом и никогда не
+показывает их значения. Полную самопроверку набора (ключи, инструменты, навыки, плагины)
+агент делает сам по команде `/check` в чате, она же идёт последним шагом `/onboard`.
 
 Входы gh, vercel и gws-cli хранятся в домашней папке пользователя Unix, поэтому их разделяют
 все агенты этого пользователя.
