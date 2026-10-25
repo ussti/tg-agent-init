@@ -44,21 +44,48 @@ say() { echo "[install] $*"; }
 die() { echo "[install] ERROR: $*" >&2; exit 1; }
 NONINTERACTIVE="${TG_AGENT_NONINTERACTIVE:-0}"
 
-# ask VAR "prompt" "default": env var wins, then the prompt, then the default.
-ask() {
-  local var="$1" prompt="$2" def="$3" val="${!1:-}"
-  if [ -z "$val" ] && [ "$NONINTERACTIVE" != "1" ]; then
-    read -r -p "$prompt [$def]: " val || true
-  fi
-  printf -v "$var" '%s' "${val:-$def}"
+# Validators: print the problem and fail, stay silent on a good value.
+# Values go into KEY="value" files read by bash and systemd: no expansion chars.
+plain_problem() {
+  case "$1" in
+    *'"'*|*'$'*|*'`'*|*'\'*) echo "must not contain \" \$ \` or \\"; return 1 ;;
+  esac
+}
+check_plain() {
+  local err
+  err="$(plain_problem "$2")" || die "$1 $err"
+}
+valid_plain() { local err; err="$(plain_problem "$1")" || { echo "the answer $err"; return 1; }; }
+valid_agent_name() {
+  [[ "$1" =~ ^[a-z][a-z0-9-]{1,30}$ ]] \
+    || { echo "agent name: lowercase letters, digits, dash; 2-31 chars"; return 1; }
+}
+valid_owner_id() {
+  [[ "$1" =~ ^[1-9][0-9]{4,14}$ ]] || { echo "owner ID must be a positive number"; return 1; }
+}
+valid_timezone() {
+  [ -f "/usr/share/zoneinfo/$1" ] || { echo "unknown timezone: $1"; return 1; }
 }
 
-# Values go into KEY="value" files read by bash and systemd: no expansion chars.
-check_plain() {
-  local name="$1" val="$2"
-  case "$val" in
-    *'"'*|*'$'*|*'`'*|*'\'*) die "$name must not contain \" \$ \` or \\" ;;
-  esac
+# ask VAR "prompt" "default" [validator]: env var wins, then the prompt, then the default.
+# A typed answer the validator rejects is asked again, so a typo never restarts the
+# installer; a bad env value or a closed input stops it.
+ask() {
+  local var="$1" prompt="$2" def="$3" valid="${4:-}" val="${!1:-}" typed=0 err
+  while :; do
+    if [ -z "${!var:-}" ] && [ "$NONINTERACTIVE" != "1" ]; then
+      typed=1
+      read -r -p "$prompt [$def]: " val || typed=0
+    fi
+    val="${val:-$def}"
+    if [ -z "$valid" ] || err="$("$valid" "$val")"; then
+      printf -v "$var" '%s' "$val"
+      return 0
+    fi
+    [ "$typed" = 1 ] || die "$err"
+    echo "[install] $err -- type it again"
+    val=""
+  done
 }
 
 # ---------------------------------------------------------------- preflight
@@ -78,19 +105,16 @@ node_major="${node_ver#v}"; node_major="${node_major%%.*}"
 
 # ---------------------------------------------------------------- answers
 echo "== tg-agent installer =="
-ask AGENT_NAME "Agent name (lowercase, used for folders and units)" "assistant"
-[[ "$AGENT_NAME" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "agent name: lowercase letters, digits, dash; 2-31 chars"
-ask AGENT_ROLE "Agent role (short)" "Personal assistant"
-ask ROLE_DESCRIPTION "Role description" "Personal assistant, strategist and coach."
-ask CHARACTER "Character / tone" "Direct, concrete, no flattery."
-ask OPERATOR_NAME "Your name" "Owner"
-ask OPERATOR_ADDRESS "How should the agent address you" "$OPERATOR_NAME"
-ask OWNER_CHAT_ID "Your Telegram numeric user ID (ask @userinfobot)" ""
-[[ "$OWNER_CHAT_ID" =~ ^[1-9][0-9]{4,14}$ ]] || die "owner ID must be a positive number"
-ask TIMEZONE "Timezone (IANA, e.g. Europe/Berlin)" "UTC"
-[ -f "/usr/share/zoneinfo/$TIMEZONE" ] || die "unknown timezone: $TIMEZONE"
-ask LANGUAGE "Language the agent speaks to you" "English"
-ask VOICE_LANG "Voice transcription language code" "en"
+ask AGENT_NAME "Agent name (lowercase, used for folders and units)" "assistant" valid_agent_name
+ask AGENT_ROLE "Agent role (short)" "Personal assistant" valid_plain
+ask ROLE_DESCRIPTION "Role description" "Personal assistant, strategist and coach." valid_plain
+ask CHARACTER "Character / tone" "Direct, concrete, no flattery." valid_plain
+ask OPERATOR_NAME "Your name" "Owner" valid_plain
+ask OPERATOR_ADDRESS "How should the agent address you" "$OPERATOR_NAME" valid_plain
+ask OWNER_CHAT_ID "Your Telegram numeric user ID (ask @userinfobot)" "" valid_owner_id
+ask TIMEZONE "Timezone (IANA, e.g. Europe/Berlin)" "UTC" valid_timezone
+ask LANGUAGE "Language the agent speaks to you" "English" valid_plain
+ask VOICE_LANG "Voice transcription language code" "en" valid_plain
 # Not asked: defaults fit every first install; env vars override them.
 AGENT_MODEL="${AGENT_MODEL:-opus}"
 PRIMARY_MODEL="${PRIMARY_MODEL:-Claude Opus}"
@@ -111,26 +135,40 @@ for v in AGENT_ROLE ROLE_DESCRIPTION CHARACTER OPERATOR_NAME OPERATOR_ADDRESS LA
   check_plain "$v" "${!v}"
 done
 
-BOT_TOKEN="${TG_AGENT_BOT_TOKEN:-}"
-if [ -z "$BOT_TOKEN" ] && [ "$NONINTERACTIVE" != "1" ]; then
-  read -r -s -p "Bot token from @BotFather (hidden): " BOT_TOKEN || true
-  echo
-fi
-[[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]] || die "bot token format is wrong"
-
 # Env only: the guided install logs in to Claude interactively after the install.
 OAUTH="${TG_AGENT_CLAUDE_OAUTH:-}"
-for v in BOT_TOKEN OAUTH; do check_plain "$v" "${!v}"; done
+check_plain OAUTH "$OAUTH"
+
+# Sets TOKEN_ERR to the problem with BOT_TOKEN (empty when Telegram accepts it) and GETME.
+check_bot_token() {
+  TOKEN_ERR=""
+  if ! [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
+    TOKEN_ERR="bot token format is wrong"
+  elif [ "${TG_AGENT_TEST_SKIP_GETME:-0}" = "1" ]; then
+    # test-only: no network; trust the id in the token
+    GETME="$(jq -n --arg id "${BOT_TOKEN%%:*}" '{ok:true,result:{id:($id|tonumber),username:"test_bot"}}')"
+  else
+    say "checking the bot token with Telegram (getMe)"
+    GETME="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$BOT_TOKEN" | curl -sS -m 20 -K - || true)"
+    [ "$(jq -r '.ok // false' <<<"$GETME" 2>/dev/null)" = "true" ] || TOKEN_ERR="Telegram rejected the token"
+  fi
+}
 
 # ---------------------------------------------------------------- bot check
-if [ "${TG_AGENT_TEST_SKIP_GETME:-0}" = "1" ]; then
-  # test-only: no network; trust the id in the token
-  GETME="$(jq -n --arg id "${BOT_TOKEN%%:*}" '{ok:true,result:{id:($id|tonumber),username:"test_bot"}}')"
-else
-  say "checking the bot token with Telegram (getMe)"
-  GETME="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$BOT_TOKEN" | curl -sS -m 20 -K - || true)"
-  [ "$(jq -r '.ok // false' <<<"$GETME" 2>/dev/null)" = "true" ] || die "Telegram rejected the token"
-fi
+# A token pasted wrong is asked again; a bad TG_AGENT_BOT_TOKEN or closed input stops here.
+BOT_TOKEN="${TG_AGENT_BOT_TOKEN:-}"
+while :; do
+  typed=0
+  if [ -z "${TG_AGENT_BOT_TOKEN:-}" ] && [ "$NONINTERACTIVE" != "1" ]; then
+    typed=1
+    read -r -s -p "Bot token from @BotFather (hidden): " BOT_TOKEN || typed=0
+    echo
+  fi
+  check_bot_token
+  [ -n "$TOKEN_ERR" ] || break
+  [ "$typed" = 1 ] || die "$TOKEN_ERR"
+  echo "[install] $TOKEN_ERR -- paste it again"
+done
 BOT_ID="$(jq -r '.result.id' <<<"$GETME")"
 BOT_USERNAME="$(jq -r '.result.username' <<<"$GETME")"
 [ "$BOT_ID" = "${BOT_TOKEN%%:*}" ] || die "getMe id does not match the token"
