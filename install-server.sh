@@ -10,7 +10,11 @@
 #
 # Interactive by default. For unattended runs set TG_AGENT_NONINTERACTIVE=1 and
 # pass every answer as an env var (names in the prompts below; the bot token as
-# TG_AGENT_BOT_TOKEN). Flags: --no-systemd, --no-cron, --no-live-test.
+# TG_AGENT_BOT_TOKEN). Settings a first-time owner never needs to change are not
+# asked; override them with env vars: AGENT_MODEL, PRIMARY_MODEL, BASE_DIR,
+# WEBHOOK_PORT (default: first free port from 8089), TG_AGENT_CLAUDE_OAUTH (a
+# 'claude setup-token' token instead of the interactive login).
+# Flags: --no-systemd, --no-cron, --no-live-test.
 # Re-running with an existing agent name moves the old workspace and secrets
 # aside (*.bak_<timestamp>); nothing is deleted.
 set -euo pipefail
@@ -20,6 +24,8 @@ readonly KIT_DIR
 readonly LIVE_TEST_TIMEOUT_S=240
 readonly PORT_WAIT_S=90
 readonly NODE_MAJOR_MIN=24  # agent-browser engines
+readonly DEFAULT_WEBHOOK_PORT=8089
+readonly MAX_PORT=65535
 
 DO_SYSTEMD=1
 DO_CRON=1
@@ -85,11 +91,17 @@ ask TIMEZONE "Timezone (IANA, e.g. Europe/Berlin)" "UTC"
 [ -f "/usr/share/zoneinfo/$TIMEZONE" ] || die "unknown timezone: $TIMEZONE"
 ask LANGUAGE "Language the agent speaks to you" "English"
 ask VOICE_LANG "Voice transcription language code" "en"
-ask AGENT_MODEL "Claude model for the agent" "opus"
-ask PRIMARY_MODEL "Model name for the identity docs" "Claude Opus"
-ask BASE_DIR "Where to create the agent" "$HOME/agents"
-ask WEBHOOK_PORT "Local webhook port (free, 1024-65535)" "8089"
-[[ "$WEBHOOK_PORT" =~ ^[0-9]+$ ]] && [ "$WEBHOOK_PORT" -ge 1024 ] && [ "$WEBHOOK_PORT" -le 65535 ] \
+# Not asked: defaults fit every first install; env vars override them.
+AGENT_MODEL="${AGENT_MODEL:-opus}"
+PRIMARY_MODEL="${PRIMARY_MODEL:-Claude Opus}"
+BASE_DIR="${BASE_DIR:-$HOME/agents}"
+if [ -z "${WEBHOOK_PORT:-}" ]; then
+  WEBHOOK_PORT="${TG_AGENT_PORT_FROM:-$DEFAULT_WEBHOOK_PORT}"
+  while ss -ltnH "sport = :$WEBHOOK_PORT" | grep -q . && [ "$WEBHOOK_PORT" -lt "$MAX_PORT" ]; do
+    WEBHOOK_PORT=$((WEBHOOK_PORT + 1))
+  done
+fi
+[[ "$WEBHOOK_PORT" =~ ^[0-9]+$ ]] && [ "$WEBHOOK_PORT" -ge 1024 ] && [ "$WEBHOOK_PORT" -le "$MAX_PORT" ] \
   || die "port must be 1024-65535"
 if ss -ltnH "sport = :$WEBHOOK_PORT" | grep -q .; then
   die "port $WEBHOOK_PORT is already in use"
@@ -106,11 +118,8 @@ if [ -z "$BOT_TOKEN" ] && [ "$NONINTERACTIVE" != "1" ]; then
 fi
 [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]] || die "bot token format is wrong"
 
+# Env only: the guided install logs in to Claude interactively after the install.
 OAUTH="${TG_AGENT_CLAUDE_OAUTH:-}"
-if [ -z "$OAUTH" ] && [ "$NONINTERACTIVE" != "1" ]; then
-  read -r -s -p "Claude long-lived token from 'claude setup-token' (optional, enter to skip): " OAUTH || true
-  echo
-fi
 for v in BOT_TOKEN OAUTH; do check_plain "$v" "${!v}"; done
 
 # ---------------------------------------------------------------- bot check

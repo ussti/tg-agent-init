@@ -184,6 +184,27 @@ check "install-server ends with the doctor step" \
   grep -q '^== Agent is up. One step left: the doctor' "$WORK/install.log"
 check "install-server: doctor hint is non-fatal" bash -c \
   "tail -1 '$KIT/install-server.sh' | grep -q 'doctor-hint.sh.*|| true'"
+check "installer does not ask model, folder, port or long-lived token" bash -c \
+  "! grep -Eq 'Claude model for the agent|Model name for the identity|Where to create the agent|Local webhook port|long-lived token' '$KIT/install-server.sh'"
+# Port not given: the installer skips a busy port and takes the next free one.
+BUSY_PORT=18095
+python3 -c "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',$BUSY_PORT)); s.listen(); time.sleep(120)" &
+BUSY_PID=$!
+for _ in $(seq 1 50); do ss -ltnH "sport = :$BUSY_PORT" | grep -q . && break; sleep 0.1; done
+PORT_HOME="$WORK/porthome"
+mkdir -p "$PORT_HOME"
+if HOME="$PORT_HOME" TG_AGENT_NONINTERACTIVE=1 TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 \
+   TG_AGENT_BOT_TOKEN="$DUMMY_TOKEN" AGENT_NAME=portbot OWNER_CHAT_ID="$OWNER" \
+   OPERATOR_NAME="Test Owner" TIMEZONE=UTC TG_AGENT_PORT_FROM="$BUSY_PORT" \
+   BASE_DIR="$PORT_HOME/agents" \
+   bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install-port.log" 2>&1; then
+  check "installer picks the next free port when none is given" \
+    grep -q "\"port\": $((BUSY_PORT + 1))" "$PORT_HOME/agents/portbot/.claude/state/telegram/config.json"
+else
+  bad "installer without WEBHOOK_PORT exits 0 (log below)"
+  tail -20 "$WORK/install-port.log"
+fi
+kill "$BUSY_PID" 2>/dev/null || true
 # The text prepare-server.sh prints at the end: its last cat <<EOF body, expanded with
 # sample values the way the script expands it, so a command elsewhere in the file (a
 # comment, a dead branch) cannot satisfy the checks below.
