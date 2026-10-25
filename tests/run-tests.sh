@@ -286,6 +286,8 @@ check "config.json valid, all IDs = owner" jq -e \
 check "config.json bot_id from token" jq -e '.bot_id == 987654321' "$WS/state/telegram/config.json"
 check "config.json webhook on port" jq -e ".webhook.enabled and .webhook.port == $PORT" \
   "$WS/state/telegram/config.json"
+check "config.json typing indicator on (header «печатает…»)" jq -e \
+  '.status.enabled == true and .status.simple_typing == true' "$WS/state/telegram/config.json"
 check "no upstream canary IDs in agent" bash -c \
   "! grep -rqE '164795011|8507713167' '$WS/state' '$WS/agent.conf' '$PLUGIN/.claude' '$SEC'"
 check "plugin settings valid JSON" jq -e '.hooks.Stop' "$PLUGIN/.claude/settings.json"
