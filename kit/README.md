@@ -36,6 +36,7 @@ optional, Enter skips, add it later with the command shown.
 | system | learnings | none | |
 | system | quick-reminders | none | |
 | system | onboard | none | |
+| system | check (`/check`, `agent-selfcheck`) | none | |
 | research | perplexity-research | `PERPLEXITY_API_KEY` (paid) | `agent-keys add perplexity` |
 | research | agent-browser | none | |
 | research | markdown-new | optional `JINA_API_KEY` | `agent-keys add jina` |
@@ -64,7 +65,7 @@ Third-party programs come only from their official source, at the pinned version
 | Vercel | plugin `vercel@claude-plugins-official`, CLI `vercel`, version in `versions.env` | see upstream |
 | GitHub | `gh`, install per https://github.com/cli/cli#installation | see upstream |
 | senior-brainstorm | our skill, `skills/dev/senior-brainstorm/LICENSE` | MIT |
-| skill-finder, agent-introspection, learnings, quick-reminders, onboard, perplexity-research, markdown-new, groq-voice, youtube-transcript, cal | our skills (some with an upstream base; no separate license file) | see upstream |
+| skill-finder, agent-introspection, learnings, quick-reminders, onboard, check, perplexity-research, markdown-new, groq-voice, youtube-transcript, cal | our skills (some with an upstream base; no separate license file) | see upstream |
 
 yt-dlp (for youtube-transcript) is installed with pipx from the official package.
 

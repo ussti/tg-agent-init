@@ -88,6 +88,8 @@ check "agent-login unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_login.py'
 check "kit skills unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_kit_skills.py'
+check "agent-selfcheck unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_selfcheck.py'
 check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/scripts/tests"
 
@@ -316,6 +318,10 @@ ids = [s["id"] for s in json.loads(out)]
 assert ids == ["core/USER.md#profile", "core/USER.md#links", "core/USER.md#goals",
                "core/USER.md#overrides", "tools/TOOLS.md#services"], ids
 PY
+check "onboarding ends with the skippable self-check step" bash -c \
+  "grep -q 'Проверим, что я умею' '$WS/skills/onboard/SKILL.md' && \
+   grep -q 'skills/check/SKILL.md' '$WS/skills/onboard/SKILL.md' && \
+   test -f '$WS/skills/check/SKILL.md' && test -x '$WS/kit/bin/agent-selfcheck'"
 check "style defaults prefilled in USER.md" bash -c \
   "grep -q '^- One complete solution and the main trade-off' '$WS/core/USER.md' && \
    grep -q '^- Disagree with reasons' '$WS/core/USER.md'"

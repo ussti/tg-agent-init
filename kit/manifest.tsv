@@ -7,6 +7,7 @@ media	youtube-transcript	bundled
 system	skill-finder	bundled
 system	agent-introspection	bundled
 system	learnings	bundled
+system	check	bundled
 dev	senior-brainstorm	bundled
 research	perplexity-research	bundled
 research	agent-browser	bundled
