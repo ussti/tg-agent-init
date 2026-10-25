@@ -205,6 +205,25 @@ else
   tail -20 "$WORK/install-port.log"
 fi
 kill "$BUSY_PID" 2>/dev/null || true
+# Interactive: a typo in an answer or the token is asked again, not a restart.
+TYPO_HOME="$WORK/typohome"
+mkdir -p "$TYPO_HOME"
+printf '%s\n' 'Typo Bot' typobot '' '' '' '' '' abc "$OWNER" Mars/Base UTC '' '' short "$DUMMY_TOKEN" \
+  | HOME="$TYPO_HOME" TG_AGENT_TEST_SKIP_GETME=1 TG_AGENT_TEST_SKIP_BUN=1 WEBHOOK_PORT=18097 \
+    BASE_DIR="$TYPO_HOME/agents" \
+    bash "$KIT/install-server.sh" --no-systemd --no-cron --no-live-test > "$WORK/install-typo.log" 2>&1 \
+  || true
+check "typed answers that fail validation are asked again" bash -c "
+  grep -q 'agent name: lowercase letters.*type it again' '$WORK/install-typo.log' \
+  && grep -q 'owner ID must be a positive number -- type it again' '$WORK/install-typo.log' \
+  && grep -q 'unknown timezone: Mars/Base -- type it again' '$WORK/install-typo.log' \
+  && grep -q 'bot token format is wrong -- paste it again' '$WORK/install-typo.log' \
+  && ! grep -q 'ERROR' '$WORK/install-typo.log' \
+  && grep -q \"\\\"port\\\": 18097\" '$TYPO_HOME/agents/typobot/.claude/state/telegram/config.json'"
+check "a bad answer from the environment still stops the installer" bash -c "
+  ! out=\$(HOME='$WORK/badenv' TG_AGENT_NONINTERACTIVE=1 AGENT_NAME=Bad \
+      bash '$KIT/install-server.sh' --no-systemd --no-cron --no-live-test 2>&1) \
+  && grep -q 'ERROR: agent name' <<< \"\$out\""
 # The text prepare-server.sh prints at the end: its last cat <<EOF body, expanded with
 # sample values the way the script expands it, so a command elsewhere in the file (a
 # comment, a dead branch) cannot satisfy the checks below.
