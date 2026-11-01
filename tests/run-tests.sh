@@ -92,6 +92,8 @@ check "agent-selfcheck unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/kit/tests" -p 'test_agent_selfcheck.py'
 check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/scripts/tests"
+check "rotate-warm unit tests" env PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s "$KIT/core/scripts/tests"
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.

@@ -1,6 +1,8 @@
 # WARM — Decisions (last ~14 days)
 
-_Key decisions. `@included` into context every session. Rotated down to COLD after ~14 days._
+_Key decisions. `@included` into context every session. Start every entry with a
+`### YYYY-MM-DD [topic]` heading: a daily cron moves entries older than 14 days to
+`core/archive/YYYY-MM.md` and adds an index line to `core/MEMORY.md`. Undated sections stay._
 
 <!-- ### YYYY-MM-DD [topic]
 Decision + one-line why. -->
