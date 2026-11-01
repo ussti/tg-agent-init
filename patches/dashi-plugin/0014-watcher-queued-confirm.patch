@@ -1,0 +1,286 @@
+Subject: [PATCH] watcher: подтверждение отправки для сообщения в очереди за ходом
+
+Доработка 0013. Ложный dead-letter: сообщение доходило до сессии, а
+наблюдатель писал «submit not confirmed» и после повторов уводил файл
+в inbox/.dead-letter/.
+
+Причина. Claude Code показывает отправленный промпт с тегом
+<channel source="X" …> не целиком, а строкой «← X: <первая строка…>».
+Сам тег, а значит и отпечаток message_id= / delivery_id=, выше
+композера не печатается. Если агент занят, сообщение встаёт в очередь
+(«Press up to edit queued messages»), а индикатор генерации был на
+экране ещё до вставки. Ни один из старых сигналов подтверждения не
+срабатывает.
+
+Исправление. Снимок панели считает строки над композером, которые
+начинаются с превью этого сообщения: «← <source>: » и первые 16
+символов первой непустой строки тела (preview_needle). Отправка
+подтверждается, если композер вернулся к исходному виду, отпечаток
+уникальный и таких строк стало больше, чем в снимке до вставки.
+Превью другого сообщения, пришедшего в ту же сессию, и строки с
+отступом внутри вывода агента не засчитываются.
+
+Ограничение. Повтор (resume_prompt) не меняется и этот сигнал не
+использует. Если превью успело уехать за верх экрана до проверки,
+первая попытка не подтвердится, а повтор не найдёт отпечаток в
+истории, и сообщение, как и до патча, уйдёт в dead-letter. Ложного
+подтверждения это не даёт.
+
+diff --git a/plugin/src/chats/hooks/multichat-entrypoint.sh b/plugin/src/chats/hooks/multichat-entrypoint.sh
+index b74d050..cc638f3 100644
+--- a/plugin/src/chats/hooks/multichat-entrypoint.sh
++++ b/plugin/src/chats/hooks/multichat-entrypoint.sh
+@@ -277,6 +277,36 @@ count_placeholders() {
+   echo $((n))
+ }
+ 
++# preview_needle TEXT — how Claude Code previews a submitted
++# `<channel source="X" …>` prompt: `← X: <first body line, cut at ~60
++# chars…>`. Prints `← X: ` plus the first 16 chars of the first non-blank
++# body line, so another message's preview does not match. The tag itself
++# (and so the message_id fingerprint) is never shown there. Empty for a
++# prompt that is not a channel block or has no body.
++preview_needle() {
++  printf '%s' "$1" | python3 -c '
++import re
++import sys
++raw = sys.stdin.read().lstrip()
++if raw.startswith("<channel ") and ">" in raw:
++    tag, body = raw.split(">", 1)
++    src = re.search(r"\bsource=\"([A-Za-z0-9_.-]+)\"", tag)
++    first = next((l.strip() for l in body.splitlines() if l.strip()), "")
++    if src and first:
++        sys.stdout.write("\u2190 " + src.group(1) + ": " + first[:16])
++' || true
++}
++
++# count_previews NEEDLE TEXT — lines of TEXT that start (after leading
++# spaces) with NEEDLE; 0 for an empty needle.
++count_previews() {
++  [[ -n "$1" ]] || { echo 0; return 0; }
++  local n
++  n="$(NEEDLE="$1" awk '{ sub(/^ +/, "") }
++    index($0, ENVIRON["NEEDLE"]) == 1 { c++ } END { print c + 0 }' <<<"$2")" || true
++  echo $((n))
++}
++
+ # True when FP is a per-message unique id. Only such a fingerprint may be
+ # looked up in history: a text fingerprint ("[from @user] да") can match
+ # an older identical message and fake a delivery.
+@@ -296,15 +326,19 @@ if lines and len(lines[-1]) >= 4:
+ ' || true
+ }
+ 
+-# take_snapshot FP [TAIL] — one capture of the visible pane, split at the
++# take_snapshot FP [TAIL] [PREVIEW] — one capture of the visible pane, split at the
+ # composer. Sets globals:
+ #   SNAP_FP_COMPOSER   occurrences of FP inside the composer region
+ #   SNAP_PH_COMPOSER   paste placeholders inside the composer region
+ #   SNAP_TAIL_COMPOSER occurrences of TAIL inside the composer region
+ #   SNAP_FP_ABOVE      occurrences of FP above the composer (transcript)
++#   SNAP_PREVIEW_ABOVE preview lines matching PREVIEW (preview_needle)
++#                      above the composer — how Claude Code shows a
++#                      channel-tagged prompt, including one queued behind
++#                      a running turn
+ #   SNAP_BUSY          1 when the "esc to interrupt" footer is shown
+ take_snapshot() {
+-  local fp="$1" tail="${2:-}" out comp above
++  local fp="$1" tail="${2:-}" preview="${3:-}" out comp above
+   out="$(pane_text)"
+   comp="$(composer_region "$out")"
+   above="$(above_composer "$out")"
+@@ -312,6 +346,7 @@ take_snapshot() {
+   SNAP_PH_COMPOSER="$(count_placeholders "$comp")"
+   SNAP_TAIL_COMPOSER="$(count_fixed "$tail" "$comp")"
+   SNAP_FP_ABOVE="$(count_fixed "$fp" "$above")"
++  SNAP_PREVIEW_ABOVE="$(count_previews "$preview" "$above")"
+   SNAP_BUSY=0
+   if grep -qiE 'esc to interrupt' <<<"$out"; then SNAP_BUSY=1; fi
+ }
+@@ -330,6 +365,7 @@ paste_text() {
+ }
+ 
+ # press_enter_until_submitted FP FP_BASE PH_BASE PRE_GENERATING FP_ABOVE_BASE
++#                             [PREVIEW_BASE PREVIEW]
+ #
+ # Enter-only verify loop; the body is never re-sent here. A submit counts
+ # as confirmed only on POSITIVE evidence that THIS prompt left the
+@@ -340,12 +376,19 @@ paste_text() {
+ #   turn    — the busy footer appeared while no generation was running
+ #             before (PRE_GENERATING=0), OR FP now shows above the
+ #             composer more often than FP_ABOVE_BASE (the prompt echoed
+-#             into the transcript / queued-message display).
++#             into the transcript / queued-message display), OR — for a
++#             unique-id FP only — more lines starting with PREVIEW (this
++#             prompt's preview_needle) show above the composer than
++#             PREVIEW_BASE. Patch 0014: a prompt sent
++#             while a turn runs is queued and shown only as
++#             `← telegram: …`, with the busy footer already up and the
++#             id never printed, so the first two signals cannot fire.
+ # "The fingerprint is gone" alone is NOT enough: a collapsed paste hides
+ # the fingerprint from the start, so its absence proves nothing.
+ # Returns 0 confirmed, 1 not confirmed.
+ press_enter_until_submitted() {
+   local fp="$1" fp_base="$2" ph_base="$3" pre_generating="$4" above_base="$5"
++  local preview_base="${6:-}" preview="${7:-}"
+   local attempt delay
+   delay="$SUBMIT_RETRY_DELAY"
+   for ((attempt = 1; attempt <= SUBMIT_RETRY_MAX; attempt++)); do
+@@ -363,12 +406,16 @@ press_enter_until_submitted() {
+       # the Enter landed. Degraded path, equals the pre-fix behaviour.
+       return 0
+     fi
+-    take_snapshot "$fp"
++    take_snapshot "$fp" "" "$preview"
+     if (( SNAP_FP_COMPOSER <= fp_base && SNAP_PH_COMPOSER <= ph_base )); then
+       if [[ "$pre_generating" == "0" && "$SNAP_BUSY" == "1" ]] \
+           || (( SNAP_FP_ABOVE > above_base )); then
+         return 0
+       fi
++      if [[ -n "$preview_base" && -n "$preview" ]] && fp_is_unique "$fp" \
++          && (( SNAP_PREVIEW_ABOVE > preview_base )); then
++        return 0
++      fi
+     fi
+ 
+     delay="$(awk -v d="$delay" -v f="$SUBMIT_RETRY_FACTOR" \
+@@ -421,8 +468,9 @@ press_enter_until_submitted() {
+ submit_prompt() {
+   local msg_text="$1"
+   local fp pre_generating i anchor rest tail
+-  local fp_c0 ph_c0 tail_c0 above0
++  local fp_c0 ph_c0 tail_c0 above0 preview preview0
+   fp="$(prompt_fingerprint "$msg_text")"
++  preview="$(preview_needle "$msg_text")"
+   SUBMIT_PHASE="unechoed"
+   SUBMIT_PH_MARK=0
+ 
+@@ -434,11 +482,12 @@ submit_prompt() {
+   rest="$SPLIT_REST"
+   tail="$SPLIT_TAIL"
+ 
+-  take_snapshot "$fp" "$tail"
++  take_snapshot "$fp" "$tail" "$preview"
+   fp_c0="$SNAP_FP_COMPOSER"
+   ph_c0="$SNAP_PH_COMPOSER"
+   tail_c0="$SNAP_TAIL_COMPOSER"
+   above0="$SNAP_FP_ABOVE"
++  preview0="$SNAP_PREVIEW_ABOVE"
+   pre_generating="$SNAP_BUSY"
+   SUBMIT_PH_MARK="$ph_c0"
+ 
+@@ -496,7 +545,8 @@ submit_prompt() {
+   fi
+   SUBMIT_PHASE="pasted"
+ 
+-  press_enter_until_submitted "$fp" "$fp_c0" "$ph_c0" "$pre_generating" "$above0"
++  press_enter_until_submitted "$fp" "$fp_c0" "$ph_c0" "$pre_generating" "$above0" \
++    "$preview0" "$preview"
+ }
+ 
+ # split_anchor TEXT FP — set SPLIT_ANCHOR / SPLIT_REST / SPLIT_TAIL for the
+diff --git a/plugin/tests/chats/multichat-entrypoint-submit.test.ts b/plugin/tests/chats/multichat-entrypoint-submit.test.ts
+index fa45500..856e504 100644
+--- a/plugin/tests/chats/multichat-entrypoint-submit.test.ts
++++ b/plugin/tests/chats/multichat-entrypoint-submit.test.ts
+@@ -705,3 +705,100 @@ MSG
+     })
+   }
+ })
++
++// Patch 0014: a message sent while the agent is mid-turn is QUEUED by
++// Claude Code. The queue shows it as one `← telegram: …` preview line
++// above the composer — the tag (and its message_id) is never printed —
++// plus "Press up to edit queued messages" in the composer. The busy
++// footer was already there before the paste, so neither old signal can
++// fire: the submit went unconfirmed and a delivered message was
++// dead-lettered.
++describe('queued while busy', () => {
++  const SEP = '─'.repeat(40)
++  const MSG =
++    '<channel source="telegram" chat_id="1" message_id="4242" user="kris">\n' +
++    'a long body line one\nand the last line of the body\n</channel>'
++  const ANCHOR = '<channel source="telegram" chat_id="1" message_id="4242"'
++  const BUSY = (above: string, composer = '❯ ') =>
++    `✻ Working… (12s)\n${above}${SEP}\n${composer}\n${SEP}\n  esc to interrupt\n`
++  const OLD_ECHO = '← telegram: <pasted_content id="a111"> line 0 of an older message\n'
++  // Claude Code shows a channel-tagged prompt as `← SOURCE: <first body
++  // line, cut at ~60 chars…>` (live pane, 2026-11-01).
++  const NEW_ECHO = '← telegram: a long body line one\n'
++  const FOREIGN_ECHO = '← telegram: another chat message arriving meanwhile…\n'
++
++  function script(afterEnter: string) {
++    installStubTmux()
++    writeFileSync(join(dir, 'pane-1.txt'), BUSY(OLD_ECHO))
++    // From the echo poll on, the anchor sits in the composer; the stub
++    // appends the rest (the last loaded buffer) below it.
++    writeFileSync(join(dir, 'pane-3.txt'), BUSY(OLD_ECHO, `❯ ${ANCHOR}`))
++    writeFileSync(join(dir, 'pane-after-enter.txt'), afterEnter)
++  }
++
++  function submit() {
++    return runHelpers(`submit_prompt "$(cat <<'MSG'
++${MSG}
++MSG
++)"`)
++  }
++
++  test('a new channel preview above a cleared composer confirms the submit', () => {
++    script(BUSY(`${OLD_ECHO}${NEW_ECHO}  ctrl+x ctrl+s to send now\n`,
++      '❯ Press up to edit queued messages'))
++
++    const res = submit()
++
++    expect(res.stderr).not.toContain('submit not confirmed')
++    expect(res.code).toBe(0)
++    expect(tmuxLog().filter((l) => l === 'send-keys -t %1 Enter').length).toBe(1)
++    expect(tmuxLog().filter((l) => l.startsWith('paste-buffer')).length).toBe(2)
++  })
++
++  test('another message\'s preview does not confirm this one', () => {
++    script(BUSY(`${OLD_ECHO}${FOREIGN_ECHO}`, '❯ Press up to edit queued messages'))
++
++    const res = submit()
++
++    expect(res.code).toBe(1)
++    expect(res.stderr).toContain('submit not confirmed')
++  })
++
++  test('our preview text indented inside agent output does not confirm', () => {
++    script(BUSY(`${OLD_ECHO}  ⎿  ← telegram: a long body line one\n`))
++
++    const res = submit()
++
++    expect(res.code).toBe(1)
++    expect(res.stderr).toContain('submit not confirmed')
++  })
++
++  test('only the old preview, composer cleared: still NOT confirmed', () => {
++    script(BUSY(OLD_ECHO))
++
++    const res = submit()
++
++    expect(res.code).toBe(1)
++    expect(res.stderr).toContain('submit not confirmed')
++  })
++
++  test('new preview but the body still in the composer: NOT confirmed', () => {
++    script(BUSY(`${OLD_ECHO}${NEW_ECHO}`, `❯ ${ANCHOR}`))
++
++    const res = submit()
++
++    expect(res.code).toBe(1)
++    expect(res.stderr).toContain('submit not confirmed')
++  })
++
++  test('a text fingerprint never confirms off a channel preview', () => {
++    installStubTmux()
++    writeFileSync(join(dir, 'pane-1.txt'), BUSY(OLD_ECHO))
++    writeFileSync(join(dir, 'pane-after-enter.txt'),
++      BUSY(`${OLD_ECHO}${NEW_ECHO}`, '❯ Press up to edit queued messages'))
++
++    const res = runHelpers(`submit_prompt '[from @kris] plain text body without any id'`)
++
++    expect(res.code).toBe(1)
++  })
++})
