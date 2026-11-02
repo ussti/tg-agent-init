@@ -70,6 +70,8 @@ class SelfcheckTest(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
+        for name in ("TELEGRAM_STATUS_SIMPLE_TYPING", "TELEGRAM_CONFIG_FILE", "SECRETS_DIR"):
+            os.environ.pop(name, None)  # the agent pane exports these; tests set their own
 
     def _install_fakes(self, browser_rc: int = 0) -> None:
         _write_exe(self.fake / "agent-browser", f"""\
@@ -213,6 +215,69 @@ class SelfcheckTest(unittest.TestCase):
         self.assertEqual(rows["keys/keys.env"]["status"], sc.BROKEN)
         self.assertEqual(self.last_code, 1)
 
+
+    def _typing(self, status: object = None, conf: str | None = None) -> dict[str, str]:
+        """Typing check against a config.json with this status block and a channel.conf."""
+        if status is not None:
+            cfg = self.ws / "state" / "telegram" / "config.json"
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text(json.dumps({"bot_id": 1, "status": status}))
+        if conf is not None:
+            secrets = self.tmp / "secrets"
+            secrets.mkdir(exist_ok=True)
+            (secrets / "channel.conf").write_text(
+                f'TELEGRAM_BOT_TOKEN="{SECRET}"\n{conf}\n')
+            os.environ["SECRETS_DIR"] = str(secrets)
+        return dataclasses.asdict(sc.check_typing(sc.load_env()))
+
+    def test_typing_on_in_config_works(self) -> None:
+        row = self._typing({"enabled": True, "simple_typing": True})
+        self.assertEqual((row["group"], row["name"], row["status"]),
+                         ("tools", sc.TYPING_NAME, sc.WORKS))
+
+    def test_typing_off_in_config_is_broken_with_fix(self) -> None:
+        for status in ({"enabled": True}, {"enabled": True, "simple_typing": False}):
+            row = self._typing(status)
+            self.assertEqual(row["status"], sc.BROKEN, status)
+            self.assertIn("simple_typing", row["fix"])
+            self.assertIn("restart", row["fix"])
+
+    def test_status_messages_off_is_broken(self) -> None:
+        for status in ({"simple_typing": True}, {"enabled": False, "simple_typing": True}):
+            row = self._typing(status)
+            self.assertEqual(row["status"], sc.BROKEN, status)
+            self.assertIn("status.enabled", row["fix"])
+
+    def test_env_override_wins_over_config(self) -> None:
+        os.environ["TELEGRAM_STATUS_SIMPLE_TYPING"] = "false"
+        row = self._typing({"enabled": True, "simple_typing": True})
+        self.assertEqual(row["status"], sc.BROKEN)
+        self.assertIn("TELEGRAM_STATUS_SIMPLE_TYPING", row["fix"])
+        os.environ["TELEGRAM_STATUS_SIMPLE_TYPING"] = "ON"
+        self.assertEqual(self._typing({"enabled": True})["status"], sc.WORKS)
+
+    def test_channel_conf_counts_when_session_env_lacks_it(self) -> None:
+        row = self._typing({"enabled": True}, conf='TELEGRAM_STATUS_SIMPLE_TYPING="true"')
+        self.assertEqual(row["status"], sc.WORKS)
+        row = self._typing({"enabled": True, "simple_typing": True},
+                           conf='TELEGRAM_STATUS_SIMPLE_TYPING="0"')
+        self.assertEqual(row["status"], sc.BROKEN)
+        self.assertNotIn(SECRET, json.dumps(row))
+
+    def test_config_file_from_env_path(self) -> None:
+        cfg = self.tmp / "elsewhere.json"
+        cfg.write_text(json.dumps({"status": {"enabled": True, "simple_typing": True}}))
+        os.environ["TELEGRAM_CONFIG_FILE"] = str(cfg)
+        self.assertEqual(self._typing()["status"], sc.WORKS)
+
+    def test_missing_config_is_not_connected(self) -> None:
+        row = self._typing()
+        self.assertEqual(row["status"], sc.NOT_CONNECTED)
+        self.assertEqual(row["fix"], sc.FIX_UPDATE)
+
+    def test_typing_row_is_in_the_report(self) -> None:
+        self._install_fakes()
+        self.assertIn("tools/" + sc.TYPING_NAME, self._by_name())
 
 if __name__ == "__main__":
     unittest.main()

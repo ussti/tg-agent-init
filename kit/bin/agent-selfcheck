@@ -17,6 +17,7 @@ Usage:
 
 Exit code: 1 when anything is broken, else 0.
 Environment: AGENT_WS, CLAUDE_CONFIG_DIR, SECRETS_DIR (or AGENT_KEYS_FILE);
+TELEGRAM_CONFIG_FILE and TELEGRAM_STATUS_SIMPLE_TYPING as the plugin reads them;
 SELFCHECK_URL, SELFCHECK_YT_URL and SELFCHECK_TIMEOUT override the probes.
 """
 
@@ -50,6 +51,9 @@ FIX_UPDATE = "re-run update.sh (it reinstalls the kit tools)"
 FIX_GOOGLE = "agent-login google"
 FIX_RESTART = "restart the agent (the session loads keys.env only at start)"
 YT_NAME = "youtube-transcript (yt-dlp)"
+TYPING_NAME = "typing indicator"
+TYPING_ENV = "TELEGRAM_STATUS_SIMPLE_TYPING"
+TRUTHY = re.compile(r"^(1|true|yes|on)$", re.IGNORECASE)  # the plugin's own env parsing
 PLUGINS: tuple[str, ...] = (
     "superpowers@claude-plugins-official",
     "vercel@claude-plugins-official",
@@ -244,8 +248,52 @@ def check_gws(env: Env) -> Check:
     return Check("tools", name, WORKS)
 
 
+def typing_override() -> tuple[str, str] | None:
+    """The env override of simple_typing and where it came from, or None when unset.
+
+    The agent pane sources channel.conf, so a shell without it (cron, ssh) reads
+    that one key from the file; the other values there are never touched.
+    """
+    if TYPING_ENV in os.environ:
+        return os.environ[TYPING_ENV], "the session environment"
+    secrets = os.environ.get("SECRETS_DIR")
+    if not secrets:
+        return None
+    try:
+        conf = load_agent_keys().load_keys(Path(secrets) / "channel.conf")
+    except OSError:
+        return None
+    return (conf[TYPING_ENV], "channel.conf") if TYPING_ENV in conf else None
+
+
+def check_typing(env: Env) -> Check:
+    """Telegram shows «typing…» while the agent works: status on, simple_typing on."""
+    path = Path(os.environ.get("TELEGRAM_CONFIG_FILE") or env.ws / "state/telegram/config.json")
+    if not path.is_file():
+        return Check("tools", TYPING_NAME, NOT_CONNECTED, "no Telegram config.json", FIX_UPDATE)
+    status = read_json(path).get("status")
+    status = status if isinstance(status, dict) else {}
+    if status.get("enabled") is not True:
+        return Check("tools", TYPING_NAME, BROKEN, "status messages are off in config.json",
+                     f'set "status.enabled": true in {path}, then restart the agent')
+    override = typing_override()
+    if override is not None:
+        on = bool(TRUTHY.match(override[0].strip()))
+        source = override[1]
+        fix = (f'set {TYPING_ENV}="true" in channel.conf (SECRETS_DIR), '
+               "then restart the agent")
+    else:
+        on = status.get("simple_typing") is True
+        source = "config.json"
+        fix = f'set "status.simple_typing": true in {path}, then restart the agent'
+    if not on:
+        return Check("tools", TYPING_NAME, BROKEN, f"simple typing is off in {source}", fix)
+    return Check("tools", TYPING_NAME, WORKS)
+
+
 TOOL_CHECKS: tuple[Callable[[Env], Check], ...] = (
     check_agent_browser, check_crawl4ai, check_markdown_new, check_yt_dlp, check_gws,
+    check_typing,
 )
 
 
