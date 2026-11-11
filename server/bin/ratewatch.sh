@@ -77,6 +77,18 @@ PAUSE_MAX_S="${RATEWATCH_PAUSE_MAX:-3600}"
 
 RATE_LIMIT_MARKER="Stop and wait for limit to reset"
 
+# Confirmation dialogs (a hook can demand "Yes/No" even under bypassPermissions)
+# are answered by a human only. The watchdog never presses a key on one; it tells
+# the owner over the Bot API once the dialog has been up PERMISSION_ALERT_AFTER_S,
+# then at most once per PERMISSION_REALERT_S while the same dialog stays up.
+PERMISSION_ALERT_AFTER_S="${RATEWATCH_PERMISSION_ALERT_AFTER:-60}"
+PERMISSION_REALERT_S="${RATEWATCH_PERMISSION_REALERT:-1800}"
+PERMISSION_RETRY_S="${RATEWATCH_PERMISSION_RETRY:-300}"
+# Fixed text on purpose: the dialog shows the command, which can carry the owner's
+# email or calendar data, so nothing from the pane is ever forwarded.
+PERMISSION_ALERT_TEXT="Агент ждёт подтверждения в терминале и не ответит, пока его не дать. \
+Напишите доктору: «агент ждёт подтверждения, посмотри окно и скажи, что там»."
+
 log() { printf '[%s] [ratewatch] %s\n' "$(date -Is)" "$*" >>"$LOG" 2>&1; }
 
 # ───── Pure detectors (unit-tested; take pane text as $1) ─────
@@ -290,7 +302,40 @@ stop_blocks_submit() {
 # numbered row ("1: Bad  2: Fine  3: Good  0: Dismiss") without its question
 # text once scrolled, and it EATS Enter — that is how a peer agent sat silent on
 # 2026-07-28. Match the option row itself, not just the question.
+# A permission / confirmation dialog. Its highlighted option is drawn with the same
+# `❯` the composer uses, so input_pending() reads "1. Yes" as a stuck message and
+# an Enter from the watchdog would APPROVE the command (2026-11-04, a student
+# agent: a privacy hook asked Yes/No; nobody but tmux could see it). Matched on the
+# option rows themselves — a "1. Yes" row plus a numbered "No" row, optionally
+# inside a box frame (│) — in the status area only, so a scrolled-away dialog
+# never counts. Deliberately broad: missing a dialog means approving a command,
+# while a false match only pauses recovery for a while.
+permission_prompt() {
+  local tail
+  tail=$(pane_tail "$1" 12)
+  printf '%s\n' "$tail" | grep -qE '^[[:space:]│|]*(❯[[:space:]]*)?1\. Yes' || return 1
+  printf '%s\n' "$tail" | grep -qE '^[[:space:]│|]*(❯[[:space:]]*)?[2-9]\. No([ ,│|]|$)'
+}
+
+# permission_question: the dialog also carries its question line. Gates the owner
+# alert, so an assistant reply that merely ends in a "1. Yes / 2. No" list does not
+# page anyone (the stand-down above stays broad on purpose).
+permission_question() {
+  pane_tail "$1" 14 | grep -qiE 'Do you want to|Would you like to|Do you trust|proceed\?'
+}
+
+# permission_alert_due <since> <last_alert> <now>: pure timing for the owner alert.
+# since = epoch the dialog was first seen (0 = none), last_alert = epoch of the
+# previous alert for it (0 = none).
+permission_alert_due() {
+  local since="$1" last="$2" now="$3"
+  [ "$since" -gt 0 ] || return 1
+  (( now - since >= PERMISSION_ALERT_AFTER_S )) || return 1
+  [ "$last" -eq 0 ] || (( now - last >= PERMISSION_REALERT_S ))
+}
+
 blocking_modal() {
+  permission_prompt "$1" && return 0
   pane_tail "$1" 12 | grep -qiE \
     'monthly spend limit|Adjust monthly spend|rate-limit-options|Fable 5 now uses|How is Claude doing this session|Stop and wait for limit to reset|Enter to select|to navigate|Esc to cancel|0: Dismiss|1: Bad|Press Enter to continue|Paste code here|Login successful|Select login method'
 }
@@ -397,6 +442,8 @@ survey_fails=0      # failed survey dismissals this hour
 interrupt_at=""     # epoch of the /stop currently in effect ("" = none)
 paused=0            # 1 while the stop file holds the watchdog down
 interrupt_digest="" # text that sat in the composer when that /stop landed
+perm_since=0        # epoch the current confirmation dialog was first seen (0 = none)
+perm_alerted=0      # epoch of the last owner alert about that dialog
 
 # Exclusive keyboard ownership for this session. `mkdir` is atomic; the pid and
 # the directory mtime let another actor decide whether a leftover lock is stale.
@@ -479,6 +526,36 @@ while true; do
       last_pending=""; stable_count=0
       sleep "$RATE_COOLDOWN"
       continue
+    fi
+
+    # A confirmation dialog: never press anything, tell the owner instead. The
+    # composer handler below stands down on it through blocking_modal().
+    if permission_prompt "$PANE"; then
+      now_s=$(date +%s)
+      if [ "$perm_since" -eq 0 ]; then
+        perm_since=$now_s
+        log "confirmation dialog on screen — waiting for a human, not touching keys"
+      fi
+      if permission_question "$PANE" \
+        && permission_alert_due "$perm_since" "$perm_alerted" "$now_s"; then
+        log "ALERT: confirmation dialog up $(( now_s - perm_since ))s — notifying owner"
+        # The time the dialog appeared makes each dialog's text unique, so the
+        # notifier's per-text throttle never swallows the alert for a NEW one.
+        if [ -x "$NOTIFY_SCRIPT" ] && "$NOTIFY_SCRIPT" "$AGENT_NAME" \
+             "$PERMISSION_ALERT_TEXT (окно с $(date -d "@$perm_since" +%H:%M))" >/dev/null 2>&1; then
+          perm_alerted=$now_s
+        else
+          # Send failed: try again in PERMISSION_RETRY_S, not in half an hour.
+          log "WARN: owner alert not sent — retrying in ${PERMISSION_RETRY_S}s"
+          perm_alerted=$(( now_s - PERMISSION_REALERT_S + PERMISSION_RETRY_S ))
+        fi
+      fi
+      last_pending=""; stable_count=0
+      sleep "$POLL_INTERVAL"
+      continue
+    elif [ "$perm_since" -ne 0 ]; then
+      log "confirmation dialog closed after $(( $(date +%s) - perm_since ))s"
+      perm_since=0; perm_alerted=0
     fi
 
     # Clear the feedback survey before looking at the composer: while it is up
@@ -675,6 +752,8 @@ while true; do
     else
       last_pending=""; stable_count=0
     fi
+  else
+    perm_since=0; perm_alerted=0   # session gone: any dialog went with it
   fi
   sleep "$POLL_INTERVAL"
 done

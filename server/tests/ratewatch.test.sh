@@ -339,6 +339,75 @@ ok "report_dropped: survives a failing alert" "$?" "0"
 ok "report_dropped: survives a missing alert script" "$?" "0"
 ok "report_dropped: still spooled without alert" "$(cut -f2- "$SPOOL" | tail -1)" "пятое сообщение"
 
+# --- permission_prompt: a confirmation dialog only a human may answer ---
+# 2026-11-04, a student agent: a privacy hook asked "Yes/No" even under
+# bypassPermissions. The dialog lives only in tmux, so the owner saw silence, and
+# its highlighted "❯ 1. Yes" row read as a stuck composer — an Enter from the
+# watchdog would have approved the command on the owner's behalf.
+perm=$(printf ' Bash command\n\n   python3 cal.py --owner someone@example.com\n\n Hook PreToolUse:Bash requires confirmation\n\n Do you want to proceed?\n \342\235\257 1. Yes\n   2. No, and tell Claude what to do differently (esc)\n')
+ok "permission_prompt: hook ask dialog" "$(truthy permission_prompt "$perm")" "true"
+ok "blocking_modal: permission dialog" "$(truthy blocking_modal "$perm")" "true"
+if [ -n "$(input_pending "$perm")" ] && ! turn_active "$perm" && ! blocking_modal "$perm"; then
+  ok "permission dialog never reaches the Enter path" "would-press" "stand-down"
+else
+  ok "permission dialog never reaches the Enter path" "stand-down" "stand-down"
+fi
+perm3=$(printf ' Edit file\n Do you want to make this edit to notes.md?\n \342\235\257 1. Yes\n   2. Yes, allow all edits during this session (shift+tab)\n   3. No, and tell Claude what to do differently (esc)\n')
+ok "permission_prompt: edit dialog, three options" "$(truthy permission_prompt "$perm3")" "true"
+permsel=$(printf ' Do you want to proceed?\n   1. Yes\n \342\235\257 2. No, and tell Claude what to do differently (esc)\n')
+ok "permission_prompt: No highlighted" "$(truthy permission_prompt "$permsel")" "true"
+ok "permission_prompt: stuck composer is not one" "$(truthy permission_prompt "$stuck")" "false"
+ok "permission_prompt: feedback survey is not one" "$(truthy permission_prompt "$survey")" "false"
+yesmsg=$(printf '────\n\342\235\257 1. Yes, делай так\n────\n%s\n' "$STATUS")
+ok "permission_prompt: owner text starting with 1. Yes is not one" "$(truthy permission_prompt "$yesmsg")" "false"
+permold=$(printf ' Do you want to proceed?\n \342\235\257 1. Yes\n   2. No\n%s\n' "$(printf 'line\n%.0s' $(seq 1 20))")
+ok "permission_prompt: dialog scrolled far above is ignored" "$(truthy permission_prompt "$permold")" "false"
+
+boxed=$(printf '╭────────────╮\n│ Bash command │\n│ Do you want to proceed? │\n│ \342\235\257 1. Yes │\n│   2. No, and tell Claude what to do differently (esc) │\n╰────────────╯\n')
+ok "permission_prompt: box-drawn dialog" "$(truthy permission_prompt "$boxed")" "true"
+ok "blocking_modal: box-drawn dialog" "$(truthy blocking_modal "$boxed")" "true"
+ok "permission_question: dialog has its question" "$(truthy permission_question "$perm")" "true"
+replylist=$(printf '  Варианты:\n  1. Yes — оставить как есть\n  2. No — переделать\n────\n\342\235\257 \n────\n%s\n' "$STATUS")
+ok "permission_question: reply ending in a Yes/No list does not page" "$(truthy permission_question "$replylist")" "false"
+
+# --- permission_alert_due: when to tell the owner (pure: since / last / now) ---
+ok "alert: not before the delay" "$(truthy3 permission_alert_due 1000 0 1059 x)" "false"
+ok "alert: after the delay" "$(truthy3 permission_alert_due 1000 0 1060 x)" "true"
+ok "alert: not again within re-alert window" "$(truthy3 permission_alert_due 1000 1060 2800 x)" "false"
+ok "alert: again after re-alert window" "$(truthy3 permission_alert_due 1000 1060 2860 x)" "true"
+ok "alert: no dialog tracked" "$(truthy3 permission_alert_due 0 0 5000 x)" "false"
+
+# --- loop: a live confirmation dialog gets one owner alert and zero keystrokes ---
+LOOPD=$(mktemp -d)
+mkdir -p "$LOOPD/bin"
+printf '%s\n' "$perm" > "$LOOPD/pane"
+cat > "$LOOPD/bin/tmux" <<'FAKE'
+#!/usr/bin/env bash
+case "$1" in
+  has-session) exit 0 ;;
+  capture-pane) cat "$FAKE_PANE" ;;
+  send-keys) printf '%s\n' "$*" >> "$FAKE_KEYS" ;;
+esac
+exit 0
+FAKE
+cat > "$LOOPD/notify" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$2" >> "$FAKE_NOTES"
+FAKE
+chmod +x "$LOOPD/bin/tmux" "$LOOPD/notify"
+FAKE_PANE="$LOOPD/pane" FAKE_KEYS="$LOOPD/keys" FAKE_NOTES="$LOOPD/notes" \
+  PATH="$LOOPD/bin:$PATH" RATEWATCH_LOG="$LOOPD/ratewatch.log" \
+  RATEWATCH_STATE_DIR="$LOOPD" RATEWATCH_NOTIFY_SCRIPT="$LOOPD/notify" \
+  RATEWATCH_POLL_INTERVAL=1 RATEWATCH_PERMISSION_ALERT_AFTER=2 \
+  RATEWATCH_PERMISSION_REALERT=100 RATEWATCH_MIN_PENDING_AGE=0 \
+  timeout 6 bash "$HERE/../bin/ratewatch.sh" >/dev/null 2>&1 || true
+ok "loop: no key pressed on a confirmation dialog" "$(cat "$LOOPD/keys" 2>/dev/null)" ""
+ok "loop: owner alerted exactly once" "$(grep -c . < <(cat "$LOOPD/notes" 2>/dev/null))" "1"
+ok "loop: alert names when the dialog appeared" "$(grep -c 'окно с [0-9][0-9]:[0-9][0-9]' < <(cat "$LOOPD/notes" 2>/dev/null))" "1"
+ok "loop: alert carries nothing from the pane" \
+  "$(grep -c 'example.com\|cal.py' < <(cat "$LOOPD/notes" 2>/dev/null))" "0"
+rm -r "$LOOPD" 2>/dev/null || true
+
 # --- pause_state: the stop-file that suspends every keystroke ---
 # Owner, 2026-09-22: stopping the watchdog by hand does not hold — cron ensure
 # revives it within two minutes and it replayed an unverified composer line into
