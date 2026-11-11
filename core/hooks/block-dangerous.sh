@@ -7,6 +7,9 @@ cmd=$(jq -r ".tool_input.command // \"\"")
 dangerous_patterns=(
   "rm -rf"
   "git reset --hard"
+  # Force push in any spelling: short flag anywhere (-f, -uf) and +refspec.
+  "git push.*[[:space:]]-[a-zA-Z]*f\b"
+  "git push.*[[:space:]][+][^[:space:]]"
   "git push.*--force"
   "DROP TABLE"
   "DROP DATABASE"

@@ -94,6 +94,7 @@ check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/scripts/tests"
 check "rotate-warm unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/core/scripts/tests"
+check "block-dangerous hook tests" bash "$KIT/tests/block-dangerous.test.sh"
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.
