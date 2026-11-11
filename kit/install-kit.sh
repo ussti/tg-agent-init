@@ -13,7 +13,8 @@ CLAUDE_CONFIG_DIR="${2:?usage: install-kit.sh <AGENT_WS> <CLAUDE_CONFIG_DIR>}"
 KIT="$AGENT_WS/kit"
 
 say() { echo "[kit] $*"; }
-warn() { echo "[kit] WARN: $*" >&2; }
+WARNED=0
+warn() { WARNED=1; echo "[kit] WARN: $*" >&2; }
 
 say "copying kit into $KIT"
 mkdir -p "$KIT"
@@ -114,14 +115,22 @@ readonly -a KIT_PLUGINS=(
 
 readonly NET_TIMEOUT=600  # seconds; a hung download must not hang the whole install
 
-# Run a command silently with a time limit; stdin closed so nothing can wait for input.
+# Output of every quiet step goes here, so a WARN can be explained without re-running it.
+readonly KIT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/agent-kit/install-kit.log"
+mkdir -p "$(dirname "$KIT_LOG")" 2> /dev/null || true
+
+# Run a command quietly with a time limit; stdin closed so nothing can wait for input.
 # setsid drops the controlling terminal as well, so a nested sudo fails at once instead of
-# asking for a password (playwright's --with-deps calls sudo for apt).
+# asking for a password (playwright's --with-deps calls sudo for apt). Output: $KIT_LOG.
 try() {
-  local pre=()
+  local pre=() rc=0
   command -v setsid > /dev/null && pre+=(setsid -w)
   command -v timeout > /dev/null && pre+=(timeout "$NET_TIMEOUT")
-  "${pre[@]}" "$@" < /dev/null > /dev/null 2>&1
+  echo "== $(date '+%F %T') $*" >> "$KIT_LOG" 2> /dev/null || true
+  "${pre[@]}" "$@" < /dev/null >> "$KIT_LOG" 2>&1 || rc=$?
+  if [ "$rc" = 124 ]; then echo "(timed out after ${NET_TIMEOUT}s)" >> "$KIT_LOG" 2> /dev/null || true; fi
+  echo "== exit $rc" >> "$KIT_LOG" 2> /dev/null || true
+  return "$rc"
 }
 
 # Shared libraries headless Chrome needs and minimal server images lack. Root installs
@@ -263,4 +272,5 @@ if [ "${KIT_SKIP_DEPS:-0}" != 1 ]; then
   install_deps
   install_plugins
 fi
+if [ "$WARNED" = 1 ] && [ -s "$KIT_LOG" ]; then say "details of the warnings above: $KIT_LOG"; fi
 say "done"
