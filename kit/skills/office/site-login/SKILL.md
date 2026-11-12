@@ -7,6 +7,7 @@ description: >
   cabinets). Use when the user asks to log in to a service, says «залогинься», «войди в мой
   аккаунт», «зайди в личный кабинет», or a task needs their account on a site without an API.
   Not for Google, GitHub or Vercel — use agent-login; not for public pages — use agent-browser.
+  Not for Instagram, Facebook, TikTok or banks: they ban automated logins, so say no instead.
 ---
 
 # site-login — the user's accounts on websites
