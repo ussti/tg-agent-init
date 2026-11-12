@@ -34,6 +34,7 @@ stays inert and says what to set; nothing else breaks. Every key and login is op
 |-------|--------------|--------------|---------------|
 | gws | Google Workspace: Gmail, Calendar, Drive, Docs, Sheets, Slides, Contacts, Tasks | Google login (own OAuth client) | `agent-login google` |
 | cal | Cal.com bookings | `CAL_API_KEY` | `agent-keys add cal` |
+| site-login | log in to the user's accounts on sites by email/SMS code, keeps the login | the user's code per site | |
 
 ### Media
 
