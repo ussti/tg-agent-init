@@ -167,6 +167,8 @@ chmod +x "$WORK/bin/ldconfig"
 export PATH="$WORK/bin:$PATH"
 export KIT_LDCONFIG="$WORK/bin/ldconfig"
 export FAKE_TOOLS_LOG="$WORK/tools.log"
+# The install log lands under $HOME/.local/state; a developer XDG_STATE_HOME must not move it.
+unset XDG_STATE_HOME
 : > "$FAKE_TOOLS_LOG"
 FAKE_HOME="$WORK/home"
 mkdir -p "$FAKE_HOME"
@@ -476,6 +478,16 @@ check "missing pin skips the item instead of installing it unpinned" bash -c "
   && grep -q 'crawl4ai: no pinned version' \"\$W/log\""
 check "browser setup steps run after install" bash -c \
   "grep -qx 'agent-browser install' '$FAKE_TOOLS_LOG' && grep -qx 'crawl4ai-setup ' '$FAKE_TOOLS_LOG'"
+check "quiet steps keep their output in the install log" bash -c "
+  L='$FAKE_HOME/.local/state/agent-kit/install-kit.log' \
+  && grep -q '^== .* agent-browser install\$' \"\$L\" && grep -q '^== exit 0\$' \"\$L\""
+check "failed quiet step: exit code in the log, warning points to it" bash -c "
+  W='$WORK/faillog'; mkdir -p \"\$W/ws\" \
+  && FAKE_TOOLS_FAIL=1 HOME=\"\$W/home\" \
+     bash '$KIT/kit/install-kit.sh' \"\$W/ws\" \"\$W/cfg\" > \"\$W/out\" 2>&1 \
+  && L=\"\$W/home/.local/state/agent-kit/install-kit.log\" \
+  && grep -q '^== exit 1\$' \"\$L\" \
+  && grep -q \"details of the warnings above: \$L\" \"\$W/out\""
 check "agent-browser safety config installed" \
   jq -e '.contentBoundaries == true and .maxOutput == 50000' "$FAKE_HOME/.agent-browser/config.json"
 check "kit plugins installed into the agent's config dir" bash -c \
