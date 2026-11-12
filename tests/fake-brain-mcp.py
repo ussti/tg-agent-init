@@ -4,10 +4,12 @@
 Behaves like the live brain where the smoke depends on it: stateful
 streamable-http (no ``Mcp-Session-Id`` -> HTTP 400), the bearer is checked only
 inside tool handlers, a bad token yields ``isError`` (not an HTTP error), and
-tool-call replies come as SSE frames.
+tool-call replies come as SSE frames. Only the ``GBRAIN_TOOLS=core`` surface
+exists (upstream's default): ``slot_list`` or swarm ``stats`` are unknown tools.
 
-Usage: fake-brain-mcp.py VALID_TOKENS_FILE MEMORY_PORT RECALL_PORT SWARM_PORT
-Valid tokens are re-read on every call, one per line.
+Usage: fake-brain-mcp.py VALID_TOKENS_FILE MEMORY_PORT RECALL_PORT SWARM_PORT [CALLS_LOG]
+Valid tokens are re-read on every call, one per line. CALLS_LOG gets one
+``<role> <tool>`` line per authenticated tool call.
 """
 
 from __future__ import annotations
@@ -19,10 +21,36 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TOOLS_BY_ROLE = {"memory": {"slot_list"}, "recall": {"recent"}, "swarm": {"stats"}}
+# Core surface per upstream services/shared/tool_gating.py (swarm: always-on tools).
+TOOLS_BY_ROLE = {
+    "memory": {"create_decision_note", "create_handoff", "append_daily_log",
+               "supersede_decision"},
+    "recall": {"recall", "get", "related", "recent"},
+    "swarm": {"notify", "ack"},
+}
 
 
-def make_handler(role: str, tokens_file: pathlib.Path) -> type[BaseHTTPRequestHandler]:
+def run_tool(name: str, args: dict, token: str = "") -> tuple[bool, str]:
+    """Mimic the upstream handler after authentication; return (is_error, text).
+
+    A token containing READONLY has no write scope: supersede_decision then fails
+    on the scope check, as upstream does before it looks for the old decision.
+    """
+    if name == "supersede_decision" and "READONLY" in token:
+        return True, ("Error executing tool supersede_decision: "
+                      "Agent 'smoke' cannot write to 30-decisions")
+    if name == "supersede_decision":
+        return True, ("Error executing tool supersede_decision: Original decision not found: "
+                      f"{args.get('old_path')}")
+    if name == "recent" and "scope" not in args:
+        return True, "Error executing tool recent: missing required argument 'scope'"
+    if name == "ack":
+        return False, json.dumps({"task_id": args.get("task_id"), "acked": False})
+    return False, "{}"
+
+
+def make_handler(role: str, tokens_file: pathlib.Path,
+                 calls_log: pathlib.Path | None) -> type[BaseHTTPRequestHandler]:
     """Build a request handler for one server role."""
     sessions: set[str] = set()
 
@@ -73,7 +101,11 @@ def make_handler(role: str, tokens_file: pathlib.Path) -> type[BaseHTTPRequestHa
                 token = auth.removeprefix("Bearer ").strip()
                 valid = set(tokens_file.read_text().split()) if tokens_file.exists() else set()
                 if token in valid:
-                    result = {"isError": False, "content": [{"type": "text", "text": "{}"}]}
+                    if calls_log is not None:
+                        with calls_log.open("a") as fh:
+                            fh.write(f"{role} {name}\n")
+                    is_error, text = run_tool(name, msg["params"].get("arguments") or {}, token)
+                    result = {"isError": is_error, "content": [{"type": "text", "text": text}]}
                 else:
                     result = {"isError": True, "content": [{
                         "type": "text",
@@ -87,7 +119,9 @@ def make_handler(role: str, tokens_file: pathlib.Path) -> type[BaseHTTPRequestHa
 def main() -> int:
     """Serve the three roles until killed."""
     tokens_file = pathlib.Path(sys.argv[1])
-    servers = [ThreadingHTTPServer(("127.0.0.1", int(port)), make_handler(role, tokens_file))
+    calls_log = pathlib.Path(sys.argv[5]) if len(sys.argv) > 5 else None
+    servers = [ThreadingHTTPServer(("127.0.0.1", int(port)),
+                                   make_handler(role, tokens_file, calls_log))
                for role, port in zip(["memory", "recall", "swarm"], sys.argv[2:5])]
     for server in servers[1:]:
         threading.Thread(target=server.serve_forever, daemon=True).start()
