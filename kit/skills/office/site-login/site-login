@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# site-login -- one logged-in browser per site for the agent.
+#
+# Every site gets its own Chrome profile under ~/.local/share/agent-browser/profiles/<site>
+# (mode 700, outside the agent workspace, so cookies never land in git or snapshots),
+# its own agent-browser session and a desktop User-Agent: many sites reject logins from a
+# browser that reports itself as HeadlessChrome.
+#
+# Usage:
+#   site-login run <site> <agent-browser command...>   e.g. site-login run tripcom open https://www.trip.com/
+#   site-login list                                    sites with a saved profile
+#   site-login expiry <site>                           when the login cookies expire (names only, no values)
+#   site-login forget <site> --yes                     log out: close the browser, delete the profile
+set -euo pipefail
+
+# Fixed under $HOME on purpose: no override can move cookies into the workspace or make
+# `forget` delete anything outside this folder.
+readonly PROFILES="$HOME/.local/share/agent-browser/profiles"
+readonly BROWSERS="$HOME/.agent-browser/browsers"
+# Used when no downloaded Chrome is found; only the major version goes into the User-Agent.
+readonly FALLBACK_CHROME_MAJOR=157
+readonly SITE_RE='^[a-z0-9][a-z0-9-]{0,39}$'
+
+die() { echo "site-login: $*" >&2; exit 1; }
+usage() { sed -n '9,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+check_site() {
+  [ -n "${1:-}" ] || die "site name missing"
+  [[ "$1" =~ $SITE_RE ]] || die "site name: lowercase letters, digits, hyphens (e.g. tripcom)"
+}
+
+chrome_major() {
+  local newest=""
+  if [ -d "$BROWSERS" ]; then
+    newest="$(find "$BROWSERS" -maxdepth 1 -name 'chrome-*' -printf '%f\n' 2> /dev/null \
+      | sed 's/^chrome-//' | sort -V | tail -1)"
+  fi
+  newest="${newest%%.*}"
+  [[ "$newest" =~ ^[0-9]+$ ]] && echo "$newest" || echo "$FALLBACK_CHROME_MAJOR"
+}
+
+desktop_ua() {
+  # A Mac desktop Chrome: the most common desktop browser, accepted where HeadlessChrome is not.
+  echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" \
+    "(KHTML, like Gecko) Chrome/$(chrome_major).0.0.0 Safari/537.36"
+}
+
+real_dir() {
+  # A profile path must be a real directory, never a symlink to somewhere else.
+  [ ! -L "$1" ] || die "$1 is a symlink; refusing to use it"
+}
+
+browse() {
+  local site="$1"; shift
+  local dir="$PROFILES/$site"
+  real_dir "$PROFILES"
+  real_dir "$dir"
+  mkdir -p "$PROFILES" "$dir"
+  chmod 700 "$PROFILES" "$dir"
+  agent-browser --session "site-$site" --profile "$dir" --user-agent "$(desktop_ua)" "$@"
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  run)
+    check_site "${1:-}"
+    site="$1"; shift
+    [ $# -gt 0 ] || die "agent-browser command missing (e.g. open <url>)"
+    browse "$site" "$@"
+    ;;
+  list)
+    [ -d "$PROFILES" ] || exit 0
+    find "$PROFILES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+    ;;
+  expiry)
+    check_site "${1:-}"
+    [ -d "$PROFILES/$1" ] || die "no profile for $1: log in first"
+    browse "$1" cookies --json | python3 -c '
+import json, re, sys, time
+# Cookie names that usually carry the login itself; others (analytics, ads) live longer.
+LOGIN = re.compile(r"ticket|token|auth|sess|login|sid|uid|user", re.I)
+cookies = json.load(sys.stdin).get("data", {}).get("cookies", [])
+kept = [c for c in cookies if not c.get("session") and (c.get("expires") or 0) > 0]
+login = [c for c in kept if LOGIN.search(c.get("name", ""))]
+if not kept:
+    print("no saved cookies for the open page. Open the site first "
+          "(run <site> open <url>) and run expiry again")
+    sys.exit(0)
+if login:
+    print("login-like cookies (names only); dates are a hint, the site decides:")
+    rows = login
+else:
+    print("no cookie looks like a login; latest dates of all cookies:")
+    rows = kept
+for c in sorted(rows, key=lambda c: c["expires"]):
+    day = time.strftime("%Y-%m-%d", time.gmtime(c["expires"]))
+    domain = c.get("domain", "").lstrip(".")
+    name = c.get("name", "")
+    print(f"  {day}  {domain}  {name}")
+'
+    ;;
+  forget)
+    check_site "${1:-}"
+    [ "${2:-}" = --yes ] || die "deletes the saved login for $1; rerun with --yes after the user agreed"
+    real_dir "$PROFILES"
+    real_dir "$PROFILES/$1"
+    [ -d "$PROFILES/$1" ] || die "no saved login for $1"
+    # Never delete a profile a running browser still writes to.
+    agent-browser --session "site-$1" close > /dev/null 2>&1 \
+      || die "could not close the $1 browser; profile kept"
+    rm -rf -- "${PROFILES:?}/$1"
+    echo "forgot $1"
+    ;;
+  -h | --help | help) usage 0 ;;
+  *) usage 1 >&2 ;;
+esac

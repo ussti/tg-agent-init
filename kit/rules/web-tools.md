@@ -8,7 +8,8 @@ Pick the lightest tool that does the job:
 | A quick fact, a date, a price, «what is X» | WebSearch |
 | Text of one page (article, docs) | WebFetch, or `markdown-new` for clean Markdown |
 | A whole site, a page that needs JS, or text verbatim | crawl4ai |
-| Act on a site: forms, login, clicks, screenshots, QA | agent-browser |
+| Act on a site: forms, clicks, screenshots, QA | agent-browser |
+| Work in the user's own account on a site (bookings, support chat, cabinet) | site-login |
 | A detailed answer with sources from many sites, a serious fact-check | perplexity-research (WebSearch if no key) |
 | What people discussed in the last 30 days | last30days |
 

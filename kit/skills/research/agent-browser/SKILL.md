@@ -3,9 +3,10 @@ name: agent-browser
 description: >
   Browser automation CLI for AI agents. Use when the user needs to interact with a
   website: navigate pages, fill forms, click buttons, take screenshots, extract data,
-  test a web app, log in to a site, or automate any browser task. Also for exploratory
-  testing and QA. Not for just reading a page — use WebFetch or markdown-new;
-  not for pulling a whole site or verbatim text — use crawl4ai.
+  test a web app, or automate any browser task. Also for exploratory testing and QA.
+  Not for just reading a page — use WebFetch or markdown-new;
+  not for pulling a whole site or verbatim text — use crawl4ai;
+  not for working in the user's own account on a site — use site-login.
 allowed-tools: Bash(agent-browser:*), Bash(npx agent-browser:*)
 ---
 
@@ -31,7 +32,8 @@ Run `agent-browser skills list` to see the specialized skills available.
 
 ## Use it for
 
-- Pages that need clicks, forms, logins or JavaScript rendering
+- Pages that need clicks, forms or JavaScript rendering
+  (logging in to the user's account: site-login, it keeps the login)
 - Screenshots of a live page
 - Testing a web app end to end
 
