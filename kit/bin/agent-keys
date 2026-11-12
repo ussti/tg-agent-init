@@ -80,7 +80,7 @@ SERVICES: tuple[Service, ...] = (
             "https://app.cal.com/settings/developer/api-keys", "GET",
             "https://api.cal.com/v2/me", extra=(("cal-api-version", "2024-08-13"),)),
     Service("brave", "BRAVE_API_KEY", "web search for last30days (2,000 free / month)",
-            "https://api.search.brave.com/app/keys", "GET",
+            "https://api-dashboard.search.brave.com/", "GET",
             "https://api.search.brave.com/res/v1/web/search?q=test&count=1",
             auth="x-subscription-token", reject=frozenset({401, 403, 422})),
     Service("scrapecreators", "SCRAPECREATORS_API_KEY",
