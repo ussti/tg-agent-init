@@ -196,6 +196,8 @@ find -L "$AGENT_WS/skills" -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
 VERSION="$(git -C "$KIT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 mkdir -p "$AGENT_WS/state"
 printf '%s\n' "$VERSION" > "$AGENT_WS/state/kit-version"
+# Where this repo lives, for /update from Telegram (server/bin/self-update.sh).
+printf '%s\n' "$KIT_DIR" > "$AGENT_WS/state/kit-dir"
 
 # ---------------------------------------------------------------- restart + health
 UNIT="$AGENT_NAME-agent.service"

@@ -783,6 +783,48 @@ check "update: previous plugin kept in backups" bash -c \
   "ls -d '$WS'/backups/update_*/plugin-old/plugin/STALE-FILE"
 check "update: run-agent.sh executable" test -x "$WS/bin/run-agent.sh"
 check "update: kit version recorded" test -s "$WS/state/kit-version"
+check "update: kit location recorded for /update" grep -qxF "$KIT" "$WS/state/kit-dir"
+check "update: self-update wrapper installed" test -x "$WS/bin/self-update.sh"
+# /update and /restart from Telegram run bin/self-update.sh; it reports through
+# state/self-update.json. A stub kit stands in for the real update.sh.
+self_update_ok() {
+  local kit="$WORK/kit-stub" res="$WS/state/self-update.json"
+  mkdir -p "$kit"
+  printf '#!/usr/bin/env bash\necho "args=$* tmux=${TMUX:-none}" > "%s/stub.args"\nexit "${STUB_RC:-0}"\n' \
+    "$WORK" > "$kit/update.sh"
+  echo "$kit" > "$WS/state/kit-dir"
+  rm -f "$res"
+  TMUX=/tmp/fake,1,0 SELF_UPDATE_CHAT_ID=42 bash "$WS/bin/self-update.sh" update > "$WORK/su1.log" 2>&1
+  jq -e '.action == "update" and .rc == 0 and .chat_id == "42" and (.version | length > 0)' \
+    "$res" >/dev/null || return 1
+  grep -qF -- "--ws $WS" "$WORK/stub.args" && grep -q 'tmux=none' "$WORK/stub.args" || return 1
+  rm -f "$res"
+  STUB_RC=5 bash "$WS/bin/self-update.sh" update > "$WORK/su2.log" 2>&1
+  jq -e '.rc == 5 and (has("chat_id") | not)' "$res" >/dev/null || return 1
+  echo "$WORK/nowhere" > "$WS/state/kit-dir"; rm -f "$res"
+  bash "$WS/bin/self-update.sh" update > "$WORK/su3.log" 2>&1
+  jq -e '.rc == 3' "$res" >/dev/null
+}
+cp "$WS/state/kit-dir" "$WORK/kit-dir.real"
+check "self-update: update runs update.sh outside tmux and records the result" self_update_ok
+cp "$WORK/kit-dir.real" "$WS/state/kit-dir"
+self_restart_ok() {
+  local bin="$WORK/su-bin" res="$WS/state/self-update.json" victim rc=0
+  mkdir -p "$bin"
+  sleep 300 & victim=$!
+  # While the victim lives it is the main PID; once killed, a new PID appears.
+  printf '#!/usr/bin/env bash\nif kill -0 %s 2>/dev/null; then echo %s; else echo 999999; fi\n' \
+    "$victim" "$victim" > "$bin/systemctl"
+  chmod +x "$bin/systemctl"
+  rm -f "$res"
+  PATH="$bin:$PATH" SELF_UPDATE_RESTART_WAIT_S=15 bash "$WS/bin/self-update.sh" restart \
+    > "$WORK/su4.log" 2>&1 || rc=1
+  wait "$victim" 2>/dev/null || true
+  [ "$rc" = 0 ] && jq -e '.action == "restart" and .rc == 0' "$res" >/dev/null
+}
+check "self-update: restart stops the main process and waits for the new one" self_restart_ok
+rm -f "$WS/state/self-update.json"
+check "self-update: unknown action refused" bash -c "! bash '$WS/bin/self-update.sh' bogus 2>/dev/null"
 check "update: finds the only agent without --ws" run_update "$WORK/update2.log" --no-pull --no-restart
 mkdir -p "$WORK/rootbin"
 printf '#!/usr/bin/env bash\necho 0\n' > "$WORK/rootbin/id"

@@ -1,0 +1,948 @@
+Subject: [PATCH] команды /update и /restart в Telegram
+
+Обновить или перезапустить агента можно было только с сервера:
+зайти по ssh и запустить ./update.sh или systemctl. Теперь это две
+команды в меню бота.
+
+Голая команда присылает карточку с подтверждением (как /new). Нажатие
+запускает $AGENT_WS/bin/self-update.sh отдельным процессом (setsid,
+без TMUX), поэтому он переживает перезапуск, который сам и вызывает.
+Скрипт пишет итог в state/self-update.json; живой на тот момент
+процесс плагина отправляет владельцу «Обновился до <версия>»,
+«Перезапустился» или хвост лога при ошибке, один раз, и удаляет файл.
+
+Защита: только allowed_user_ids, только личка владельца, карточка
+живёт 2 минуты, двойное нажатие срабатывает один раз, параллельный
+запуск блокирует lock-файл (протухает через 20 минут). На установке
+без self-update.sh команда объясняет, что нужно один раз обновиться
+вручную.
+
+Binary files base/plugin/src/chats/hooks/__pycache__/stop-to-outbox.cpython-312.pyc and work/plugin/src/chats/hooks/__pycache__/stop-to-outbox.cpython-312.pyc differ
+diff -ruN a/plugin/src/commands/oob.ts b/plugin/src/commands/oob.ts
+--- a/plugin/src/commands/oob.ts
++++ b/plugin/src/commands/oob.ts
+@@ -1,7 +1,8 @@
+ // Out-of-band (OOB) commands handled by the plugin BEFORE a channel
+ // notification is sent to Claude.
+ //
+-// Control commands: /help, /status, /stop, /compact, /new, /mirror, /keys, /cc.
++// Control commands: /help, /status, /stop, /compact, /new, /mirror, /keys, /cc,
++// /update, /restart.
+ // The session-driving controls (/stop, /compact, /new-confirm, /cc, /keys) act
+ // on the agent's tmux pane through the RELIABLE injection layer in keys.ts
+ // (probe → optionally interrupt → send → confirm), never a blind Enter.
+@@ -27,6 +28,7 @@
+ 
+ import type { AppConfig } from '../config.js'
+ import type { Logger } from '../log.js'
++import { buildSysConfirmCard } from './self-update.js'
+ import type { TelegramApi, InlineKeyboardLike } from '../channel/tools.js'
+ import { sendChannelNotification, type ChannelEvent } from '../channel/notify.js'
+ import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
+@@ -58,6 +60,7 @@
+ 
+ export type OobCommandName =
+   | 'help' | 'status' | 'stop' | 'compact' | 'new' | 'mirror' | 'keys' | 'cc' | 'lease'
++  | 'update' | 'restart'
+ 
+ const KNOWN_COMMANDS = new Set<OobCommandName>([
+   'help',
+@@ -69,6 +72,8 @@
+   'keys',
+   'cc',
+   'lease',
++  'update',
++  'restart',
+ ])
+ 
+ // Sub-actions for /mirror. We accept the bare command (= same as `status`),
+@@ -234,7 +239,9 @@
+     + '<code>/mirror on|off|status</code> — управлять зеркалом терминала (tmux, обновляется в реальном времени)\n'
+     + '<code>/keys</code> — панель кнопок: тап = нажатие в сессии (ответить на нативный диалог Claude Code; есть ⌫ backspace и 🧹 clear)\n'
+     + '<code>/cc</code> — панель команд Claude Code (тап = выполнить); либо <code>/cc &lt;команда&gt;</code>: <code>/cc model opus</code>\n'
+-    + '<code>/lease &lt;scope&gt;</code> — выдать мандат автономии (напр. <code>/lease деплой стейджинга; ttl=48h</code>); без аргумента — список активных\n\n'
++    + '<code>/lease &lt;scope&gt;</code> — выдать мандат автономии (напр. <code>/lease деплой стейджинга; ttl=48h</code>); без аргумента — список активных\n'
++    + '<code>/update</code> — обновить агента до новой версии кита (спросит подтверждение)\n'
++    + '<code>/restart</code> — перезапустить агента (спросит подтверждение)\n\n'
+     + '<i>примечание: /stop — best-effort: посылает Escape в сессию, но не может '
+     + 'гарантировать прерывание посреди вызова инструмента.</i>'
+   )
+@@ -256,6 +263,8 @@
+   { command: 'keys', description: 'панель кнопок для подтверждений (нажатия в сессию)' },
+   { command: 'cc', description: 'панель команд Claude Code (тап) или /cc <команда>' },
+   { command: 'lease', description: 'выдать мандат автономии: /lease <scope>[; ttl=48h]' },
++  { command: 'update', description: 'обновить агента до новой версии кита (с подтверждением)' },
++  { command: 'restart', description: 'перезапустить агента (с подтверждением)' },
+ ]
+ 
+ // Agent commands shown in the «/» menu next to BOT_COMMANDS. They are NOT in
+@@ -658,6 +667,23 @@
+         replyToTelegram: {
+           text: card.text,
+           parseMode: 'HTML',
++          inlineKeyboard: card.inlineKeyboard,
++        },
++      }
++    }
++
++    case 'update':
++    case 'restart': {
++      // Both restart the plugin, so a bare command only posts a confirm card;
++      // the tap launches the detached wrapper (sysq: callback in server.ts).
++      ctx.log.info(`oob /${parsed.name}`, { chat_id: ctx.chatId })
++      const card = buildSysConfirmCard(parsed.name)
++      return {
++        handled: true,
++        command: parsed.name,
++        replyToTelegram: {
++          text: card.text,
++          parseMode: 'HTML',
+           inlineKeyboard: card.inlineKeyboard,
+         },
+       }
+diff -ruN a/plugin/src/commands/self-update.ts b/plugin/src/commands/self-update.ts
+--- a/plugin/src/commands/self-update.ts
++++ b/plugin/src/commands/self-update.ts
+@@ -0,0 +1,452 @@
++// /update and /restart — owner-only controls that update or restart the agent
++// from Telegram.
++//
++// Both are destructive for the running session (the plugin restarts), so a bare
++// command posts a confirm card; the tap launches `$AGENT_WS/bin/self-update.sh`
++// fully detached (setsid, own log, no TMUX in env). The unit has
++// KillMode=process, so the wrapper survives the restart it causes. The wrapper
++// writes `$AGENT_WS/state/self-update.json` when done; whichever plugin process
++// is alive then (the old one if the update failed before restart, the new one
++// after it) reports the result to the owner once and removes the file.
++//
++// Callback data uses the `sysq:` prefix, distinct from kkey:/ccmd:/pgate:/ask:/
++// newq:/hud:.
++//   sysq:update:<ts>:<rand>  — run update.sh
++//   sysq:restart:<ts>:<rand> — restart the agent unit
++//   sysq:cancel              — abort
++
++import { spawn } from 'node:child_process'
++import {
++  closeSync,
++  existsSync,
++  mkdirSync,
++  openSync,
++  readFileSync,
++  renameSync,
++  statSync,
++  unlinkSync,
++  writeFileSync,
++} from 'node:fs'
++import { dirname, join } from 'node:path'
++
++import type { InlineKeyboardLike } from '../channel/tools.js'
++import { escapeHtml } from '../format/html.js'
++import type { Logger } from '../log.js'
++import { createNewqNonceGuard, isOwnerDmChat, type NewqNonceGuard } from '../telegram/newq-confirm-ui.js'
++
++export const SYSQ_PREFIX = 'sysq:'
++// A card older than this cannot fire.
++export const SYSQ_TTL_MS = 2 * 60 * 1000
++// A lock older than this is a wrapper that died without writing a result.
++export const SYSQ_LOCK_STALE_MS = 20 * 60 * 1000
++// How long a plugin keeps looking for the result after launch or boot.
++export const SYSQ_WATCH_MS = 15 * 60 * 1000
++export const SYSQ_POLL_MS = 5_000
++const LOG_TAIL_LINES = 12
++const LOG_TAIL_MAX_CHARS = 1500
++
++export type SysAction = 'update' | 'restart'
++
++export interface SelfUpdatePaths {
++  script: string
++  resultFile: string
++  lockFile: string
++  logFile: string
++}
++
++// Paths come from agent.conf, which the pane sources before launching Claude.
++// Null when this is not a tg-agent install or the wrapper is not deployed yet.
++export function resolveSelfUpdatePaths(env: NodeJS.ProcessEnv): SelfUpdatePaths | null {
++  const ws = env.AGENT_WS
++  if (typeof ws !== 'string' || ws.length === 0) return null
++  const script = join(ws, 'bin', 'self-update.sh')
++  if (!existsSync(script)) return null
++  const logDir = env.LOG_DIR !== undefined && env.LOG_DIR.length > 0 ? env.LOG_DIR : join(ws, 'logs')
++  return {
++    script,
++    resultFile: join(ws, 'state', 'self-update.json'),
++    lockFile: join(ws, 'state', 'self-update.lock'),
++    logFile: join(logDir, 'self-update.log'),
++  }
++}
++
++// ───────────────────────────── confirm card
++
++export interface ParsedSysq {
++  action: SysAction | 'cancel'
++  ts: number | null
++  nonce: string | null
++}
++
++export function parseSysqCallback(data: string): ParsedSysq | null {
++  if (typeof data !== 'string' || !data.startsWith(SYSQ_PREFIX)) return null
++  const rest = data.slice(SYSQ_PREFIX.length)
++  if (rest === 'cancel') return { action: 'cancel', ts: null, nonce: null }
++  const m = /^(update|restart):(\d+):([a-z0-9]{1,16})$/.exec(rest)
++  if (m === null) return null
++  const ts = Number(m[2])
++  if (!Number.isSafeInteger(ts) || ts <= 0) return null
++  return { action: m[1] as SysAction, ts, nonce: `${m[2]}:${m[3]}` }
++}
++
++const CARD_TEXT: Record<SysAction, string> = {
++  update:
++    '<b>Обновление</b> — подтяну новую версию кита и перезапущусь. '
++    + 'Если новая версия не встанет, верну прежнюю. Продолжить?',
++  restart: '<b>Перезапуск</b> — агент перезапустится, текущая задача прервется. Продолжить?',
++}
++
++const CONFIRM_LABEL: Record<SysAction, string> = {
++  update: 'Да, обновить',
++  restart: 'Да, перезапустить',
++}
++
++export function buildSysConfirmCard(action: SysAction): {
++  text: string
++  inlineKeyboard: InlineKeyboardLike
++} {
++  const rand = Math.random().toString(36).slice(2, 10) || 'x'
++  return {
++    text: CARD_TEXT[action],
++    inlineKeyboard: {
++      inline_keyboard: [
++        [{ text: CONFIRM_LABEL[action], callback_data: `${SYSQ_PREFIX}${action}:${Date.now()}:${rand}` }],
++        [{ text: 'Отмена', callback_data: `${SYSQ_PREFIX}cancel` }],
++      ],
++    },
++  }
++}
++
++// ───────────────────────────── launch
++
++export type SpawnDetached = (
++  cmd: string,
++  args: string[],
++  logFile: string,
++  env: NodeJS.ProcessEnv,
++) => void
++
++// Real spawner: own session (setsid) so the restart's SIGHUP/kill of the pane
++// does not reach it; stdout+stderr appended to the log file.
++export const spawnDetached: SpawnDetached = (cmd, args, logFile, env) => {
++  mkdirSync(dirname(logFile), { recursive: true })
++  const fd = openSync(logFile, 'a')
++  try {
++    const child = spawn('setsid', [cmd, ...args], {
++      detached: true,
++      stdio: ['ignore', fd, fd],
++      env,
++    })
++    child.unref()
++  } finally {
++    closeSync(fd)
++  }
++}
++
++interface LockInfo {
++  ts: number
++  action?: SysAction
++  chat_id?: string
++}
++
++function readLock(file: string): LockInfo | null {
++  let raw: string
++  try {
++    raw = readFileSync(file, 'utf8').trim()
++  } catch {
++    return null
++  }
++  try {
++    const v = JSON.parse(raw) as unknown
++    if (typeof v === 'number') return { ts: v }
++    if (v !== null && typeof v === 'object' && typeof (v as LockInfo).ts === 'number') {
++      return v as LockInfo
++    }
++  } catch {
++    // fall through to mtime
++  }
++  try {
++    return { ts: statSync(file).mtimeMs }
++  } catch {
++    return null
++  }
++}
++
++function removeQuiet(file: string): void {
++  try {
++    unlinkSync(file)
++  } catch {
++    // already gone
++  }
++}
++
++export interface LaunchOptions {
++  spawn?: SpawnDetached
++  env?: NodeJS.ProcessEnv
++  chatId?: string
++}
++
++export type LaunchResult = { ok: true } | { ok: false; reason: 'busy' | 'spawn_failed'; error?: string }
++
++export function launchSelfUpdate(
++  action: SysAction,
++  paths: SelfUpdatePaths,
++  opts: LaunchOptions = {},
++): LaunchResult {
++  const lock = readLock(paths.lockFile)
++  if (lock !== null && Date.now() - lock.ts < SYSQ_LOCK_STALE_MS) {
++    return { ok: false, reason: 'busy' }
++  }
++  mkdirSync(dirname(paths.lockFile), { recursive: true })
++  removeQuiet(paths.resultFile)
++  const info: LockInfo = { ts: Date.now(), action }
++  if (opts.chatId !== undefined) info.chat_id = opts.chatId
++  writeFileSync(paths.lockFile, JSON.stringify(info))
++
++  const env: NodeJS.ProcessEnv = { ...(opts.env ?? process.env) }
++  // update.sh refuses to run inside the agent's own tmux session; the wrapper is
++  // detached from it, so drop the marker.
++  delete env.TMUX
++  delete env.TMUX_PANE
++  if (opts.chatId !== undefined) env.SELF_UPDATE_CHAT_ID = opts.chatId
++  try {
++    ;(opts.spawn ?? spawnDetached)('bash', [paths.script, action], paths.logFile, env)
++  } catch (err) {
++    removeQuiet(paths.lockFile)
++    return { ok: false, reason: 'spawn_failed', error: err instanceof Error ? err.message : String(err) }
++  }
++  return { ok: true }
++}
++
++// ───────────────────────────── report
++
++export interface SelfUpdateResult {
++  action: SysAction
++  rc: number
++  version?: string
++  chat_id?: string
++}
++
++function parseResult(raw: string): SelfUpdateResult | null {
++  try {
++    const v = JSON.parse(raw) as Partial<SelfUpdateResult>
++    if ((v.action !== 'update' && v.action !== 'restart') || typeof v.rc !== 'number') return null
++    return v as SelfUpdateResult
++  } catch {
++    return null
++  }
++}
++
++export function formatSelfUpdateReport(res: SelfUpdateResult, logTail: string): string {
++  if (res.action === 'restart') {
++    return res.rc === 0
++      ? '<b>Перезапустился</b>, на связи.'
++      : `<b>Перезапуск не удался</b> (код ${res.rc}).${tailBlock(logTail)}`
++  }
++  const ver = res.version !== undefined && res.version.length > 0
++    ? ` <code>${escapeHtml(res.version)}</code>`
++    : ''
++  if (res.rc === 0) return `<b>Обновился</b> до версии${ver}, на связи.`
++  return (
++    `<b>Обновление не прошло</b> (код ${res.rc}). Работаю на прежней версии.`
++    + tailBlock(logTail)
++  )
++}
++
++function tailBlock(tail: string): string {
++  const t = tail.trim()
++  return t.length === 0 ? '' : `\n\nКонец лога:\n<pre>${escapeHtml(t)}</pre>`
++}
++
++function readLogTail(file: string): string {
++  try {
++    const lines = readFileSync(file, 'utf8').split('\n')
++    const tail = lines.slice(-LOG_TAIL_LINES - 1).join('\n')
++    return tail.length > LOG_TAIL_MAX_CHARS ? tail.slice(-LOG_TAIL_MAX_CHARS) : tail
++  } catch {
++    return ''
++  }
++}
++
++export type SendOwner = (chatId: string, text: string) => Promise<void>
++
++// Report a finished run once. Claims the result by renaming it first, so two
++// plugin processes alive at the same moment cannot both send it. Returns true
++// when a report was sent.
++export async function reportSelfUpdateResult(
++  paths: SelfUpdatePaths,
++  ownerChatIds: readonly (number | string)[],
++  send: SendOwner,
++  log: Logger,
++): Promise<boolean> {
++  const claimed = `${paths.resultFile}.${process.pid}.claimed`
++  try {
++    renameSync(paths.resultFile, claimed)
++  } catch {
++    return false
++  }
++  let raw = ''
++  try {
++    raw = readFileSync(claimed, 'utf8')
++  } catch {
++    // vanished between rename and read
++  }
++  removeQuiet(claimed)
++  const lock = readLock(paths.lockFile)
++  removeQuiet(paths.lockFile)
++  const res = parseResult(raw)
++  if (res === null) {
++    log.warn('self-update result unreadable, dropped')
++    return false
++  }
++  const owners = ownerChatIds.map(String)
++  const wanted = res.chat_id ?? lock?.chat_id
++  const chatId = wanted !== undefined && owners.includes(wanted) ? wanted : owners[0]
++  if (chatId === undefined) {
++    log.warn('self-update result: no owner chat to report to')
++    return false
++  }
++  const tail = res.rc === 0 ? '' : readLogTail(paths.logFile)
++  try {
++    await send(chatId, formatSelfUpdateReport(res, tail))
++  } catch (err) {
++    log.warn('self-update report send failed', {
++      error: err instanceof Error ? err.message : String(err),
++    })
++    return false
++  }
++  log.info('self-update reported', { action: res.action, rc: res.rc })
++  return true
++}
++
++// Poll for the result for a bounded time. Started on boot (a restart or a
++// successful update lands here) and right after a launch (a failure before the
++// restart lands in the old process). Returns a stop function.
++export function watchSelfUpdateResult(
++  paths: SelfUpdatePaths,
++  ownerChatIds: readonly (number | string)[],
++  send: SendOwner,
++  log: Logger,
++  opts: { pollMs?: number; maxMs?: number } = {},
++): () => void {
++  const pollMs = opts.pollMs ?? SYSQ_POLL_MS
++  const deadline = Date.now() + (opts.maxMs ?? SYSQ_WATCH_MS)
++  let stopped = false
++  let timer: ReturnType<typeof setTimeout> | undefined
++  const tick = async (): Promise<void> => {
++    if (stopped) return
++    const done = await reportSelfUpdateResult(paths, ownerChatIds, send, log).catch(() => false)
++    if (done || Date.now() > deadline) return
++    if (!existsSync(paths.lockFile) && !existsSync(paths.resultFile)) return
++    timer = setTimeout(() => void tick(), pollMs)
++    timer.unref?.()
++  }
++  void tick()
++  return () => {
++    stopped = true
++    if (timer !== undefined) clearTimeout(timer)
++  }
++}
++
++// ───────────────────────────── callback
++
++export interface SysqCallbackContext {
++  callbackQuery: { data: string }
++  from?: { id?: number | undefined }
++  chatId?: string
++  answerCallbackQuery(arg?: { text: string }): Promise<void>
++  editMessageText(
++    text: string,
++    opts?: { parse_mode?: 'HTML'; reply_markup?: InlineKeyboardLike },
++  ): Promise<void>
++}
++
++export interface SysqCallbackDeps {
++  allowedUserIds: readonly number[]
++  ownerChatIds?: readonly (number | string)[]
++  paths: SelfUpdatePaths | null
++  log: Logger
++  launch?: (action: SysAction, paths: SelfUpdatePaths, opts: LaunchOptions) => LaunchResult
++  // Called after a successful launch so the live process watches for a result.
++  onLaunched?: () => void
++  nonceGuard?: NewqNonceGuard
++}
++
++const defaultGuard = createNewqNonceGuard()
++
++const LAUNCHED_TEXT: Record<SysAction, string> = {
++  update: '<b>Обновляюсь</b>. Обычно это пара минут, напишу, когда вернусь.',
++  restart: '<b>Перезапускаюсь</b>, вернусь через полминуты.',
++}
++
++export async function handleSysqCallback(
++  ctx: SysqCallbackContext,
++  deps: SysqCallbackDeps,
++): Promise<boolean> {
++  const fromId = ctx.from?.id
++  if (typeof fromId !== 'number' || !deps.allowedUserIds.includes(fromId)) {
++    deps.log.warn('sysq unauthorized tap', { user_id: fromId })
++    await ctx.answerCallbackQuery({ text: 'не авторизовано' })
++    return true
++  }
++  const parsed = parseSysqCallback(ctx.callbackQuery.data)
++  if (parsed === null) {
++    await ctx.answerCallbackQuery({ text: 'неизвестное действие' })
++    return true
++  }
++  if (parsed.action === 'cancel') {
++    await ctx.editMessageText('Отменено', { parse_mode: 'HTML' })
++    await ctx.answerCallbackQuery()
++    return true
++  }
++  const action = parsed.action
++  if (!isOwnerDmChat(ctx.chatId, deps.ownerChatIds)) {
++    await ctx.answerCallbackQuery({ text: 'недоступно в этом чате' })
++    return true
++  }
++  if (parsed.ts !== null && Date.now() - parsed.ts > SYSQ_TTL_MS) {
++    await ctx.answerCallbackQuery({ text: `запрос устарел, повтори /${action}` })
++    await ctx.editMessageText('Запрос устарел.', { parse_mode: 'HTML' })
++    return true
++  }
++  if (parsed.nonce !== null && !(deps.nonceGuard ?? defaultGuard).claim(parsed.nonce)) {
++    await ctx.answerCallbackQuery({ text: 'уже выполнено' })
++    return true
++  }
++  if (deps.paths === null) {
++    await ctx.answerCallbackQuery({ text: 'недоступно' })
++    await ctx.editMessageText(
++      'На этой установке нет скрипта обновления. Один раз обнови агента вручную '
++      + '(<code>./update.sh</code> из папки кита), дальше команда заработает.',
++      { parse_mode: 'HTML' },
++    )
++    return true
++  }
++  const opts: LaunchOptions = ctx.chatId !== undefined ? { chatId: ctx.chatId } : {}
++  const res = (deps.launch ?? launchSelfUpdate)(action, deps.paths, opts)
++  if (!res.ok) {
++    deps.log.warn('sysq launch failed', { action, reason: res.reason, error: res.error })
++    await ctx.answerCallbackQuery({ text: 'не запустилось' })
++    await ctx.editMessageText(
++      res.reason === 'busy'
++        ? 'Обновление или перезапуск уже идет, дождись результата.'
++        : 'Не смог запустить скрипт, подробности в логе плагина.',
++      { parse_mode: 'HTML' },
++    )
++    return true
++  }
++  deps.log.info('sysq launched', { action, chat_id: ctx.chatId })
++  await ctx.answerCallbackQuery({ text: 'Запускаю…' })
++  try {
++    await ctx.editMessageText(LAUNCHED_TEXT[action], {
++      parse_mode: 'HTML',
++      reply_markup: { inline_keyboard: [] },
++    })
++  } catch (err) {
++    deps.log.warn('sysq card edit failed (ignored)', {
++      error: err instanceof Error ? err.message : String(err),
++    })
++  }
++  deps.onLaunched?.()
++  return true
++}
+diff -ruN a/plugin/src/server.ts b/plugin/src/server.ts
+--- a/plugin/src/server.ts
++++ b/plugin/src/server.ts
+@@ -112,6 +112,12 @@
+   type HandlerDeps,
+ } from './telegram/handlers.js'
+ import { GuestQueryRegistry } from './telegram/guest-queries.js'
++import {
++  handleSysqCallback,
++  resolveSelfUpdatePaths,
++  SYSQ_PREFIX,
++  watchSelfUpdateResult,
++} from './commands/self-update.js'
+ import { AlbumBuffer } from './telegram/album-buffer.js'
+ import {
+   ensureAlbumsDir,
+@@ -601,6 +607,25 @@
+ // never be pinned in a public group, and its callbacks drive the single global
+ // DM pane.
+ const hudOwnerChatIds: ReadonlyArray<number | string> = resolveOwnerChatIds(config)
++
++// /update and /restart (sysq:*). Paths resolve from agent.conf env (AGENT_WS);
++// null on installs without the self-update wrapper. The watcher reports a
++// finished run to the owner once — on boot (after a restart) and right after
++// a launch (a failed update never restarts this process).
++const selfUpdatePaths = resolveSelfUpdatePaths(process.env)
++let stopSelfUpdateWatch: (() => void) | undefined
++function startSelfUpdateWatch(): void {
++  if (selfUpdatePaths === null) return
++  stopSelfUpdateWatch?.()
++  stopSelfUpdateWatch = watchSelfUpdateResult(
++    selfUpdatePaths,
++    hudOwnerChatIds,
++    async (chatId, text) => {
++      await telegramApi.sendMessage(chatId, text, { parse_mode: 'HTML' })
++    },
++    log,
++  )
++}
+ const hudApi: HudTelegramApi = {
+   // skipOutboundStamp (fix-loop-1 #6): a HUD pin (re)creation is an INTERNAL
+   // surface, not a report to the owner — it must never reset the heartbeat
+@@ -1105,6 +1130,48 @@
+     }
+     return
+   }
++  // /update and /restart confirm card (sysq:*). Same fail-closed allowlist
++  // auth and owner-DM gate as newq:. confirm → detached self-update.sh run.
++  if (data.startsWith(SYSQ_PREFIX)) {
++    try {
++      await handleSysqCallback(
++        {
++          callbackQuery: { data },
++          from: { id: ctx.from?.id },
++          ...(ctx.chat?.id !== undefined ? { chatId: String(ctx.chat.id) } : {}),
++          answerCallbackQuery: async arg => {
++            if (arg) await ctx.answerCallbackQuery(arg)
++            else await ctx.answerCallbackQuery()
++          },
++          editMessageText: async (text, opts) => {
++            const other: Record<string, unknown> = {}
++            if (opts?.parse_mode) other.parse_mode = opts.parse_mode
++            if (opts?.reply_markup) other.reply_markup = opts.reply_markup
++            await ctx.editMessageText(text, other)
++          },
++        },
++        {
++          allowedUserIds: config.allowed_user_ids,
++          ownerChatIds: hudOwnerChatIds,
++          paths: selfUpdatePaths,
++          log,
++          onLaunched: startSelfUpdateWatch,
++        },
++      )
++    } catch (err) {
++      log.error('sysq callback_query handler threw', {
++        error: err instanceof Error ? err.message : String(err),
++      })
++      try {
++        await ctx.answerCallbackQuery({ text: 'ошибка' })
++      } catch (ackErr) {
++        log.warn('sysq error-ack answerCallbackQuery failed', {
++          error: ackErr instanceof Error ? ackErr.message : String(ackErr),
++        })
++      }
++    }
++    return
++  }
+   // Context HUD panel (hud:*) — callbacks of the pinned HUD message («Сжать»
+   // plus legacy hud:new from stale pre-removal markup).
+   // Same fail-closed allowlist auth as kkey:/ccmd:/newq: (config
+@@ -1647,6 +1714,9 @@
+   },
+ })
+ 
++// Report a finished /update or /restart run (if any) now that we are up.
++startSelfUpdateWatch()
++
+ // Register the OOB command list with Telegram, scoped to the OWNER's chat(s)
+ // only (not the default/all_private_chats scopes), so the «/» autocomplete menu
+ // is visible to the warchief alone. Telegram scope precedence is
+diff -ruN a/plugin/tests/commands/self-update.test.ts b/plugin/tests/commands/self-update.test.ts
+--- a/plugin/tests/commands/self-update.test.ts
++++ b/plugin/tests/commands/self-update.test.ts
+@@ -0,0 +1,285 @@
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++
++import {
++  SYSQ_PREFIX,
++  buildSysConfirmCard,
++  formatSelfUpdateReport,
++  handleSysqCallback,
++  launchSelfUpdate,
++  parseSysqCallback,
++  reportSelfUpdateResult,
++  resolveSelfUpdatePaths,
++  type SelfUpdatePaths,
++  type SpawnDetached,
++} from '../../src/commands/self-update.js'
++import { parseOobCommand, BOT_COMMANDS } from '../../src/commands/oob.js'
++
++const silentLog = {
++  info: () => {}, warn: () => {}, error: () => {}, debug: () => {},
++} as never
++
++let ws: string
++let paths: SelfUpdatePaths
++
++beforeEach(() => {
++  ws = mkdtempSync(join(tmpdir(), 'self-update-'))
++  mkdirSync(join(ws, 'bin'), { recursive: true })
++  mkdirSync(join(ws, 'logs'), { recursive: true })
++  writeFileSync(join(ws, 'bin', 'self-update.sh'), '#!/bin/sh\n')
++  const p = resolveSelfUpdatePaths({ AGENT_WS: ws, LOG_DIR: join(ws, 'logs') })
++  if (p === null) throw new Error('paths must resolve')
++  paths = p
++})
++
++afterEach(() => {
++  // temp dirs are left to the OS tmp cleaner
++})
++
++describe('commands', () => {
++  test('/update and /restart are plugin commands in the menu', () => {
++    expect(parseOobCommand('/update')?.name).toBe('update')
++    expect(parseOobCommand('/restart@bot')?.name).toBe('restart')
++    const names = BOT_COMMANDS.map((c) => c.command)
++    expect(names).toContain('update')
++    expect(names).toContain('restart')
++  })
++})
++
++describe('resolveSelfUpdatePaths', () => {
++  test('null without AGENT_WS', () => {
++    expect(resolveSelfUpdatePaths({})).toBeNull()
++  })
++
++  test('null when the wrapper script is missing', () => {
++    const empty = mkdtempSync(join(tmpdir(), 'self-update-empty-'))
++    expect(resolveSelfUpdatePaths({ AGENT_WS: empty })).toBeNull()
++  })
++
++  test('paths live under the workspace', () => {
++    expect(paths.script).toBe(join(ws, 'bin', 'self-update.sh'))
++    expect(paths.resultFile).toBe(join(ws, 'state', 'self-update.json'))
++    expect(paths.logFile).toBe(join(ws, 'logs', 'self-update.log'))
++  })
++})
++
++describe('confirm card + callback parsing', () => {
++  test('card carries action and nonce, fits 64 bytes', () => {
++    for (const action of ['update', 'restart'] as const) {
++      const card = buildSysConfirmCard(action)
++      const btns = card.inlineKeyboard.inline_keyboard.flat()
++      const data = btns.map((b) => b.callback_data ?? '')
++      expect(data[0]?.startsWith(`${SYSQ_PREFIX}${action}:`)).toBe(true)
++      expect(data[1]).toBe(`${SYSQ_PREFIX}cancel`)
++      for (const d of data) expect(Buffer.byteLength(d)).toBeLessThanOrEqual(64)
++      const parsed = parseSysqCallback(data[0] ?? '')
++      expect(parsed?.action).toBe(action)
++      expect(parsed?.ts).toBeGreaterThan(0)
++    }
++  })
++
++  test('rejects garbage', () => {
++    expect(parseSysqCallback('newq:confirm')).toBeNull()
++    expect(parseSysqCallback('sysq:wipe:1')).toBeNull()
++    expect(parseSysqCallback('sysq:update:abc')).toBeNull()
++    expect(parseSysqCallback('sysq:update')).toBeNull()
++    expect(parseSysqCallback('sysq:cancel')?.action).toBe('cancel')
++  })
++})
++
++describe('launchSelfUpdate', () => {
++  test('clears a stale result and spawns the wrapper detached', () => {
++    mkdirSync(join(ws, 'state'), { recursive: true })
++    writeFileSync(paths.resultFile, '{"action":"update","rc":0}')
++    const calls: Array<{ cmd: string; args: string[]; log: string; env: NodeJS.ProcessEnv }> = []
++    const spawn: SpawnDetached = (cmd, args, log, env) => {
++      calls.push({ cmd, args, log, env })
++    }
++    const res = launchSelfUpdate('update', paths, { spawn, env: { TMUX: 'x', A: '1' } })
++    expect(res.ok).toBe(true)
++    expect(existsSync(paths.resultFile)).toBe(false)
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.cmd).toBe('bash')
++    expect(calls[0]?.args).toEqual([paths.script, 'update'])
++    expect(calls[0]?.log).toBe(paths.logFile)
++    expect(calls[0]?.env.TMUX).toBeUndefined()
++    expect(calls[0]?.env.A).toBe('1')
++  })
++
++  test('refuses a second launch while one is running', () => {
++    const spawn: SpawnDetached = () => {}
++    mkdirSync(join(ws, 'state'), { recursive: true })
++    writeFileSync(paths.lockFile, String(Date.now()))
++    const res = launchSelfUpdate('restart', paths, { spawn, env: {} })
++    expect(res.ok).toBe(false)
++  })
++
++  test('a stale lock does not block', () => {
++    const spawn: SpawnDetached = () => {}
++    mkdirSync(join(ws, 'state'), { recursive: true })
++    writeFileSync(paths.lockFile, String(Date.now() - 60 * 60 * 1000))
++    expect(launchSelfUpdate('restart', paths, { spawn, env: {} }).ok).toBe(true)
++  })
++
++  test('spawn failure is reported, not thrown', () => {
++    const spawn: SpawnDetached = () => {
++      throw new Error('ENOENT')
++    }
++    const res = launchSelfUpdate('update', paths, { spawn, env: {} })
++    expect(res.ok).toBe(false)
++    expect(existsSync(paths.lockFile)).toBe(false)
++  })
++})
++
++describe('formatSelfUpdateReport', () => {
++  test('update ok names the version', () => {
++    const t = formatSelfUpdateReport({ action: 'update', rc: 0, version: 'abc1234' }, '')
++    expect(t).toContain('abc1234')
++    expect(t).not.toContain('<pre>')
++  })
++
++  test('update failure carries the escaped log tail', () => {
++    const t = formatSelfUpdateReport({ action: 'update', rc: 1, version: 'abc1234' }, 'boom <x>')
++    expect(t).toContain('<pre>boom &lt;x&gt;</pre>')
++  })
++
++  test('restart', () => {
++    expect(formatSelfUpdateReport({ action: 'restart', rc: 0 }, '')).toContain('Перезапустился')
++  })
++})
++
++describe('reportSelfUpdateResult', () => {
++  test('sends once and removes the result', async () => {
++    mkdirSync(join(ws, 'state'), { recursive: true })
++    writeFileSync(paths.resultFile, JSON.stringify({ action: 'restart', rc: 0, chat_id: '42' }))
++    writeFileSync(paths.lockFile, String(Date.now()))
++    const sent: Array<[string, string]> = []
++    const send = async (chatId: string, text: string): Promise<void> => {
++      sent.push([chatId, text])
++    }
++    expect(await reportSelfUpdateResult(paths, ['42'], send, silentLog)).toBe(true)
++    expect(await reportSelfUpdateResult(paths, ['42'], send, silentLog)).toBe(false)
++    expect(sent).toHaveLength(1)
++    expect(sent[0]?.[0]).toBe('42')
++    expect(existsSync(paths.resultFile)).toBe(false)
++    expect(existsSync(paths.lockFile)).toBe(false)
++  })
++
++  test('falls back to the first owner when the chat is not an owner', async () => {
++    mkdirSync(join(ws, 'state'), { recursive: true })
++    writeFileSync(paths.resultFile, JSON.stringify({ action: 'update', rc: 0, chat_id: '-100' }))
++    const sent: string[] = []
++    await reportSelfUpdateResult(paths, ['7'], async (c) => { sent.push(c) }, silentLog)
++    expect(sent).toEqual(['7'])
++  })
++
++  test('a corrupt result is dropped without sending', async () => {
++    mkdirSync(join(ws, 'state'), { recursive: true })
++    writeFileSync(paths.resultFile, 'not json')
++    const sent: string[] = []
++    expect(await reportSelfUpdateResult(paths, ['7'], async (c) => { sent.push(c) }, silentLog))
++      .toBe(false)
++    expect(sent).toEqual([])
++    expect(existsSync(paths.resultFile)).toBe(false)
++  })
++
++  test('no result → nothing', async () => {
++    expect(await reportSelfUpdateResult(paths, ['7'], async () => {}, silentLog)).toBe(false)
++  })
++})
++
++describe('handleSysqCallback', () => {
++  function mkCtx(data: string, fromId: number, chatId = String(fromId)) {
++    const acks: string[] = []
++    const edits: string[] = []
++    return {
++      acks,
++      edits,
++      ctx: {
++        callbackQuery: { data },
++        from: { id: fromId },
++        chatId,
++        answerCallbackQuery: async (arg?: { text: string }) => { acks.push(arg?.text ?? '') },
++        editMessageText: async (text: string) => { edits.push(text) },
++      },
++    }
++  }
++
++  test('non-allowed user: toast only, nothing launched', async () => {
++    let launched = 0
++    const card = buildSysConfirmCard('restart')
++    const data = card.inlineKeyboard.inline_keyboard[0]?.[0]?.callback_data ?? ''
++    const { ctx, edits } = mkCtx(data, 999)
++    await handleSysqCallback(ctx, {
++      allowedUserIds: [1], ownerChatIds: ['1'], paths, log: silentLog,
++      launch: () => { launched++; return { ok: true as const } },
++    })
++    expect(launched).toBe(0)
++    expect(edits).toEqual([])
++  })
++
++  test('confirm from the owner launches and records the chat', async () => {
++    const seen: Array<[string, string | undefined]> = []
++    const card = buildSysConfirmCard('update')
++    const data = card.inlineKeyboard.inline_keyboard[0]?.[0]?.callback_data ?? ''
++    const { ctx, edits } = mkCtx(data, 1)
++    await handleSysqCallback(ctx, {
++      allowedUserIds: [1], ownerChatIds: ['1'], paths, log: silentLog,
++      launch: (action, _p, opts) => { seen.push([action, opts.chatId]); return { ok: true as const } },
++    })
++    expect(seen).toEqual([['update', '1']])
++    expect(edits[0]).toContain('Обновляюсь')
++  })
++
++  test('double tap launches once', async () => {
++    let launched = 0
++    const card = buildSysConfirmCard('restart')
++    const data = card.inlineKeyboard.inline_keyboard[0]?.[0]?.callback_data ?? ''
++    const deps = {
++      allowedUserIds: [1], ownerChatIds: ['1'], paths, log: silentLog,
++      launch: () => { launched++; return { ok: true as const } },
++    }
++    await handleSysqCallback(mkCtx(data, 1).ctx, deps)
++    await handleSysqCallback(mkCtx(data, 1).ctx, deps)
++    expect(launched).toBe(1)
++  })
++
++  test('stale card refused', async () => {
++    let launched = 0
++    const { ctx, edits } = mkCtx(`${SYSQ_PREFIX}restart:${Date.now() - 10 * 60 * 1000}:aa`, 1)
++    await handleSysqCallback(ctx, {
++      allowedUserIds: [1], ownerChatIds: ['1'], paths, log: silentLog,
++      launch: () => { launched++; return { ok: true as const } },
++    })
++    expect(launched).toBe(0)
++    expect(edits[0]).toContain('устарел')
++  })
++
++  test('no wrapper on this install', async () => {
++    const card = buildSysConfirmCard('update')
++    const data = card.inlineKeyboard.inline_keyboard[0]?.[0]?.callback_data ?? ''
++    const { ctx, edits } = mkCtx(data, 1)
++    await handleSysqCallback(ctx, {
++      allowedUserIds: [1], ownerChatIds: ['1'], paths: null, log: silentLog,
++      launch: () => ({ ok: true as const }),
++    })
++    expect(edits[0]).toContain('update.sh')
++  })
++
++  test('cancel edits the card', async () => {
++    const { ctx, edits } = mkCtx(`${SYSQ_PREFIX}cancel`, 1)
++    await handleSysqCallback(ctx, {
++      allowedUserIds: [1], ownerChatIds: ['1'], paths, log: silentLog,
++      launch: () => ({ ok: true as const }),
++    })
++    expect(edits[0]).toContain('Отменено')
++  })
++})
++
++test('launch writes the requesting chat into the lock for the report', () => {
++  const spawn: SpawnDetached = () => {}
++  launchSelfUpdate('restart', paths, { spawn, env: {}, chatId: '55' })
++  expect(readFileSync(paths.lockFile, 'utf8')).toContain('55')
++})
