@@ -342,6 +342,10 @@ cp "$KIT_DIR"/server/bin/* "$AGENT_WS/bin/"
 cp "$KIT_DIR"/server/hooks/* "$AGENT_WS/hooks/"
 chmod +x "$AGENT_WS"/bin/*.sh "$AGENT_WS"/hooks/*.sh "$AGENT_WS"/hooks/*.py "$AGENT_WS"/scripts/*.sh
 render "$KIT_DIR/server/templates/agent.conf.template" "$AGENT_WS/agent.conf"
+# Kit location and version, for /update and /restart from Telegram.
+mkdir -p "$AGENT_WS/state"
+printf '%s\n' "$KIT_DIR" > "$AGENT_WS/state/kit-dir"
+git -C "$KIT_DIR" rev-parse --short HEAD > "$AGENT_WS/state/kit-version" 2>/dev/null || true
 
 say "writing secrets to $SECRETS_DIR (mode 600)"
 (
