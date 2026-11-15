@@ -1,0 +1,90 @@
+Subject: [PATCH] меню «/»: команды агента /onboard и /check
+
+Плагин при каждом старте стирает меню бота и записывает туда свой
+список BOT_COMMANDS. Команды набора (/onboard, /check) работали, только
+если набрать их руками, в меню их не было.
+
+AGENT_MENU_COMMANDS добавляет их в меню после команд плагина. В
+KNOWN_COMMANDS они не входят, поэтому нажатие доходит до сессии
+обычным сообщением, как ручной набор. Меню по-прежнему видно только
+владельцу (registerOwnerScopedCommands не менялся).
+
+--- a/plugin/src/commands/oob.ts
++++ b/plugin/src/commands/oob.ts
+@@ -258,6 +258,20 @@
+   { command: 'lease', description: 'выдать мандат автономии: /lease <scope>[; ttl=48h]' },
+ ]
+ 
++// Agent commands shown in the «/» menu next to BOT_COMMANDS. They are NOT in
++// KNOWN_COMMANDS: parseOobCommand returns null, so a tap reaches the agent
++// session as an ordinary message, exactly like typing the command by hand.
++export const AGENT_MENU_COMMANDS: ReadonlyArray<BotCommandSpec> = [
++  { command: 'onboard', description: 'настроить агента под себя: пять вопросов' },
++  { command: 'check', description: 'проверить, что всё работает' },
++]
++
++// The full «/» menu: plugin commands first, then the agent's own.
++export const MENU_COMMANDS: ReadonlyArray<BotCommandSpec> = [
++  ...BOT_COMMANDS,
++  ...AGENT_MENU_COMMANDS,
++]
++
+ // Format process uptime seconds as a compact human string (e.g. `2h 15m`).
+ function formatUptime(sec: number): string {
+   const s = Math.max(0, Math.floor(sec))
+--- a/plugin/src/server.ts
++++ b/plugin/src/server.ts
+@@ -90,7 +90,7 @@
+ import { createPermissionGateUi } from './telegram/permission-gate-ui.js'
+ import { TelegramPoller, tokenLock } from './telegram/poller.js'
+ import { describePidHolder, readLockHolder } from './telegram/pid-inspect.js'
+-import { BOT_COMMANDS } from './commands/oob.js'
++import { MENU_COMMANDS } from './commands/oob.js'
+ import { handleKkeyCallback } from './telegram/keys-panel-ui.js'
+ import { handleCcmdCallback } from './telegram/cc-panel-ui.js'
+ import { handleNewqCallback } from './telegram/newq-confirm-ui.js'
+@@ -1654,7 +1654,7 @@
+ // then register per owner chat. Best-effort: any failure here (no internet,
+ // token revoked) must not block the poller from starting.
+ void (async () => {
+-  const cmds = BOT_COMMANDS.map((c) => ({ command: c.command, description: c.description }))
++  const cmds = MENU_COMMANDS.map((c) => ({ command: c.command, description: c.description }))
+   // FIX-8: the owner command menu is DM-only. Owner chats come from
+   // resolveOwnerChatIds (owner_chat_ids / allowed_user_ids = positive DM ids),
+   // NEVER allowed_chat_ids — pinning the menu scope in a group would expose it
+--- /dev/null
++++ b/plugin/tests/commands/oob-menu.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  AGENT_MENU_COMMANDS,
++  BOT_COMMANDS,
++  MENU_COMMANDS,
++  parseOobCommand,
++} from '../../src/commands/oob.js'
++
++describe('«/» menu', () => {
++  test('lists /onboard and /check after the plugin commands', () => {
++    const names = MENU_COMMANDS.map((c) => c.command)
++    expect(names.slice(0, BOT_COMMANDS.length)).toEqual(BOT_COMMANDS.map((c) => c.command))
++    expect(names.slice(BOT_COMMANDS.length)).toEqual(['onboard', 'check'])
++  })
++
++  test('agent commands pass through to the session', () => {
++    for (const c of AGENT_MENU_COMMANDS) {
++      expect(parseOobCommand(`/${c.command}`)).toBeNull()
++      expect(parseOobCommand(`/${c.command}@my_bot`)).toBeNull()
++    }
++  })
++
++  test('names are unique and valid for setMyCommands', () => {
++    const names = MENU_COMMANDS.map((c) => c.command)
++    expect(new Set(names).size).toBe(names.length)
++    for (const c of MENU_COMMANDS) {
++      expect(c.command).toMatch(/^[a-z0-9_]{1,32}$/)
++      expect(c.description.length).toBeGreaterThan(0)
++      expect(c.description.length).toBeLessThanOrEqual(256)
++    }
++  })
++})
