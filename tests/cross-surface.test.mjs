@@ -25,11 +25,13 @@ function makeHome() {
   return { home, ws, hot: path.join(ws, 'core', 'hot') };
 }
 
-/** Run the hook; `now` is "YYYY-MM-DDTHH:MM" local time. */
-function run(home, args, stdin, now = '2026-11-27T10:00') {
+/** Run the hook; `now` is "YYYY-MM-DDTHH:MM" local time, null for the real clock. */
+function run(home, args, stdin, now = '2026-11-27T10:00', extraEnv = {}) {
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: home, ...extraEnv };
+  if (now) env.CROSS_SURFACE_NOW = now; else delete env.CROSS_SURFACE_NOW;
   const r = spawnSync('node', [HOOK, ...args], {
     input: typeof stdin === 'string' ? stdin : JSON.stringify(stdin),
-    env: { ...process.env, CLAUDE_PROJECT_DIR: home, CROSS_SURFACE_NOW: now },
+    env,
     encoding: 'utf8',
   });
   assert.equal(r.status, 0, r.stderr);
@@ -158,13 +160,83 @@ test('stop on garbage stdin exits 0, writes nothing', () => {
 
 // ---------------------------------------------------------------- prompt
 
-test('prompt: first call injects the task rule, no news, creates state', () => {
+test('prompt: first call injects the task rule, no news already in handoff', () => {
   const { home, hot, ws } = makeHome();
   tgEntry(hot, '2026-11-27 09:00', 'morning', 'seen at start');
+  fs.copyFileSync(path.join(hot, 'recent-plugin.md'), path.join(hot, 'handoff.md'));
   const ctx = ask(home, 'claude-code', SID_A, 'hi');
-  assert.match(ctx, /core\/hot\/tasks\.md/);
+  assert.ok(ctx.includes(`Shared task list: ${path.join(hot, 'tasks.md')}`), ctx);
   assert.doesNotMatch(ctx, /seen at start/);
-  assert.ok(fs.existsSync(path.join(ws, 'state', 'cross-surface', `${SID_A}.json`)));
+  const stateFile = path.join(ws, 'state', 'cross-surface', `${SID_A}.json`);
+  assert.equal(fs.statSync(stateFile).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.dirname(stateFile)).mode & 0o777, 0o700);
+});
+
+test('prompt: first call gets other-surface turns newer than the handoff', () => {
+  const { home, hot } = makeHome();
+  tgEntry(hot, '2026-11-27 09:00', 'morning', 'in handoff');
+  fs.copyFileSync(path.join(hot, 'recent-plugin.md'), path.join(hot, 'handoff.md'));
+  tgEntry(hot, '2026-11-27 09:00', 'same minute', 'same-minute-not-in-handoff');
+  tgEntry(hot, '2026-11-27 09:30', 'later', 'newer than handoff');
+  const ctx = ask(home, 'claude-code', SID_A, 'continue on the mac', '2026-11-27T09:31');
+  assert.match(ctx, /newer than handoff/);
+  assert.match(ctx, /same-minute-not-in-handoff/);
+  assert.doesNotMatch(ctx, /in handoff\b/);
+});
+
+test('entries use the agent timezone from agent.conf', () => {
+  const { home, ws, hot } = makeHome();
+  fs.appendFileSync(path.join(ws, 'agent.conf'), 'TZ="Asia/Makassar"\n');
+  const fmt = () => new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Makassar', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(new Date()).replace('T', ' ');
+  const before = fmt();
+  run(home, ['stop'], { session_id: SID_A, last_assistant_message: 'tz' }, null, { TZ: 'UTC' });
+  const after = fmt();
+  const ts = readRecent(hot).match(/^### (\S+ \S+) \[claude-code\]/m)[1];
+  assert.ok(ts === before || ts === after, `${ts} vs ${before}/${after}`);
+});
+
+test('pending prompt is stored redacted and cut', () => {
+  const { home, ws } = makeHome();
+  ask(home, 'claude-code', SID_A, `my token ${TG_TOKEN} ${'w'.repeat(2000)}`);
+  const raw = fs.readFileSync(path.join(ws, 'state', 'cross-surface', `${SID_A}.json`), 'utf8');
+  assert.ok(!raw.includes(TG_TOKEN));
+  assert.ok(raw.length < 800, String(raw.length));
+});
+
+test("a session's own tasks.md edit is not re-injected to it", () => {
+  const { home, hot } = makeHome();
+  ask(home, 'claude-code', SID_A, 'start');
+  fs.writeFileSync(path.join(hot, 'tasks.md'), '- Zoom -- link -- next: send -- claude-code\n');
+  reply(home, SID_A, 'added the task');
+  assert.doesNotMatch(ask(home, 'claude-code', SID_A, 'next'), /Zoom -- link/);
+  assert.match(ask(home, 'tg', SID_B, 'from the phone'), /Zoom -- link/);
+});
+
+test('task lines starting with # and a number are kept', () => {
+  const { home, hot } = makeHome();
+  fs.writeFileSync(path.join(hot, 'tasks.md'), '# Tasks\n\n#1 Flight plan -- tg\n');
+  assert.match(ask(home, 'tg', SID_B, 'x'), /#1 Flight plan/);
+});
+
+test('a stale lock does not block the writer', () => {
+  const { home, hot } = makeHome();
+  const lock = path.join(hot, 'recent.md.lock');
+  fs.writeFileSync(lock, '');
+  const past = new Date(Date.now() - 60 * 1000);
+  fs.utimesSync(lock, past, past);
+  reply(home, SID_A, 'after stale lock');
+  assert.match(readRecent(hot), /after stale lock/);
+  assert.ok(!fs.existsSync(lock));
+});
+
+test('a held lock delays the writer but never drops the turn', () => {
+  const { home, hot } = makeHome();
+  fs.writeFileSync(path.join(hot, 'recent.md.lock'), '');
+  reply(home, SID_A, 'despite fresh lock');
+  assert.match(readRecent(hot), /despite fresh lock/);
 });
 
 test('prompt: tg turns written after the session started are injected once', () => {

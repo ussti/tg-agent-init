@@ -101,6 +101,23 @@ class MigrateTest(unittest.TestCase):
         self.assertTrue(any(CROSS in c for c in commands(got, "Stop")))
         self.assertTrue(any(CROSS in c for c in commands(got, "UserPromptSubmit")))
 
+    def test_keeps_owner_additions_to_the_handoff_command(self) -> None:
+        data = old_template()
+        data["hooks"]["Stop"][0]["hooks"][0]["command"] += " && notify.sh"
+        self.run_migrate(data)
+        stop = [c for c in commands(self.load(), "Stop") if CROSS in c]
+        self.assertEqual(len(stop), 1)
+        self.assertTrue(stop[0].endswith("write-handoff.sh && notify.sh"), stop[0])
+
+    def test_odd_layout_exit_1_file_untouched(self) -> None:
+        for bad in ({"hooks": {"Stop": "oops"}},
+                    {"hooks": {"Stop": [{"hooks": [{"command": "write-handoff.sh",
+                                                    "timeout": "10s"}]}]}}):
+            res = self.run_migrate(bad)
+            self.assertEqual(res.returncode, 1, bad)
+            self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), bad)
+            self.assertNotIn("Traceback", res.stderr)
+
     def test_bad_json_exit_1_file_untouched(self) -> None:
         res = self.run_migrate("{ not json")
         self.assertEqual(res.returncode, 1)

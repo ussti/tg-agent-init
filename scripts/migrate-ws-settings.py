@@ -6,13 +6,14 @@ it is never replaced, only migrated. Each step adds or rewrites one kit hook com
 every other key, group and hook as it was. Idempotent.
 
 Steps:
-  cross-surface  Stop: the write-handoff.sh command becomes the chain
-                 "cross-surface.mjs stop; write-handoff.sh" (Stop hooks of one group run in
-                 parallel, so the writer must run before the merge in one command).
+  cross-surface  Stop: "node cross-surface.mjs stop; " is prepended to the command that runs
+                 write-handoff.sh, whatever else the owner put in it (Stop hooks of one
+                 group run in parallel, so the writer must run before the merge in one command).
                  UserPromptSubmit: add "cross-surface.mjs prompt --self claude-code".
 
 Usage: migrate-ws-settings.py <settings.json>
-Prints "changed" or "unchanged". Exit 1 (file untouched) when the file is not valid JSON.
+Prints "changed" or "unchanged". Exit 1 (file untouched) when the file is not valid JSON or
+its hooks are not laid out the way Claude Code reads them.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ from typing import Any
 HOOKS_DIR = "$CLAUDE_PROJECT_DIR/.claude/hooks"
 CROSS_SURFACE = "cross-surface.mjs"
 WRITE_HANDOFF = "write-handoff.sh"
-STOP_CHAIN = f"node {HOOKS_DIR}/{CROSS_SURFACE} stop; {HOOKS_DIR}/{WRITE_HANDOFF}"
+STOP_PREFIX = f"node {HOOKS_DIR}/{CROSS_SURFACE} stop; "
+STOP_CHAIN = f"{STOP_PREFIX}{HOOKS_DIR}/{WRITE_HANDOFF}"
 PROMPT_CMD = f"node {HOOKS_DIR}/{CROSS_SURFACE} prompt --self claude-code"
 STOP_TIMEOUT_S = 10
 LOG = logging.getLogger("migrate-ws-settings")
@@ -55,7 +57,7 @@ def migrate_cross_surface(settings: dict[str, Any]) -> bool:
     if not any(CROSS_SURFACE in str(h.get("command", "")) for h in _commands(stop)):
         handoff = [h for h in _commands(stop) if WRITE_HANDOFF in str(h.get("command", ""))]
         if handoff:
-            handoff[0]["command"] = STOP_CHAIN
+            handoff[0]["command"] = STOP_PREFIX + str(handoff[0]["command"])
             handoff[0]["timeout"] = max(int(handoff[0].get("timeout", 0) or 0), STOP_TIMEOUT_S)
         else:
             entry = {"type": "command", "command": STOP_CHAIN, "timeout": STOP_TIMEOUT_S}
@@ -102,7 +104,12 @@ def main(argv: list[str]) -> int:
     if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
         LOG.error("unexpected layout in %s", path)
         return 1
-    if migrate_cross_surface(settings):
+    try:
+        changed = migrate_cross_surface(settings)
+    except (TypeError, ValueError, AttributeError) as err:
+        LOG.error("unexpected hook layout in %s: %s", path, err)
+        return 1
+    if changed:
         write_atomic(path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
         sys.stdout.write("changed\n")
     else:

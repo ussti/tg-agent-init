@@ -27,8 +27,13 @@ const AGENT_SNIPPET_MAX = 600;
 const NEWS_MAX_ENTRIES = 8;
 const NEWS_MAX_CHARS = 3500;
 const TASKS_MAX_CHARS = 2500;
-const RECENT_TRIM_BYTES = 24 * 1024;
+const RECENT_TRIM_ENTRIES = 80; // count, not bytes: a rewrite once per ~40 turns, not each one
 const RECENT_KEEP_ENTRIES = 40;
+const LOCK_WAIT_MS = 1000;
+const LOCK_RETRY_MS = 20;
+const LOCK_STALE_MS = 10000;
+const STATE_DIR_MODE = 0o700;
+const STATE_FILE_MODE = 0o600;
 const STATE_TTL_MS = 7 * 24 * 3600 * 1000;
 const SID_SHORT = 8;
 const KEY_LEN = 12;
@@ -36,11 +41,14 @@ const RECENT_HEADER =
   '# Hot memory -- Claude Code sessions\n\n' +
   '_Turns from Claude Code sessions in the agent folder (desktop app, terminal, phone)._\n' +
   '_Written by hooks/cross-surface.mjs. Telegram turns are in recent-plugin.md._\n';
-const TASK_RULE =
-  'Shared task list: core/hot/tasks.md -- the same list is seen from Telegram and from Claude ' +
-  'Code sessions. When you start, advance, pause or finish a multi-step task, update its line: ' +
-  'task, current step, next step, where it is being done (tg / claude-code). Remove finished ' +
-  'tasks. One task is driven from one place at a time.';
+
+/** The task-list rule, with the absolute path: the bot's cwd is the plugin dir. */
+function taskRule(tasksFile) {
+  return `Shared task list: ${tasksFile} -- the same file is seen from Telegram and from ` +
+    'Claude Code sessions. When you start, advance, pause or finish a multi-step task, update ' +
+    'its line: task, current step, next step, where it is being done (tg / claude-code). ' +
+    'Remove finished tasks. One task is driven from one place at a time.';
+}
 
 // Same patterns as write-handoff.sh.
 const REDACTIONS = [
@@ -84,11 +92,11 @@ function readText(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
 }
 
-function writeAtomic(file, text) {
+function writeAtomic(file, text, mode = undefined) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = path.join(path.dirname(file), `.${path.basename(file)}.tmp.${process.pid}`);
   try {
-    fs.writeFileSync(tmp, text, 'utf8');
+    fs.writeFileSync(tmp, text, mode === undefined ? 'utf8' : { encoding: 'utf8', mode });
     fs.renameSync(tmp, file);
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* renamed or never written */ }
@@ -99,18 +107,76 @@ function redact(s) {
   return REDACTIONS.reduce((acc, [re, rep]) => acc.replace(re, rep), s);
 }
 
+/** Redact first (a cut must not leave half a token), then flatten and cut by code point. */
 function snippet(s, max) {
-  const flat = redact(String(s)).replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, max)} …` : flat;
+  const chars = Array.from(redact(String(s)).replace(/\s+/g, ' ').trim());
+  return chars.length > max ? `${chars.slice(0, max).join('')} …` : chars.join('');
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run fn holding <file>.lock, so two Claude Code sessions finishing at once do not lose an
+ * entry to the trim rewrite. A stale lock (crashed writer) is broken; after LOCK_WAIT_MS fn
+ * runs anyway: a lost race is better than a lost turn.
+ */
+function withLock(file, fn) {
+  const lock = `${file}.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lock, 'wx');
+    } catch (err) {
+      if (err.code !== 'EEXIST') break;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(lock);
+          continue;
+        }
+      } catch { continue; }
+      if (Date.now() > deadline) break;
+      sleepMs(LOCK_RETRY_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (fd !== null) {
+      fs.closeSync(fd);
+      try { fs.unlinkSync(lock); } catch { /* broken as stale by another writer */ }
+    }
+  }
 }
 
 function validSid(sid) {
   return typeof sid === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(sid) ? sid : null;
 }
 
+function confValue(ws, key) {
+  const re = new RegExp(`^${key}=["']?([^"'\\n]*)["']?\\s*$`, 'm');
+  const m = readText(path.join(ws, 'agent.conf')).match(re);
+  return m ? m[1].trim() : '';
+}
+
 function agentLabel(ws) {
-  const m = readText(path.join(ws, 'agent.conf')).match(/^AGENT_NAME=["']?([^"'\n]+)["']?\s*$/m);
-  return m ? m[1].trim() : 'Agent';
+  return confValue(ws, 'AGENT_NAME') || 'Agent';
+}
+
+/**
+ * Use the agent's timezone (agent.conf TZ). The bot gets it from agent.conf at launch;
+ * Claude Code sessions over SSH run in the server's zone. Entries carry local wall-clock
+ * time, so both sides must write and compare in the same zone.
+ */
+function useAgentTimezone(ws) {
+  const tz = confValue(ws, 'TZ');
+  if (!tz) return;
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: tz });
+    process.env.TZ = tz;
+  } catch { /* invalid zone: keep the process default */ }
 }
 
 function hash(s) {
@@ -155,7 +221,9 @@ function loadState(ws, sid) {
 }
 
 function saveState(ws, sid, state) {
-  writeAtomic(statePath(ws, sid), JSON.stringify(state));
+  const file = statePath(ws, sid);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: STATE_DIR_MODE });
+  writeAtomic(file, JSON.stringify(state), STATE_FILE_MODE);
 }
 
 function cleanupStates(ws, keepSid) {
@@ -210,9 +278,8 @@ function fromTranscript(file) {
 
 function trimRecent(file) {
   const content = readText(file);
-  if (Buffer.byteLength(content, 'utf8') <= RECENT_TRIM_BYTES) return;
   const starts = [...content.matchAll(/^### /gm)].map((m) => m.index);
-  if (starts.length <= RECENT_KEEP_ENTRIES) return;
+  if (starts.length <= RECENT_TRIM_ENTRIES) return;
   const head = content.slice(0, starts[0]).trimEnd();
   const kept = content.slice(starts[starts.length - RECENT_KEEP_ENTRIES]);
   writeAtomic(file, `${head || RECENT_HEADER.trimEnd()}\n\n${kept}`);
@@ -222,25 +289,34 @@ function stop(input) {
   const ws = workspaceDir();
   const sid = validSid(input.session_id);
   const state = sid ? loadState(ws, sid) : null;
-  let prompt = (state && typeof state.pendingPrompt === 'string') ? state.pendingPrompt : '';
+  // pendingPrompt is stored already redacted and cut (see prompt()).
+  let user = (state && typeof state.pendingPrompt === 'string') ? state.pendingPrompt : '';
   let text = typeof input.last_assistant_message === 'string' ? input.last_assistant_message : '';
-  if ((!prompt || !text.trim()) && typeof input.transcript_path === 'string') {
+  if ((!user || !text.trim()) && typeof input.transcript_path === 'string') {
     const t = fromTranscript(input.transcript_path);
-    prompt = prompt || t.prompt;
+    user = user || snippet(t.prompt, USER_SNIPPET_MAX);
     text = text.trim() ? text : t.text;
   }
-  if (!prompt.trim() && !text.trim()) return;
+  if (!user.trim() && !text.trim()) return;
 
-  const file = path.join(ws, 'core', 'hot', 'recent.md');
-  if (!fs.existsSync(file)) writeAtomic(file, RECENT_HEADER);
+  const hot = path.join(ws, 'core', 'hot');
+  const file = path.join(hot, 'recent.md');
   const sidTag = sid ? sid.slice(0, SID_SHORT) : 'unknown';
   const entry =
     `\n### ${formatTs(now())} [${TAG_CLAUDE_CODE}] <!-- s:${sidTag} -->\n` +
-    `**User:** ${snippet(prompt || '(no prompt)', USER_SNIPPET_MAX)}\n` +
+    `**User:** ${user || '(no prompt)'}\n` +
     `**${agentLabel(ws)}:** ${snippet(text || '(no text)', AGENT_SNIPPET_MAX)}\n`;
-  fs.appendFileSync(file, entry, 'utf8');
-  trimRecent(file);
-  if (sid && state && state.pendingPrompt) saveState(ws, sid, { ...state, pendingPrompt: null });
+  withLock(file, () => {
+    if (!fs.existsSync(file)) writeAtomic(file, RECENT_HEADER);
+    fs.appendFileSync(file, entry, 'utf8');
+    trimRecent(file);
+  });
+  if (sid && state) {
+    // Edits this session made to tasks.md during its turn are not news to itself.
+    const tasksBody = taskLines(readText(path.join(hot, 'tasks.md')));
+    const tasksHash = tasksBody ? hash(tasksBody) : '';
+    saveState(ws, sid, { ...state, pendingPrompt: null, tasksHash });
+  }
 }
 
 // ---------------------------------------------------------------- prompt
@@ -250,7 +326,7 @@ function renderEntry(e) {
   return `[${e.tag} ${e.ts}] ${body}`;
 }
 
-function newsBlock(news) {
+function newsBlock(news, hot) {
   let shown = news.slice(-NEWS_MAX_ENTRIES);
   let lines = shown.map(renderEntry);
   while (lines.length > 1 && lines.join('\n').length > NEWS_MAX_CHARS) {
@@ -259,7 +335,8 @@ function newsBlock(news) {
   }
   const earlier = news.length - shown.length;
   const more = earlier > 0
-    ? ` ${earlier} earlier not shown: see core/hot/recent-plugin.md and core/hot/recent.md.`
+    ? ` ${earlier} earlier not shown: see ${path.join(hot, 'recent-plugin.md')} and ` +
+      `${path.join(hot, 'recent.md')}.`
     : '';
   return `New on the other surface since your last message (oldest first).${more}\n` +
     lines.join('\n');
@@ -272,7 +349,7 @@ function taskLines(text) {
     .split('\n')
     .filter((l) => {
       const t = l.trim();
-      return t && !t.startsWith('#') && !/^_.*_$/.test(t);
+      return t && !/^#{1,6}\s/.test(t) && !/^_.*_$/.test(t);
     })
     .join('\n')
     .trim();
@@ -295,36 +372,44 @@ function prompt(input, self) {
 
   const prev = loadState(ws, sid);
   const first = !prev;
-  let news = [];
-  if (!first) {
+  let unseen;
+  if (first) {
+    // A new session has handoff.md in its context, but the handoff may lag the newest turn
+    // (the plugin writes recent-plugin.md asynchronously): start from the handoff's newest.
+    const handoff = readText(path.join(hot, 'handoff.md'));
+    const hc = parseEntries(handoff, 'handoff').reduce((m, e) => (e.ts > m ? e.ts : m), '');
+    unseen = (e) => e.ts > hc || (e.ts === hc && !handoff.includes(e.text.split('\n')[0]));
+  } else {
     const seen = new Set(prev.seen || []);
     const cursor = prev.cursorTs || '';
-    news = entries
-      .filter(isOther)
-      .filter((e) => e.ts > cursor || (e.ts === cursor && !seen.has(e.key)))
-      .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    unseen = (e) => e.ts > cursor || (e.ts === cursor && !seen.has(e.key));
   }
+  const news = entries
+    .filter(isOther)
+    .filter(unseen)
+    .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   const cursorTs = entries.reduce((m, e) => (e.ts > m ? e.ts : m), (prev && prev.cursorTs) || '');
   const seenNow = entries.filter((e) => e.ts === cursorTs).map((e) => e.key);
 
-  const tasksBody = taskLines(readText(path.join(hot, 'tasks.md')));
+  const tasksFile = path.join(hot, 'tasks.md');
+  const tasksBody = taskLines(readText(tasksFile));
   const tasksHash = tasksBody ? hash(tasksBody) : '';
   const tasksChanged = tasksHash !== ((prev && prev.tasksHash) || '');
   const showTasks = Boolean(tasksBody) && (first || tasksChanged);
 
   const pendingPrompt = self === TAG_CLAUDE_CODE && typeof input.prompt === 'string'
-    ? input.prompt : null;
+    ? snippet(input.prompt, USER_SNIPPET_MAX) : null;
   saveState(ws, sid, { cursorTs, seen: seenNow, tasksHash, pendingPrompt });
 
   const parts = [];
-  if (news.length) parts.push(newsBlock(news));
+  if (news.length) parts.push(newsBlock(news, hot));
   if (showTasks) {
     const t = tasksBody.length > TASKS_MAX_CHARS
       ? `${tasksBody.slice(0, TASKS_MAX_CHARS)} …`
       : tasksBody;
-    parts.push(`Shared task list (core/hot/tasks.md)${first ? '' : ', changed'}:\n${t}`);
+    parts.push(`Shared task list (${tasksFile})${first ? '' : ', changed'}:\n${t}`);
   }
-  if (first || showTasks) parts.push(TASK_RULE);
+  if (first || showTasks) parts.push(taskRule(tasksFile));
   if (!parts.length) return;
   const where = self === 'tg' ? 'Telegram' : 'a Claude Code session';
   const context =
@@ -342,6 +427,7 @@ function main() {
   let input;
   try { input = JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return; }
   if (!input || typeof input !== 'object') return;
+  useAgentTimezone(workspaceDir());
   if (mode === 'stop') stop(input);
   else if (mode === 'prompt' && flag === '--self' && SELVES.has(self)) prompt(input, self);
 }

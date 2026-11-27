@@ -98,12 +98,17 @@ Desktop over SSH, a terminal, Claude Code on the phone). Claude Code reads proje
 - Entries share the plugin's format (`### YYYY-MM-DD HH:MM [tag]`, local time); Claude Code
   entries are tagged `claude-code` and carry `<!-- s:<session> -->`, so two Claude Code
   sessions (mac and phone) see each other but not themselves.
+- Local time means the agent's zone: the bot gets `TZ` from `agent.conf` at launch, SSH
+  sessions run in the server's zone, so the hook sets `TZ` from `agent.conf` itself.
 - The workspace Stop command is `cross-surface.mjs stop; write-handoff.sh` in one command:
   hooks of one group run in parallel, and the merge must see the new entry.
 - On each prompt the hook injects what the other surface wrote since this session last
   looked (state in `state/cross-surface/<session>.json`, at most 8 entries), and
-  `core/hot/tasks.md` when it changed. The first prompt of a session gets only the task-list
-  rule: `handoff.md` is already in its context.
+  `core/hot/tasks.md` (absolute path: the bot's cwd is the plugin dir) when it changed. The
+  first prompt of a session starts from the newest entry of `handoff.md`, which is already in
+  its context, and gets the other surface's turns the handoff has not caught up with yet.
+- Claude Code entries are appended under `recent.md.lock`; prompts in the state files are
+  stored redacted and cut, mode 0600.
 - `update.sh` migrates an installed workspace `settings.json` with
   `scripts/migrate-ws-settings.py` (adds the two commands, keeps everything else, backed up
   and restored on rollback) and creates `tasks.md` when it is missing.

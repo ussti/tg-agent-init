@@ -199,7 +199,8 @@ if [ -f "$AGENT_WS/settings.json" ]; then
   if res="$(python3 "$KIT_DIR/scripts/migrate-ws-settings.py" "$AGENT_WS/settings.json")"; then
     [ "$res" != changed ] || say "workspace settings: shared memory hooks added"
   else
-    say "WARNING: $AGENT_WS/settings.json is not valid JSON; shared memory hooks not added"
+    say "WARNING: $AGENT_WS/settings.json could not be migrated (see above);" \
+      "shared memory hooks not added"
   fi
 fi
 # Memory files a newer version needs; never overwritten.
