@@ -75,13 +75,38 @@ backslashes in values.
 |---|---|
 | PreToolUse | block-dangerous (Bash), protect-files (Edit/Write) |
 | PostToolUse | log-commands |
-| UserPromptSubmit | post-to-webhook, inject-channel-reminder, local-recall, correction-detector |
+| UserPromptSubmit | post-to-webhook, inject-channel-reminder, local-recall, correction-detector, cross-surface prompt (tg) |
 | Stop | write-handoff, post-to-webhook |
 | PreCompact | precompact-backup |
 
 The plugin writes the last `reply` text into `core/hot/recent-plugin.md`;
 `write-handoff` merges hot files into `core/hot/handoff.md`, which CLAUDE.md includes.
 That is how context survives `/compact` and restarts.
+
+## Shared memory across surfaces
+
+The owner also opens Claude Code sessions in the agent folder (`~/agents/<name>`: Claude
+Desktop over SSH, a terminal, Claude Code on the phone). Claude Code reads project
+`settings.json` only from the session's cwd, so these sessions load the workspace
+`settings.json` and the bot (cwd = the plugin dir) loads only the plugin's.
+
+| Surface | Writes its turns to | Gets the other surface's turns |
+|---|---|---|
+| Telegram bot | `core/hot/recent-plugin.md` (the plugin) | `cross-surface.mjs prompt --self tg` |
+| Claude Code sessions | `core/hot/recent.md` (`cross-surface.mjs stop`, workspace settings only) | `cross-surface.mjs prompt --self claude-code` |
+
+- Entries share the plugin's format (`### YYYY-MM-DD HH:MM [tag]`, local time); Claude Code
+  entries are tagged `claude-code` and carry `<!-- s:<session> -->`, so two Claude Code
+  sessions (mac and phone) see each other but not themselves.
+- The workspace Stop command is `cross-surface.mjs stop; write-handoff.sh` in one command:
+  hooks of one group run in parallel, and the merge must see the new entry.
+- On each prompt the hook injects what the other surface wrote since this session last
+  looked (state in `state/cross-surface/<session>.json`, at most 8 entries), and
+  `core/hot/tasks.md` when it changed. The first prompt of a session gets only the task-list
+  rule: `handoff.md` is already in its context.
+- `update.sh` migrates an installed workspace `settings.json` with
+  `scripts/migrate-ws-settings.py` (adds the two commands, keeps everything else, backed up
+  and restored on rollback) and creates `tasks.md` when it is missing.
 
 ## Team layer (install-fleet.sh)
 

@@ -54,7 +54,9 @@ done < <(find "$KIT/server" "$KIT/scripts" "$KIT/core/hooks" "$KIT/core/scripts"
            "$KIT/install-doctor.sh" "$KIT/prepare-server.sh" -name '*.sh' -type f | sort)
 check "python syntax" python3 -m py_compile "$KIT/scripts/render-template.py" \
   "$KIT/server/hooks/silent-reply-check.py" "$KIT/server/fleet/mcp-smoke.py" \
-  "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py"
+  "$KIT/tests/fake-brain-mcp.py" "$KIT/scripts/bump-versions.py" \
+  "$KIT/scripts/migrate-ws-settings.py"
+check "node --check cross-surface.mjs" node --check "$KIT/core/hooks/cross-surface.mjs"
 find "$KIT" -name __pycache__ -type d -exec find {} -delete \; 2>/dev/null || true
 if python3 -c 'import yaml' 2>/dev/null; then
   check "versions workflow parses and has the agreed shape" python3 - \
@@ -95,6 +97,7 @@ check "bump-versions unit tests" env PYTHONDONTWRITEBYTECODE=1 \
 check "rotate-warm unit tests" env PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s "$KIT/core/scripts/tests"
 check "block-dangerous hook tests" bash "$KIT/tests/block-dangerous.test.sh"
+check "cross-surface hook tests" node --test "$KIT/tests/cross-surface.test.mjs"
 
 echo "== 4. installer end-to-end"
 # Fake claude: answers --version, logs every other call with its config dir, no network.
@@ -296,6 +299,37 @@ check "config.json typing indicator on (header «печатает…»)" jq -e \
 check "no upstream canary IDs in agent" bash -c \
   "! grep -rqE '164795011|8507713167' '$WS/state' '$WS/agent.conf' '$PLUGIN/.claude' '$SEC'"
 check "plugin settings valid JSON" jq -e '.hooks.Stop' "$PLUGIN/.claude/settings.json"
+check "workspace: shared task list" test -f "$WS/core/hot/tasks.md"
+check "workspace settings: cross-surface writer runs before the handoff merge" jq -e \
+  '[.hooks.Stop[].hooks[].command | select(test("cross-surface\\.mjs stop; .*write-handoff\\.sh$"))]
+   | length == 1' "$WS/settings.json"
+check "workspace settings: cross-surface prompt hook as claude-code" jq -e \
+  '[.hooks.UserPromptSubmit[].hooks[].command | select(test("cross-surface\\.mjs prompt --self claude-code$"))]
+   | length == 1' "$WS/settings.json"
+check "plugin settings: cross-surface prompt hook as tg" jq -e \
+  '[.hooks.UserPromptSubmit[].hooks[].command | select(test("cross-surface\\.mjs prompt --self tg$"))]
+   | length == 1' "$PLUGIN/.claude/settings.json"
+check "plugin settings: no cross-surface writer (the plugin writes bot turns)" jq -e \
+  '[.hooks.Stop[].hooks[].command | select(test("cross-surface"))] | length == 0' \
+  "$PLUGIN/.claude/settings.json"
+# The workspace Stop command as Claude Code runs it: the turn lands in recent.md and the
+# handoff merges it with the plugin's entries in time order.
+cross_surface_e2e() {
+  local hot="$WS/core/hot" cmd keep="$WORK/hot-keep"
+  rm -rf "$keep"; cp -a "$hot" "$keep"
+  printf '\n### 2000-01-01 00:00 [tg]\n**User:** old\n**testbot:** tg-e2e-old\n' \
+    >> "$hot/recent-plugin.md"
+  cmd="$(jq -r '.hooks.Stop[].hooks[].command | select(test("cross-surface"))' "$WS/settings.json")"
+  echo '{"session_id":"e2e00000-0000","last_assistant_message":"cc-e2e-turn"}' \
+    | CLAUDE_PROJECT_DIR="$(dirname "$WS")" bash -c "$cmd"
+  local ok=0
+  grep -q 'cc-e2e-turn' "$hot/recent.md" \
+    && [ "$(grep -n 'tg-e2e-old' "$hot/handoff.md" | cut -d: -f1)" \
+         -lt "$(grep -n 'cc-e2e-turn' "$hot/handoff.md" | cut -d: -f1)" ] || ok=1
+  rm -rf "$hot"; mv "$keep" "$hot"
+  return "$ok"
+}
+check "cross-surface: Claude Code turn reaches recent.md and handoff in order" cross_surface_e2e
 check "every hook command points at an executable" python3 - "$PLUGIN/.claude/settings.json" <<'PY'
 import json, os, sys
 d = json.load(open(sys.argv[1]))
@@ -757,6 +791,15 @@ jq '.mcpServers += {"gbrain-recall": {"type": "http", "url": "http://127.0.0.1:1
     "notebooklm": {"command": "nlm"}} | .mcpServers["dashi-channel"].args = ["stale"]' \
   "$PLUGIN/.mcp.json" > "$WORK/mcp.tmp" && mv "$WORK/mcp.tmp" "$PLUGIN/.mcp.json"
 user_sum="$(sha256sum "$WS/core/USER.md" | cut -d' ' -f1)"
+# An agent installed before cross-surface memory: old workspace settings with an owner's
+# own key, no task list.
+jq '(.hooks.Stop[].hooks[] | select(.command | test("cross-surface"))).command
+      = "$CLAUDE_PROJECT_DIR/.claude/hooks/write-handoff.sh"
+    | .hooks.UserPromptSubmit[].hooks |= map(select(.command | test("cross-surface") | not))
+    | .env.OWNER_MARK = "keep"' "$WS/settings.json" > "$WORK/ws-settings.tmp" \
+  && mv "$WORK/ws-settings.tmp" "$WS/settings.json"
+rm -f "$WS/core/hot/tasks.md"
+echo "- owner task" > "$WORK/owner-tasks.md"
 run_update() {  # run_update LOG ARGS...
   local log="$1"; shift
   HOME="$FAKE_HOME" TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 bash "$KIT/update.sh" "$@" > "$log" 2>&1
@@ -767,6 +810,15 @@ else
   bad "update.sh runs (log below)"; tail -5 "$WORK/update1.log"
 fi
 check "update: plugin rebuilt" test ! -e "$PLUGIN/STALE-FILE"
+check "update: workspace settings migrated to cross-surface hooks" jq -e \
+  '([.hooks.Stop[].hooks[].command | select(test("cross-surface"))] | length == 1)
+   and ([.hooks.UserPromptSubmit[].hooks[].command | select(test("cross-surface"))] | length == 1)' \
+  "$WS/settings.json"
+check "update: owner's own settings kept" jq -e '.env.OWNER_MARK == "keep"' "$WS/settings.json"
+check "update: old workspace settings in the backup" bash -c \
+  "ls '$WS'/backups/update_*/ws/settings.json"
+check "update: task list created when missing" test -f "$WS/core/hot/tasks.md"
+cp "$WORK/owner-tasks.md" "$WS/core/hot/tasks.md"
 check "update: local plugin env file carried over" grep -qx local "$PLUGIN/.env"
 check "update: added MCP servers carried over" jq -e \
   '.mcpServers["gbrain-recall"].url == "http://127.0.0.1:1/mcp" and .mcpServers.notebooklm.command == "nlm"' \
@@ -825,7 +877,11 @@ self_restart_ok() {
 check "self-update: restart stops the main process and waits for the new one" self_restart_ok
 rm -f "$WS/state/self-update.json"
 check "self-update: unknown action refused" bash -c "! bash '$WS/bin/self-update.sh' bogus 2>/dev/null"
+ws_settings_sum="$(sha256sum "$WS/settings.json" | cut -d' ' -f1)"
 check "update: finds the only agent without --ws" run_update "$WORK/update2.log" --no-pull --no-restart
+check "update: owner's task list not overwritten" grep -qx -- '- owner task' "$WS/core/hot/tasks.md"
+check "update: second run leaves migrated settings as they are" \
+  test "$(sha256sum "$WS/settings.json" | cut -d' ' -f1)" = "$ws_settings_sum"
 mkdir -p "$WORK/rootbin"
 printf '#!/usr/bin/env bash\necho 0\n' > "$WORK/rootbin/id"
 chmod +x "$WORK/rootbin/id"
@@ -847,6 +903,28 @@ broken_build() {
 }
 check "update: failed build changes nothing" broken_build
 rm -rf "$WORK/kit-broken"
+# A failure after the swap rolls the workspace settings back to the owner's old file.
+settings_rollback() {
+  local kit="$WORK/kit-broken" before
+  rm -rf "$kit"; mkdir -p "$kit"
+  cp -a "$KIT/update.sh" "$KIT/scripts" "$KIT/server" "$KIT/core" "$KIT/kit" "$kit/"
+  ln -s "$KIT/vendor" "$kit/vendor"; ln -s "$KIT/patches" "$kit/patches"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$kit/kit/install-kit.sh"
+  jq '.hooks.UserPromptSubmit[].hooks |= map(select(.command | test("cross-surface") | not))
+      | .env.ROLLBACK_MARK = "old"' "$WS/settings.json" > "$WORK/rb.tmp"
+  cp "$WS/settings.json" "$WORK/rb-current.json"
+  mv "$WORK/rb.tmp" "$WS/settings.json"
+  before="$(sha256sum "$WS/settings.json" | cut -d' ' -f1)"
+  ! HOME="$FAKE_HOME" TG_AGENT_TEST_SKIP_BUN=1 KIT_SKIP_DEPS=1 \
+    bash "$kit/update.sh" --no-pull --no-restart --ws "$WS" > "$WORK/update-rb.log" 2>&1 \
+    && grep -q 'previous version is back' "$WORK/update-rb.log" \
+    && test "$(sha256sum "$WS/settings.json" | cut -d' ' -f1)" = "$before"
+  local rc=$?
+  mv "$WORK/rb-current.json" "$WS/settings.json"
+  rm -rf "$kit"
+  return "$rc"
+}
+check "update: rollback puts the old workspace settings back" settings_rollback
 keeps_three() {
   local i
   for i in 1 2 3; do

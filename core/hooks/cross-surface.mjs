@@ -121,7 +121,8 @@ function hash(s) {
  * Split a hot-memory file into entries.
  * @param {string} text file content
  * @param {string} channel 'tg' for recent-plugin.md, 'claude-code' for recent.md
- * @returns {{ts: string, tag: string, sid: string|null, key: string, channel: string, text: string}[]}
+ * @returns {{ts: string, tag: string, sid: string|null, key: string, channel: string,
+ *   text: string}[]}
  */
 export function parseEntries(text, channel) {
   const out = [];
@@ -318,7 +319,9 @@ function prompt(input, self) {
   const parts = [];
   if (news.length) parts.push(newsBlock(news));
   if (showTasks) {
-    const t = tasksBody.length > TASKS_MAX_CHARS ? `${tasksBody.slice(0, TASKS_MAX_CHARS)} …` : tasksBody;
+    const t = tasksBody.length > TASKS_MAX_CHARS
+      ? `${tasksBody.slice(0, TASKS_MAX_CHARS)} …`
+      : tasksBody;
     parts.push(`Shared task list (core/hot/tasks.md)${first ? '' : ', changed'}:\n${t}`);
   }
   if (first || showTasks) parts.push(TASK_RULE);
@@ -343,6 +346,7 @@ function main() {
   else if (mode === 'prompt' && flag === '--self' && SELVES.has(self)) prompt(input, self);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
+const SELF_PATH = path.resolve(new URL(import.meta.url).pathname);
+if (process.argv[1] && path.resolve(process.argv[1]) === SELF_PATH) {
   try { main(); } catch { /* memory must never break a turn */ }
 }
