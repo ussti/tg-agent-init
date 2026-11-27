@@ -1,0 +1,7 @@
+# Shared tasks
+
+_Open multi-step tasks, seen from Telegram and from Claude Code sessions alike._
+_One line per task: task -- current step -- next step -- where (tg / claude-code)._
+_Update when a task starts, moves, pauses or ends; remove finished ones._
+
+<!-- - Zoom for the client -- link created -- next: send it after the owner's yes -- claude-code -->
