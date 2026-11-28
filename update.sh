@@ -7,7 +7,9 @@
 # Pulls the repo, rebuilds the Telegram plugin, refreshes the server scripts, hooks
 # and the skill kit, then restarts the agent and checks that it comes back. If it does
 # not, the previous version is put back. Memory, the profile from /onboard, rules,
-# keys, logins, logs and the library are never touched.
+# keys, logins, logs and the library are never touched. The workspace settings.json is
+# migrated in place (kit hooks added, everything else kept); missing memory files the
+# new version needs are created from templates, existing ones are left as they are.
 #
 # Flags: --no-pull (use the repo as it is), --no-restart, --ws <agent workspace>
 # (needed only when this user has more than one agent).
@@ -137,6 +139,11 @@ CODE_DIRS=(bin hooks scripts skills/onboard)
 for d in "${CODE_DIRS[@]}"; do
   [ ! -e "$AGENT_WS/$d" ] || { mkdir -p "$BAK/ws/$(dirname "$d")"; cp -a "$AGENT_WS/$d" "$BAK/ws/$d"; }
 done
+# The owner's workspace settings: migrated below, put back on rollback.
+if [ -f "$AGENT_WS/settings.json" ]; then
+  mkdir -p "$BAK/ws"
+  cp -p "$AGENT_WS/settings.json" "$BAK/ws/settings.json"
+fi
 # The kit minus its downloaded upstream checkouts, which install-kit.sh reuses.
 [ ! -d "$AGENT_WS/kit" ] || tar -C "$AGENT_WS" --exclude=kit/vendor -cf "$BAK/kit.tar" kit
 
@@ -171,6 +178,7 @@ restore() {
     fi
   done
   [ ! -f "$BAK/kit.tar" ] || tar -C "$AGENT_WS" -xf "$BAK/kit.tar"
+  [ ! -f "$BAK/ws/settings.json" ] || put_file "$BAK/ws/settings.json" "$AGENT_WS/settings.json"
 }
 
 # ---------------------------------------------------------------- swap
@@ -185,6 +193,20 @@ put_dir_files "$AGENT_WS/scripts" "$KIT_DIR"/core/scripts/*.sh "$KIT_DIR"/core/s
 rm -rf "$AGENT_WS/skills/onboard"
 cp -R "$KIT_DIR/core/skills/onboard" "$AGENT_WS/skills/"
 chmod +x "$AGENT_WS"/bin/*.sh "$AGENT_WS"/hooks/*.sh "$AGENT_WS"/hooks/*.py "$AGENT_WS"/scripts/*.sh
+
+# Workspace settings belong to the owner: add the kit's hooks, keep everything else.
+if [ -f "$AGENT_WS/settings.json" ]; then
+  if res="$(python3 "$KIT_DIR/scripts/migrate-ws-settings.py" "$AGENT_WS/settings.json")"; then
+    [ "$res" != changed ] || say "workspace settings: shared memory hooks added"
+  else
+    say "WARNING: $AGENT_WS/settings.json could not be migrated (see above);" \
+      "shared memory hooks not added"
+  fi
+fi
+# Memory files a newer version needs; never overwritten.
+mkdir -p "$AGENT_WS/core/hot"
+[ -f "$AGENT_WS/core/hot/tasks.md" ] \
+  || cp "$KIT_DIR/core/templates/core/hot/tasks.md.template" "$AGENT_WS/core/hot/tasks.md"
 
 say "updating the skill kit"
 if ! KIT_SKIP_DEPS="${KIT_SKIP_DEPS:-0}" bash "$KIT_DIR/kit/install-kit.sh" "$AGENT_WS" "$CLAUDE_CONFIG_DIR"; then
